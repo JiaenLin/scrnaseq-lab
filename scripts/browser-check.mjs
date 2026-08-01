@@ -20,7 +20,7 @@ const run = async (file, tag) => {
   await page.goto('http://localhost:4174/', { waitUntil: 'networkidle' })
   const t0 = Date.now()
   await page.setInputFiles('input[type=file]', `${T}/${file}`)
-  await page.waitForSelector('text=Which column holds the cell type annotation?', { timeout: 300000 })
+  await page.waitForSelector('text=cell type annotation', { timeout: 300000 })
   console.log(`${tag}: scanned in ${Date.now() - t0} ms`)
   await page.screenshot({ path: `${OUT}/${tag}-review.png`, fullPage: true })
   const summary = await page.locator('.sub').first().innerText()
