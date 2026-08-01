@@ -180,8 +180,8 @@ export default function App() {
                 Open scRNA-seq Studio →
               </a>
               <p className="sub mt-2">
-                Drop <span className="mono">{done.name}</span> onto its panel. The file stays on
-                your machine — the studio reads it the same way this page read your object.
+                Drop <span className="mono">{done.name}</span> onto its panel — it stays on your
+                machine.
               </p>
             </Handoff>
           </div>
@@ -221,8 +221,7 @@ export default function App() {
               ))}
             </ul>
             <p className="sub mt-2">
-              These travel inside the bundle and appear again on the studio&rsquo;s Overview tab, so
-              whoever reads the figures sees the same caveats as whoever ran the conversion.
+              These travel inside the bundle and show again on the studio&rsquo;s Overview tab.
             </p>
           </div>
         </Card>

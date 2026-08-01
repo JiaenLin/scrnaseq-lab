@@ -1,21 +1,21 @@
-import { useRef, useState, type ReactNode } from 'react'
+import { useRef, useState } from 'react'
 import { Flow } from './Ui.tsx'
 
 const STUDIO = 'https://jiaenlin.github.io/scrnaseq-studio/'
 
-/** What the object has to contain, and what happens when it does not. */
-const REQUIREMENTS: [string, ReactNode, ReactNode][] = [
-  ['A cell annotation', 'any categorical column — cell_type, seurat_annotations, louvain, leiden',
-    <>Required. You pick which one after the scan.</>],
-  ['An embedding', 'UMAP, t-SNE or PCA in obsm / @reductions',
-    <>Required by the Cells and Feature plot tabs.</>],
-  ['Expression', 'log-normalized values, or raw counts to build them from',
-    <>Required. Scaled values are z-scores; the converter refuses them rather than plotting
-      violins that look normal and are wrong.</>],
-  ['A sample column', 'donor, animal, run — orig.ident and the like',
-    <>Optional. Without it composition cannot show between-animal spread.</>],
-  ['A condition column', 'the experimental group',
-    <>Optional. Without it the object opens single-condition.</>],
+/**
+ * What the object has to contain.
+ *
+ * Folded away by default. It is reference material — the app enforces every row
+ * at conversion time and says which one failed — so putting it between someone
+ * and the file picker made them read a five-row table to do nothing at all.
+ */
+const NEEDS: [string, boolean, string][] = [
+  ['Cell annotation', true, 'any categorical column — you pick which one after the scan'],
+  ['Embedding', true, 'UMAP, t-SNE or PCA'],
+  ['Expression', true, 'log-normalized, or raw counts to build it from — scaled z-scores are refused'],
+  ['Sample', false, 'donor, animal or run — without it, composition cannot show spread'],
+  ['Condition', false, 'the experimental group — without it, the comparison tabs stay empty'],
 ]
 
 export default function Landing({ onFile, error, busy, stage }: {
@@ -34,9 +34,25 @@ export default function Landing({ onFile, error, busy, stage }: {
 
   return (
     <div className="grid min-h-screen place-items-center px-5 py-10">
-      <div className="w-full max-w-[700px]">
+      <div className="w-full max-w-[540px]">
+        <header className="text-center">
+          <div
+            className="mx-auto mb-3 grid h-[30px] w-[30px] place-items-center rounded-[9px] text-xs font-bold text-white"
+            style={{ background: 'linear-gradient(150deg, var(--accent), #a855f7)' }}
+          >sc</div>
+          <h1 className="text-[20px] tracking-[-0.02em]">scRNA-seq Lab</h1>
+          <p className="mx-auto mt-1.5 max-w-[430px] text-[13px]" style={{ color: 'var(--ink-2)' }}>
+            Turns an annotated single-cell object into the file{' '}
+            {/* nowrap: the hyphen in "scRNA-seq" is a break opportunity, so the
+                product name was splitting across two lines mid-word. */}
+            <a className="underline" href={STUDIO} target="_blank" rel="noreferrer"
+              style={{ whiteSpace: 'nowrap' }}>scRNA-seq Studio</a>{' '}opens.
+          </p>
+          <div className="mt-3.5"><Flow at="convert" /></div>
+        </header>
+
         <div
-          className="rounded-[18px] px-[30px] py-[34px] text-center"
+          className="mt-6 rounded-2xl px-6 py-9 text-center"
           style={{
             border: `1.5px dashed ${over ? 'var(--accent)' : 'var(--line-2)'}`,
             background: over ? 'var(--accent-soft)' : 'var(--surface)',
@@ -46,83 +62,52 @@ export default function Landing({ onFile, error, busy, stage }: {
           onDragLeave={() => setOver(false)}
           onDrop={e => { e.preventDefault(); setOver(false); take(e.dataTransfer.files) }}
         >
-          <div
-            className="mx-auto mb-3.5 grid h-[30px] w-[30px] place-items-center rounded-[9px] text-xs font-bold text-white"
-            style={{ background: 'linear-gradient(150deg, var(--accent), #a855f7)' }}
-          >sc</div>
-          <h1 className="text-[19px] tracking-[-0.02em]">scRNA-seq Lab</h1>
-          <p className="mt-2 text-[14px] font-medium">
-            This page does one thing: it converts an <b>already-annotated</b>{' '}
-            <code className="mono">.h5ad</code> or <code className="mono">.rds</code> into{' '}
-            <code className="mono">bundle.zip</code>, the input format{' '}
-            <a className="underline" href={STUDIO} target="_blank" rel="noreferrer">
-              scRNA-seq&nbsp;Studio</a>{' '}opens.
-          </p>
-          <p className="mt-1.5 text-[12.5px]" style={{ color: 'var(--ink-2)' }}>
-            It does not cluster, annotate or analyse anything — bring an object you have already
-            processed. Conversion happens in this tab: nothing is uploaded, and there is no
-            Python or R to install.
-          </p>
-
-          <Flow at="convert" />
-          <div className="mb-[18px]" />
-
           <input
             ref={input} type="file" accept=".h5ad,.rds,.h5,.RDS" className="hidden"
             onChange={e => take(e.target.files)}
           />
           <button className="btn btn-primary" disabled={busy} onClick={() => input.current?.click()}>
-            {busy ? (stage || 'Reading…') : 'Choose a .h5ad or .rds'}
+            {busy ? (stage || 'Reading…') : 'Choose a file'}
           </button>
-          <p className="mt-2 text-[12px]" style={{ color: 'var(--ink-3)' }}>
-            or drop it anywhere on this panel
-          </p>
-
-          {busy && stage && (
-            <div className="note note-info mt-4 text-left"><b>{stage}</b></div>
-          )}
-
-          {error && (
-            <div className="note mt-4 text-left">
-              <b>That file did not open.</b> {error}
-            </div>
-          )}
-
-          <div className="mt-5 rounded-xl px-4 py-3 text-left" style={{ background: 'var(--sunk)' }}>
-            <div className="eyebrow">What happens when you drop a file in</div>
-            <p className="mt-1.5 text-[12.5px]" style={{ color: 'var(--ink-2)' }}>
-              The lab scans the object&rsquo;s metadata, shows you every column it found, and asks
-              which one is the cell type annotation and which — if any — is the condition to group
-              by. Those two answers are the whole conversation. Then it writes{' '}
-              <code className="mono">bundle.zip</code> and sends you to the studio.
-            </p>
-            <p className="mt-2 text-[12.5px]" style={{ color: 'var(--ink-2)' }}>
-              Large objects are fine: a 288&nbsp;MB Seurat object scans in about a second, because
-              the reader walks the file without expanding the matrices it is not going to use.
-            </p>
-          </div>
-
-          <div className="eyebrow mt-6 text-left">What the object needs</div>
-          <div className="scrollx mt-2">
-            <table className="t">
-              <thead><tr><th>Needs</th><th>Which is</th><th>If missing</th></tr></thead>
-              <tbody>
-                {REQUIREMENTS.map(([name, what, missing]) => (
-                  <tr key={name}>
-                    <td className="whitespace-nowrap font-semibold">{name}</td>
-                    <td style={{ color: 'var(--ink-2)' }}>{what}</td>
-                    <td style={{ color: 'var(--ink-2)' }}>{missing}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <p className="mt-4 text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
-            Raw FASTQ instead? Start at <b>rnaseq-service</b>. A bulk count matrix goes to{' '}
-            <b>rnaseq-lab</b>, then <b>rnaseq-studio</b>.
+          <p className="mt-2.5 text-[12px]" style={{ color: 'var(--ink-3)' }}>
+            or drop it here — <code className="mono">.h5ad</code> or{' '}
+            <code className="mono">.rds</code>, up to a few hundred MB
           </p>
         </div>
+
+        {busy && stage && <div className="note note-info mt-3"><b>{stage}</b></div>}
+        {error && (
+          <div className="note mt-3"><b>That file did not open.</b> {error}</div>
+        )}
+
+        <p className="mt-3 text-center text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
+          Read in this tab — nothing is uploaded, and there is no Python or R to install.
+        </p>
+
+        <details className="mt-5 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--sunk)' }}>
+          <summary className="cursor-pointer text-[12.5px] font-semibold">
+            What the object needs
+          </summary>
+          <div className="mt-2.5 grid gap-1.5">
+            {NEEDS.map(([name, required, what]) => (
+              <div key={name} className="flex items-baseline gap-2">
+                <span className="w-[104px] flex-none text-[12px] font-semibold">{name}</span>
+                <span className={`badge flex-none ${required ? 'badge-here' : 'badge-none'}`}>
+                  {required ? 'required' : 'optional'}
+                </span>
+                <span className="text-[11.5px]" style={{ color: 'var(--ink-2)' }}>{what}</span>
+              </div>
+            ))}
+          </div>
+          <p className="mt-2.5 text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
+            The lab does not cluster or annotate — bring an object you have already processed.
+            After the scan it asks which column is the cell annotation and which is the condition.
+          </p>
+        </details>
+
+        <p className="mt-4 text-center text-[11px]" style={{ color: 'var(--ink-3)' }}>
+          Bulk RNA-seq? Counts go to <b>rnaseq-lab</b>; raw FASTQ starts at <b>rnaseq-service</b>.
+        </p>
       </div>
     </div>
   )

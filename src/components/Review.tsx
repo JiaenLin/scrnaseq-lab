@@ -58,10 +58,10 @@ function Option({ col, chosen, sameAs, onPick }: {
 /** A column already spoken for by another question, and what it was picked as. */
 interface Taken { name: string | null; as: string }
 
-function Picker({ scan, role, value, onChange, allowNone, noneLabel, exclude = [] }: {
+function Picker({ scan, role, value, onChange, allowNone, noneLabel, emptyNote, exclude = [] }: {
   scan: Scan; role: Role; value: string | null
   onChange: (v: string | null) => void
-  allowNone?: boolean; noneLabel?: string; exclude?: Taken[]
+  allowNone?: boolean; noneLabel?: string; emptyNote?: string; exclude?: Taken[]
 }) {
   const usable = candidates(scan, role, exclude.map(t => t.name))
   const dup = useMemo(() => duplicateOf(scan.columns), [scan])
@@ -82,9 +82,41 @@ function Picker({ scan, role, value, onChange, allowNone, noneLabel, exclude = [
     .map(c => ({ c, why: why(c) }))
     .filter(x => x.why)
 
+  const rejectedList = rejected.length > 0 && (
+    <details className="mt-2">
+      <summary className="cursor-pointer text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
+        {rejected.length} column{rejected.length > 1 ? 's' : ''} cannot be used here
+      </summary>
+      <div className="mt-1.5 grid gap-1">
+        {rejected.map(({ c, why }) => (
+          <div key={c.name} className="text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
+            <span className="mono">{c.name}</span> — {why}
+          </div>
+        ))}
+      </div>
+    </details>
+  )
+
+  // Nothing to choose between: one quiet line, not a full-width card offering
+  // the only option there is plus a warning saying the same thing again.
+  if (!usable.length) {
+    return (
+      <>
+        <p className="text-[12.5px]" style={{ color: 'var(--ink-2)' }}>
+          No column here can act as{' '}
+          {role === 'cluster' ? 'a cell annotation' : `a ${role}`}
+          {emptyNote ? ` — ${emptyNote}` : '.'}
+        </p>
+        {rejectedList}
+      </>
+    )
+  }
+
   return (
     <>
-      <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit,minmax(240px,1fr))' }}>
+      {/* auto-fill, not auto-fit: with a single candidate, auto-fit collapses the
+          empty tracks and stretches that one card across the whole row. */}
+      <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fill,minmax(240px,1fr))' }}>
         {allowNone && (
           <button
             onClick={() => onChange(null)}
@@ -95,8 +127,8 @@ function Picker({ scan, role, value, onChange, allowNone, noneLabel, exclude = [
             }}
           >
             <div className="text-[12.5px] font-semibold">{noneLabel ?? 'Not in this object'}</div>
-            <div className="mt-1.5 text-[11.5px]" style={{ color: 'var(--ink-2)' }}>
-              Leave it out rather than pick something that is not it.
+            <div className="mt-1.5 text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
+              Better than picking something that is not it.
             </div>
           </button>
         )}
@@ -105,11 +137,6 @@ function Picker({ scan, role, value, onChange, allowNone, noneLabel, exclude = [
             onPick={() => onChange(c.name)} />
         ))}
       </div>
-      {!usable.length && (
-        <div className="note mt-2">
-          No column in this object can act as {role === 'cluster' ? 'a cell annotation' : `a ${role}`}.
-        </div>
-      )}
       {rejected.length > 0 && (
         <details className="mt-2">
           <summary className="cursor-pointer text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
@@ -179,16 +206,15 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
 
       {!usableMatrix && (
         <div className="note mt-4">
-          <b>Every matrix in this object is scaled data.</b> The studio plots expression, not
-          z-scores, so there is nothing here it can show. Re-save with the raw counts or the
-          log-normalized matrix included.
+          <b>Every matrix here is scaled data.</b> The studio plots expression, not z-scores —
+          re-save including the raw counts or the log-normalized matrix.
         </div>
       )}
 
       <Card
         eyebrow="Step 1 · required"
-        title="Which column holds the cell type annotation?"
-        sub="Every view in the studio is per cell type, so this is the one answer it cannot proceed without. Columns are ranked by name, but the name is only a hint — check the levels."
+        title="Which column is the cell type annotation?"
+        sub="Ranked by name, but the name is only a hint — check the levels."
       >
         <div className="mt-3.5">
           <Picker scan={scan} role="cluster"
@@ -199,11 +225,12 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
       <Card
         eyebrow="Step 2 · optional"
         title="Group by — the experimental condition"
-        sub="What the cells are compared across: treatment, genotype, timepoint. Leave it out and the object opens as one group, with the comparison tabs empty rather than showing an invented contrast."
+        sub="Treatment, genotype, timepoint. Skip it and the object opens as one group."
       >
         <div className="mt-3.5">
           <Picker scan={scan} role="condition" allowNone
             noneLabel="No condition — one group"
+            emptyNote="this object opens as one group"
             exclude={[{ name: choices.cluster, as: 'cell annotation' }]}
             value={choices.condition} onChange={v => set({ condition: v })} />
         </div>
@@ -211,12 +238,13 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
 
       <Card
         eyebrow="Step 3 · optional"
-        title="Sample — which animal, donor or run each cell came from"
-        sub="This is what makes replication visible. Without it every cell is one sample, so composition cannot show between-animal spread and pseudobulk has nothing to aggregate."
+        title="Sample — animal, donor or run"
+        sub="Makes replication visible. Skip it and every cell counts as one sample."
       >
         <div className="mt-3.5">
           <Picker scan={scan} role="sample" allowNone
             noneLabel="No sample — treat as one"
+            emptyNote="every cell counts as one sample"
             exclude={[{ name: choices.cluster, as: 'cell annotation' },
                       { name: choices.condition, as: 'condition' }]}
             value={choices.sample} onChange={v => set({ sample: v })} />
@@ -226,7 +254,7 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
       {clash && <div className="note mt-4"><b>These two do not nest.</b> {clash}</div>}
 
       <Card eyebrow="Step 4" title="Embedding and label">
-        <Field label="Embedding" hint="The Cells and Feature plot tabs draw on this.">
+        <Field label="Embedding" hint="What the Cells and Feature plot tabs draw on.">
           <div className="seg">
             {scan.embeddings.map(e => (
               <button key={e.key} className={e.key === choices.embedding ? 'sel' : ''}
@@ -237,19 +265,15 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
           </div>
           {!scan.embeddings.length && (
             <div className="note mt-2">
-              This object has no 2D embedding. Run a UMAP before converting — the studio needs
-              one to draw cells.
+              No 2D embedding in this object. Run a UMAP before converting.
             </div>
           )}
           {/pca/i.test(choices.embedding) && (
-            <p className="sub mt-2">
-              Only principal components are available here, which is a much coarser picture
-              than a UMAP.
-            </p>
+            <p className="sub mt-2">Principal components only — a coarser picture than a UMAP.</p>
           )}
         </Field>
 
-        <Field label="Label" hint="The name shown at the top of the studio.">
+        <Field label="Label" hint="Shown at the top of the studio.">
           <input className="inp w-full max-w-[420px]" value={choices.label}
             onChange={e => set({ label: e.target.value })} />
         </Field>
@@ -257,8 +281,8 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
 
       <Card
         eyebrow="Before you convert"
-        title="What this bundle will and will not support"
-        sub="Derived from the choices above, so a missing capability traces back to a specific answer rather than appearing later as an empty tab."
+        title="What this bundle will support"
+        sub="Follows from the answers above — nothing turns up empty later."
       >
         <div className="scrollx mt-3">
           <table className="t">
@@ -319,9 +343,8 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
           </table>
         </div>
         <p className="sub mt-2.5">
-          Matrices found: {scan.matrices.map(m => `${m.key} (${m.kind})`).join(', ')}. The
-          converter picks the log-normalized one, or builds it from counts — never{' '}
-          <Mono>scaled</Mono>, which would render violins that look normal and are wrong.
+          Matrices: {scan.matrices.map(m => `${m.key} (${m.kind})`).join(', ')} — the converter
+          takes the log-normalized one or builds it from counts, never <Mono>scaled</Mono>.
         </p>
       </Card>
 
