@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { gunzipSync } from 'fflate'
 import Landing from './components/Landing.tsx'
 import Review from './components/Review.tsx'
-import { Card } from './components/Ui.tsx'
+import { Card, Flow } from './components/Ui.tsx'
 import { decompressRds, RdsReader } from './lib/rds.ts'
 import { scanSeurat } from './lib/seurat.ts'
 import { scanH5ad } from './lib/h5ad.ts'
@@ -10,6 +10,24 @@ import { buildBundle, type BundleMeta } from './lib/build.ts'
 import { guessCluster, guessEmbedding, guessRole, type Choices, type Scan } from './lib/scan.ts'
 
 const STUDIO = 'https://jiaenlin.github.io/scrnaseq-studio/'
+
+/** One numbered step of the handoff out of this app. */
+function Handoff({ n, title, done, children }: {
+  n: number; title: string; done?: boolean; children: ReactNode
+}) {
+  return (
+    <div className="flex gap-3 rounded-xl px-3.5 py-3" style={{ background: 'var(--sunk)' }}>
+      <div
+        className="grid h-[22px] w-[22px] flex-none place-items-center rounded-[7px] text-[11px] font-bold text-white"
+        style={{ background: done ? 'var(--good)' : 'var(--accent)' }}
+      >{done ? '✓' : n}</div>
+      <div className="min-w-0 flex-1">
+        <div className="mb-2 text-[13px] font-semibold">{title}</div>
+        {children}
+      </div>
+    </div>
+  )
+}
 
 /** Let the browser paint the stage label before the next blocking step. */
 const yieldToPaint = () =>
@@ -29,6 +47,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [stage, setStage] = useState('')
   const [busy, setBusy] = useState(false)
+  const [saved, setSaved] = useState(false)
 
   async function open(file: File) {
     setError(null)
@@ -123,6 +142,7 @@ export default function App() {
     a.href = url
     a.download = done.name
     a.click()
+    setSaved(true)
     setTimeout(() => URL.revokeObjectURL(url), 5000)
   }
 
@@ -131,6 +151,7 @@ export default function App() {
     setChoices(null)
     setDone(null)
     setError(null)
+    setSaved(false)
   }
 
   if (done) {
@@ -138,21 +159,36 @@ export default function App() {
     return (
       <div className="wrap py-10">
         <Card
-          eyebrow="Converted"
-          title={done.name}
+          eyebrow="Converted — the lab's job is done"
+          title={`${done.name} is ready for scRNA-seq Studio`}
           sub={`${done.meta.nCells.toLocaleString()} cells · ${done.meta.nGenes.toLocaleString()} genes · ${done.meta.nnz.toLocaleString()} stored values · ${mb.toFixed(1)} MB`}
         >
-          <div className="mt-4 flex flex-wrap items-center gap-2.5">
-            <button className="btn btn-primary" onClick={download}>Download {done.name}</button>
-            <a className="btn" href={STUDIO} target="_blank" rel="noreferrer">
-              Open scRNA-seq Studio
-            </a>
-            <button className="btn btn-ghost" onClick={restart}>Convert another</button>
+          <Flow at="done" />
+
+          {/* Two steps, and only one of them is live at a time: the studio cannot
+              open a file that has not been saved yet, so it stays secondary
+              until the download has actually happened. */}
+          <div className="mt-5 grid gap-2.5">
+            <Handoff n={1} title="Save the bundle" done={saved}>
+              <button className={`btn ${saved ? '' : 'btn-primary'}`} onClick={download}>
+                {saved ? `Download ${done.name} again` : `Download ${done.name}`}
+              </button>
+            </Handoff>
+            <Handoff n={2} title="Open it in scRNA-seq Studio">
+              <a className={`btn ${saved ? 'btn-primary' : ''}`} href={STUDIO}
+                target="_blank" rel="noreferrer">
+                Open scRNA-seq Studio →
+              </a>
+              <p className="sub mt-2">
+                Drop <span className="mono">{done.name}</span> onto its panel. The file stays on
+                your machine — the studio reads it the same way this page read your object.
+              </p>
+            </Handoff>
           </div>
-          <p className="sub mt-3">
-            Download it, then drop it on the studio&rsquo;s panel. The file stays on your machine —
-            the studio reads it the same way this page read your object.
-          </p>
+
+          <div className="mt-4">
+            <button className="btn btn-ghost" onClick={restart}>Convert another object</button>
+          </div>
 
           <div className="mt-5">
             <div className="eyebrow mb-2">What went in</div>

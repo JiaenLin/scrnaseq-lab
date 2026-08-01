@@ -1,4 +1,5 @@
 import { useRef, useState, type ReactNode } from 'react'
+import { Flow } from './Ui.tsx'
 
 const STUDIO = 'https://jiaenlin.github.io/scrnaseq-studio/'
 
@@ -50,11 +51,21 @@ export default function Landing({ onFile, error, busy, stage }: {
             style={{ background: 'linear-gradient(150deg, var(--accent), #a855f7)' }}
           >sc</div>
           <h1 className="text-[19px] tracking-[-0.02em]">scRNA-seq Lab</h1>
-          <p className="mb-[18px] mt-2 text-[13.5px]" style={{ color: 'var(--ink-2)' }}>
-            Turn a Scanpy <code className="mono">.h5ad</code> or a Seurat{' '}
-            <code className="mono">.rds</code> into a studio bundle. It reads the object here,
-            in this tab — nothing is uploaded, and there is no Python or R to install.
+          <p className="mt-2 text-[14px] font-medium">
+            This page does one thing: it converts an <b>already-annotated</b>{' '}
+            <code className="mono">.h5ad</code> or <code className="mono">.rds</code> into{' '}
+            <code className="mono">bundle.zip</code>, the input format{' '}
+            <a className="underline" href={STUDIO} target="_blank" rel="noreferrer">
+              scRNA-seq&nbsp;Studio</a>{' '}opens.
           </p>
+          <p className="mt-1.5 text-[12.5px]" style={{ color: 'var(--ink-2)' }}>
+            It does not cluster, annotate or analyse anything — bring an object you have already
+            processed. Conversion happens in this tab: nothing is uploaded, and there is no
+            Python or R to install.
+          </p>
+
+          <Flow at="convert" />
+          <div className="mb-[18px]" />
 
           <input
             ref={input} type="file" accept=".h5ad,.rds,.h5,.RDS" className="hidden"
@@ -78,13 +89,12 @@ export default function Landing({ onFile, error, busy, stage }: {
           )}
 
           <div className="mt-5 rounded-xl px-4 py-3 text-left" style={{ background: 'var(--sunk)' }}>
-            <div className="eyebrow">How this works</div>
+            <div className="eyebrow">What happens when you drop a file in</div>
             <p className="mt-1.5 text-[12.5px]" style={{ color: 'var(--ink-2)' }}>
               The lab scans the object&rsquo;s metadata, shows you every column it found, and asks
               which one is the cell type annotation and which — if any — is the condition to group
-              by. Then it writes <code className="mono">bundle.zip</code>, which you open in{' '}
-              <a className="underline" href={STUDIO} target="_blank" rel="noreferrer">
-                scRNA-seq Studio</a>.
+              by. Those two answers are the whole conversation. Then it writes{' '}
+              <code className="mono">bundle.zip</code> and sends you to the studio.
             </p>
             <p className="mt-2 text-[12.5px]" style={{ color: 'var(--ink-2)' }}>
               Large objects are fine: a 288&nbsp;MB Seurat object scans in about a second, because

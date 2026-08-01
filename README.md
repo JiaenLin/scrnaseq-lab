@@ -1,8 +1,11 @@
 # scRNA-seq Lab
 
-Convert a Scanpy `.h5ad` or a Seurat `.rds` into a bundle for
-[scRNA-seq Studio](https://jiaenlin.github.io/scrnaseq-studio/) — in the browser, with no
-Python, no R, and no upload.
+**One job: turn an already-annotated Scanpy `.h5ad` or Seurat `.rds` into the file
+[scRNA-seq Studio](https://jiaenlin.github.io/scrnaseq-studio/) opens** — in the browser, with
+no Python, no R, and no upload.
+
+It does not cluster, annotate or analyse anything. Bring an object you have already processed;
+you explore it in the Studio, not here.
 
 **→ [jiaenlin.github.io/scrnaseq-lab](https://jiaenlin.github.io/scrnaseq-lab/)**
 
@@ -82,15 +85,15 @@ almost always are.
 This is the third independent writer of it, so `scripts/test-build.mjs` reads a built bundle
 back and compares it against a dense reference rather than trusting the writer.
 
-## The family
+## The family — one job each
 
-| App | Input | Does |
+| App | Takes | Produces |
 |---|---|---|
-| **rnaseq-service** | raw FASTQ | the pipeline |
-| **rnaseq-lab** | bulk count matrix | DESeq2 |
-| **rnaseq-studio** | bulk results | explore |
-| **scrnaseq-lab** (here) | `.h5ad` / `.rds` | convert |
-| **scrnaseq-studio** | `bundle.zip` | explore |
+| **rnaseq-service** | raw FASTQ | an analysis request + nf-core sample sheet |
+| **rnaseq-lab** | a bulk counts matrix | `bundle.zip` for rnaseq-studio |
+| **rnaseq-studio** | `bundle.zip` | the figures you read |
+| **scrnaseq-lab** (here) | an annotated `.h5ad` / `.rds` | `bundle.zip` for scrnaseq-studio |
+| **scrnaseq-studio** | `bundle.zip` | the figures you read |
 
 ## Development
 
