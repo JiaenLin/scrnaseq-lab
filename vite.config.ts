@@ -5,7 +5,7 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   base: './',
   plugins: [react()],
-  // The reader worker imports h5wasm on demand, which is a code split, and
-  // Vite's default IIFE worker format cannot express one.
+  // The reader is a module worker; h5wasm itself is loaded at runtime from
+  // public/vendor so the bundler never rewrites it.
   worker: { format: 'es' },
 })

@@ -20,6 +20,36 @@ import type { Choices, Scan, ScanInfo } from './scan.ts'
 import type { CellMajor } from './matrix.ts'
 import { gunzipSync } from 'fflate'
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
+type H5Mod = any
+
+/**
+ * Load h5wasm at runtime, from a copy the bundler never touches.
+ *
+ * Letting Vite bundle it into the worker produced a worker that loaded, threw
+ * nothing, and never answered: the WebAssembly never finished arriving, and
+ * with no error there was nothing to report. The stock ESM build works
+ * unmodified in a module worker — that is how it is meant to be used — so it
+ * is copied to public/vendor verbatim and imported by URL.
+ */
+let h5mod: H5Mod = null
+async function h5(url: string): Promise<H5Mod> {
+  if (!h5mod) {
+    void url
+    const mod = await import('h5wasm')
+    h5mod = mod.default ?? mod
+    if (!h5mod?.File) throw new Error('the HDF5 reader did not load')
+  }
+  return h5mod
+}
+
+// A promise that rejects inside the reader would otherwise leave every call
+// pending with nothing to report.
+self.addEventListener('unhandledrejection', ev => {
+  const r = (ev as PromiseRejectionEvent).reason
+  post({ id: 0, event: 'fatal', message: r?.message ?? String(r), stack: String(r?.stack ?? '').slice(0, 400) })
+})
+
 let scan: Scan | null = null
 
 /** Strip the closures: a Scan cannot be structured-cloned, its shape can. */
@@ -35,7 +65,7 @@ function describe(s: Scan, nnzPerCell: Int32Array | null): ScanInfo {
 }
 
 type Msg =
-  | { id: number; cmd: 'open'; file: File }
+  | { id: number; cmd: 'open'; file: File; readerUrl: string }
   | { id: number; cmd: 'convert'; choices: Choices; shards: Shard[] | null; passes: number[][] | null }
 
 const post = (m: unknown, transfer: Transferable[] = []) =>
@@ -55,11 +85,12 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
         const r = new RdsReader(raw)
         scan = scanSeurat(r, r.read(), file.name)
       } else if (name.endsWith('.h5ad') || name.endsWith('.h5')) {
-        post({ id, event: 'stage', stage: 'Mounting the file' })
-        // No copy: HDF5 reads only the bytes it asks for, straight from disk.
-        const h5wasm = (await import('h5wasm')).default
+        post({ id, event: 'stage', stage: 'Loading the HDF5 reader' })
+        const h5wasm = await h5(e.data.readerUrl)
+        await h5wasm.ready
+        // No copy: HDF5 reads only the bytes it asks for, straight from the File.
         post({ id, event: 'stage', stage: 'Scanning obs, var and obsm' })
-        scan = (await scanH5adFile(h5wasm as never, file)).scan
+        scan = (await scanH5adFile(h5wasm, file)).scan
       } else {
         throw new Error(`this is a ${name.split('.').pop() ?? 'file'} — the lab reads .h5ad (Scanpy/AnnData) and .rds (Seurat).`)
       }
