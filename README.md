@@ -109,6 +109,15 @@ against an independent implementation of the same spec rather than against a rec
 
 ## Known limits
 
+- **`.h5ad` files must be under 2 GB.** h5wasm is a 32-bit WebAssembly build of HDF5 and its
+  emulated filesystem holds the whole file with signed-32-bit lengths, so 2^31-1 bytes is a hard
+  ceiling (measured: 2047 MB writes, 2048 MB throws). The lab refuses larger files up front with
+  that explanation rather than failing deep inside the reader. Subset the object first, or run
+  `tools/export_h5ad.py` offline, which streams and has no such limit.
+- **Very large objects are out of range regardless of format.** The conversion holds the matrix
+  in memory twice — once cell-major, once gene-major — so it needs roughly `nnz x 16` bytes.
+  A 700 M-nonzero atlas would want ~11 GB and produce a multi-GB bundle the studio could not
+  open either. Convert a subset.
 - **Dense `.h5ad` X** is materialized in full before being thinned to nonzeros. Sparse is the
   normal case and is streamed; a large dense matrix will be memory-hungry.
 - **Seurat v5** objects are read through `@layers`. Tested against v3/v4 objects; a v5 object

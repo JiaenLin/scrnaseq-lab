@@ -29,6 +29,19 @@ function Handoff({ n, title, done, children }: {
   )
 }
 
+/**
+ * A sentence for the user, whatever was thrown.
+ *
+ * Emscripten's ErrnoError carries no `message`, so reading `.message` blindly
+ * printed "That file did not open. undefined" — the one case where saying
+ * nothing would have been better than what was said.
+ */
+function explain(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e)
+  if (msg && msg !== 'undefined') return msg
+  return 'the reader failed without saying why. If the file is very large, subset it and try again; otherwise please open an issue with the file’s size and how it was written.'
+}
+
 /** Let the browser paint the stage label before the next blocking step. */
 const yieldToPaint = () =>
   new Promise<void>(r => requestAnimationFrame(() => setTimeout(r, 0)))
@@ -90,7 +103,7 @@ export default function App() {
         label: file.name.replace(/\.(h5ad|rds|h5)$/i, ''),
       })
     } catch (e) {
-      setError((e as Error).message)
+      setError(explain(e))
     } finally {
       setBusy(false)
       setStage('')
@@ -128,7 +141,7 @@ export default function App() {
         pseudobulkColumns: res.pseudobulkColumns,
       })
     } catch (e) {
-      setError((e as Error).message)
+      setError(explain(e))
     } finally {
       setBusy(false)
       setStage('')

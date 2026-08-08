@@ -55,6 +55,15 @@ const toStrings = (v: unknown): string[] =>
 
 export class H5adError extends Error {}
 
+/**
+ * The largest .h5ad the in-tab reader can accept.
+ *
+ * 2^31 - 1: h5wasm's emulated filesystem stores lengths as signed 32-bit.
+ * Verified empirically against this build — a 2047 MB write succeeds and a
+ * 2048 MB write throws.
+ */
+export const MAX_H5AD_BYTES = 2 ** 31 - 1
+
 /** The compound-dataset layout: one array of rows, each row an array of fields. */
 interface Compound { names: string[]; rows: unknown[][]; members: H5[] }
 
@@ -254,11 +263,28 @@ export async function scanH5ad(
   h5wasm: H5Module, bytes: Uint8Array, filename: string,
 ): Promise<Scan> {
   const { FS } = await h5wasm.ready
+
+  // h5wasm is a 32-bit WebAssembly build of HDF5, and its emulated filesystem
+  // holds the whole file. Lengths there are signed 32-bit, so 2 GB is a hard
+  // ceiling — measured exactly: 2047 MB writes, 2048 MB does not. Past it
+  // FS.writeFile throws an ErrnoError whose `message` is undefined, which the
+  // UI then rendered as "That file did not open. undefined". Refusing up front
+  // costs nothing and can say something true.
+  if (bytes.length >= MAX_H5AD_BYTES) {
+    throw new H5adError(
+      `this .h5ad is ${(bytes.length / 1e9).toFixed(1)} GB, and the HDF5 reader in this tab cannot open a file of 2 GB or more — it is a 32-bit WebAssembly build, so that is a limit of the reader rather than a setting. Subset the object in Python first (one tissue, one timepoint, or a downsample of cells) and convert that, or run tools/export_h5ad.py offline where there is no such limit.`)
+  }
+
   // Written relative to the emulated working directory: the root of h5wasm's
   // in-memory filesystem is not writable in its Node build.
   const path = `scan_${filename.replace(/[^\w.-]/g, '_')}`
   try { FS.unlink(path) } catch { /* first run */ }
-  FS.writeFile(path, bytes)
+  try {
+    FS.writeFile(path, bytes)
+  } catch {
+    throw new H5adError(
+      `this .h5ad (${(bytes.length / 1e9).toFixed(1)} GB) would not fit in the reader's memory. Subset or downsample the object and convert that instead.`)
+  }
 
   let f: H5
   try {

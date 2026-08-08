@@ -70,8 +70,8 @@ export default function Landing({ onFile, error, busy, stage }: {
             {busy ? (stage || 'Reading…') : 'Choose a file'}
           </button>
           <p className="mt-2.5 text-[12px]" style={{ color: 'var(--ink-3)' }}>
-            or drop it here — <code className="mono">.h5ad</code> or{' '}
-            <code className="mono">.rds</code>, up to a few hundred MB
+            or drop it here — <code className="mono">.h5ad</code> up to 2&nbsp;GB, or{' '}
+            <code className="mono">.rds</code>
           </p>
         </div>
 
