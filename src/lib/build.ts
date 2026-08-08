@@ -113,14 +113,32 @@ function grouping(col: Column | undefined, fallback: string, nCells: number): {
   }
   // NA becomes its own level rather than silently joining level 0 — a cell with
   // no annotation is a fact about the object, not a member of the first cluster.
+  const NA = col.levels.length
+  const raw = new Int32Array(col.codes.length)
   let hasNA = false
-  for (const c of col.codes) if (c < 0) { hasNA = true; break }
-  if (!hasNA) return { codes: col.codes, levels: col.levels }
-  const levels = [...col.levels, 'NA']
-  const codes = new Int32Array(col.codes.length)
   for (let i = 0; i < col.codes.length; i++) {
-    codes[i] = col.codes[i] < 0 ? levels.length - 1 : col.codes[i]
+    if (col.codes[i] < 0) { raw[i] = NA; hasNA = true } else raw[i] = col.codes[i]
   }
+  const all = hasNA ? [...col.levels, 'NA'] : col.levels
+
+  // Levels with no cells are dropped. A bundle should describe the cells it
+  // actually holds: when an atlas is split, most shards contain only a few of
+  // the parent's 93 samples and a handful of its 20 timepoints, and carrying
+  // the empty ones through made the studio report "0 samples per group" and a
+  // minimum replicate count of zero for groups that were simply not there.
+  const used = new Uint8Array(all.length)
+  for (const c of raw) used[c] = 1
+  let n = 0
+  const remap = new Int32Array(all.length).fill(-1)
+  const levels: string[] = []
+  for (let i = 0; i < all.length; i++) {
+    if (!used[i]) continue
+    remap[i] = n++
+    levels.push(all[i])
+  }
+  if (levels.length === all.length) return { codes: raw, levels: all }
+  const codes = new Int32Array(raw.length)
+  for (let i = 0; i < raw.length; i++) codes[i] = remap[raw[i]]
   return { codes, levels }
 }
 
