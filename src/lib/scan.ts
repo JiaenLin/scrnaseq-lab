@@ -29,6 +29,23 @@ export interface MatrixRef {
   kind: MatrixKind
   /** Read it in full. Deferred: most objects hold more matrices than we need. */
   load: () => CellMajor
+  /**
+   * Nonzeros per cell, without reading the values.
+   *
+   * For a CSR matrix this is a difference of the row offsets — a few hundred KB
+   * for an atlas — so a split can be costed exactly before any of it is read.
+   */
+  nnzPerCell?: () => Int32Array
+  /**
+   * Read several disjoint cell subsets in one forward pass.
+   *
+   * Random access is not an option on a real atlas: the payload is chunked and
+   * compressed, so a scattered row read decompresses a whole chunk for ~2500
+   * values. Measured on a 736 M-nonzero file, per-row reads run at 20 ms each —
+   * 100 minutes for one pass — while a forward scan sustains 11 M nonzeros/s
+   * and finishes in about a minute. So everything here is sequential.
+   */
+  loadGroups?: (groups: Int32Array[], onProgress?: (frac: number) => void) => CellMajor[]
 }
 
 export interface EmbeddingRef {
@@ -36,6 +53,27 @@ export interface EmbeddingRef {
   nDims: number
   /** Interleaved x,y — the first two dimensions. */
   load: () => Float32Array
+}
+
+/**
+ * Everything about a scan that survives postMessage.
+ *
+ * The reader lives in a worker — it holds an open HDF5 handle and closures over
+ * it — but the UI only ever needs the description. So the worker keeps `Scan`
+ * and sends this, and every question the interface asks is answered from it.
+ */
+export interface ScanInfo {
+  format: 'h5ad' | 'seurat'
+  source: string
+  nCells: number
+  columns: Column[]
+  matrices: { key: string; geneSet: string; nGenes: number; nCells: number; kind: MatrixKind }[]
+  embeddings: { key: string; nDims: number }[]
+  geneSets: Record<string, string[]>
+  provenance: Record<string, string | null>
+  notes: string[]
+  /** Nonzeros per cell, when the source could supply them cheaply. */
+  nnzPerCell?: Int32Array | null
 }
 
 export interface Scan {
@@ -217,7 +255,7 @@ export function duplicateOf(columns: Column[]): Map<string, string> {
  * and offering it in both places invites a bundle whose condition and cluster
  * are the same partition — which produces comparisons with nothing to compare.
  */
-export function candidates(scan: Scan, role: Role, exclude: (string | null)[] = []): Column[] {
+export function candidates(scan: ScanInfo, role: Role, exclude: (string | null)[] = []): Column[] {
   const names = role === 'cluster' ? CLUSTER_NAMES
     : role === 'sample' ? SAMPLE_NAMES : CONDITION_NAMES
   const taken = scan.columns.filter(c => exclude.includes(c.name))
@@ -236,7 +274,7 @@ export function candidates(scan: Scan, role: Role, exclude: (string | null)[] = 
  * 0..8 and `seurat_annotations` holding "B", "NK" describe the same grouping,
  * and only one of them makes a readable figure.
  */
-export function guessCluster(scan: Scan): string | null {
+export function guessCluster(scan: ScanInfo): string | null {
   const cands = candidates(scan, 'cluster')
   if (!cands.length) return null
   const named = cands.find(c =>
@@ -244,7 +282,7 @@ export function guessCluster(scan: Scan): string | null {
   return (named ?? cands[0]).name
 }
 
-export function guessRole(scan: Scan, role: 'sample' | 'condition'): string | null {
+export function guessRole(scan: ScanInfo, role: 'sample' | 'condition'): string | null {
   const names = role === 'sample' ? SAMPLE_NAMES : CONDITION_NAMES
   const hit = candidates(scan, role).find(c => rank(c.name, names) < 1000)
   return hit?.name ?? null
@@ -253,7 +291,7 @@ export function guessRole(scan: Scan, role: 'sample' | 'condition'): string | nu
 const EMBED_ORDER = ['umap', 'tsne', 'draw_graph', 'pca']
 
 /** UMAP, then t-SNE, then a force layout, then PCA. */
-export function guessEmbedding(scan: Scan): string | null {
+export function guessEmbedding(scan: ScanInfo): string | null {
   const usable = scan.embeddings.filter(e => e.nDims >= 2)
   if (!usable.length) return null
   for (const want of EMBED_ORDER) {
@@ -263,7 +301,7 @@ export function guessEmbedding(scan: Scan): string | null {
   return usable[0].key
 }
 
-export const column = (scan: Scan, name: string | null): Column | undefined =>
+export const column = (scan: ScanInfo, name: string | null): Column | undefined =>
   name ? scan.columns.find(c => c.name === name) : undefined
 
 /**

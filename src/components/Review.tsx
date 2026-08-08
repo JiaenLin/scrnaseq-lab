@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import {
   candidates, column, crossCheck, duplicateOf, replicatesPerCondition,
   samePartition, unusable,
-  type Choices, type Column, type Role, type Scan,
+  type Choices, type Column, type Role, type ScanInfo,
 } from '../lib/scan.ts'
 import { Card, Field, LevelBar, Mono } from './Ui.tsx'
 
@@ -59,7 +59,7 @@ function Option({ col, chosen, sameAs, onPick }: {
 interface Taken { name: string | null; as: string }
 
 function Picker({ scan, role, value, onChange, allowNone, noneLabel, emptyNote, exclude = [] }: {
-  scan: Scan; role: Role; value: string | null
+  scan: ScanInfo; role: Role; value: string | null
   onChange: (v: string | null) => void
   allowNone?: boolean; noneLabel?: string; emptyNote?: string; exclude?: Taken[]
 }) {
@@ -156,7 +156,7 @@ function Picker({ scan, role, value, onChange, allowNone, noneLabel, emptyNote, 
 }
 
 export default function Review({ scan, choices, setChoices, onBuild, busy, stage }: {
-  scan: Scan
+  scan: ScanInfo
   choices: Choices
   setChoices: (c: Choices) => void
   onBuild: () => void

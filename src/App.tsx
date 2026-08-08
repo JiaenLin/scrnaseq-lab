@@ -1,13 +1,11 @@
 import { useState, type ReactNode } from 'react'
-import { gunzipSync } from 'fflate'
 import Landing from './components/Landing.tsx'
 import Review from './components/Review.tsx'
+import Split from './components/Split.tsx'
 import { Card, Flow } from './components/Ui.tsx'
-import { decompressRds, RdsReader } from './lib/rds.ts'
-import { scanSeurat } from './lib/seurat.ts'
-import { scanH5ad } from './lib/h5ad.ts'
-import { buildBundle, type BundleMeta } from './lib/build.ts'
-import { guessCluster, guessEmbedding, guessRole, type Choices, type Scan } from './lib/scan.ts'
+import { convert as runConvert, openFile, release, type BuiltBundle } from './lib/client.ts'
+import { COMFORTABLE_NNZ, planSplit, splitCandidates } from './lib/shard.ts'
+import { guessCluster, guessEmbedding, guessRole, type Choices, type ScanInfo } from './lib/scan.ts'
 
 const STUDIO = 'https://jiaenlin.github.io/scrnaseq-studio/'
 
@@ -33,67 +31,44 @@ function Handoff({ n, title, done, children }: {
  * A sentence for the user, whatever was thrown.
  *
  * Emscripten's ErrnoError carries no `message`, so reading `.message` blindly
- * printed "That file did not open. undefined" — the one case where saying
- * nothing would have been better than what was said.
+ * printed "That file did not open. undefined".
  */
-function explain(e: unknown): string {
+const explain = (e: unknown): string => {
   const msg = e instanceof Error ? e.message : String(e)
-  if (msg && msg !== 'undefined') return msg
-  return 'the reader failed without saying why. If the file is very large, subset it and try again; otherwise please open an issue with the file’s size and how it was written.'
+  return msg && msg !== 'undefined'
+    ? msg
+    : 'the reader failed without saying why. If the object is very large, try splitting it.'
 }
 
-/** Let the browser paint the stage label before the next blocking step. */
-const yieldToPaint = () =>
-  new Promise<void>(r => requestAnimationFrame(() => setTimeout(r, 0)))
-
-interface Done {
-  blob: Blob
-  name: string
-  meta: BundleMeta
-  pseudobulkColumns: number
+function saveBlob(b: Blob, name: string) {
+  const url = URL.createObjectURL(b)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
 }
 
 export default function App() {
-  const [scan, setScan] = useState<Scan | null>(null)
+  const [scan, setScan] = useState<ScanInfo | null>(null)
   const [choices, setChoices] = useState<Choices | null>(null)
-  const [done, setDone] = useState<Done | null>(null)
+  const [splitBy, setSplitBy] = useState<string | null>(null)
+  const [bundles, setBundles] = useState<BuiltBundle[]>([])
+  const [finished, setFinished] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [stage, setStage] = useState('')
+  const [frac, setFrac] = useState(0)
   const [busy, setBusy] = useState(false)
-  const [saved, setSaved] = useState(false)
+  const [saved, setSaved] = useState<Set<string>>(new Set())
 
   async function open(file: File) {
     setError(null)
-    setDone(null)
+    setBundles([])
+    setFinished(false)
     setBusy(true)
     try {
-      const name = file.name.toLowerCase()
       setStage(`Reading ${file.name}`)
-      await yieldToPaint()
-      const bytes = new Uint8Array(await file.arrayBuffer())
-
-      let s: Scan
-      if (name.endsWith('.rds')) {
-        setStage('Decompressing the .rds')
-        await yieldToPaint()
-        const raw = decompressRds(bytes, b => gunzipSync(b))
-        setStage('Walking the R object')
-        await yieldToPaint()
-        const r = new RdsReader(raw)
-        s = scanSeurat(r, r.read(), file.name)
-      } else if (name.endsWith('.h5ad') || name.endsWith('.h5')) {
-        setStage('Opening the HDF5 file')
-        await yieldToPaint()
-        // Loaded on demand: h5wasm is a WASM build of HDF5 and has no business
-        // being in the bundle of someone who only ever opens .rds files.
-        const h5wasm = (await import('h5wasm')).default
-        setStage('Scanning obs, var and obsm')
-        await yieldToPaint()
-        s = await scanH5ad(h5wasm, bytes, file.name)
-      } else {
-        throw new Error(`this is a ${name.split('.').pop() ?? 'file'} — the lab reads .h5ad (Scanpy/AnnData) and .rds (Seurat).`)
-      }
-
+      const s = await openFile(file, { onStage: setStage })
       setScan(s)
       setChoices({
         cluster: guessCluster(s) ?? '',
@@ -102,6 +77,14 @@ export default function App() {
         embedding: guessEmbedding(s) ?? '',
         label: file.name.replace(/\.(h5ad|rds|h5)$/i, ''),
       })
+      // Pre-select the best split when the object is too large to be one
+      // bundle. Split renders nothing at all when it already fits, so a normal
+      // object never sees any of this.
+      let total = 0
+      for (const v of s.nnzPerCell ?? []) total += v
+      setSplitBy(total > COMFORTABLE_NNZ
+        ? splitCandidates(s.columns, s.nnzPerCell ?? null, s.nCells)[0]?.column.name ?? null
+        : null)
     } catch (e) {
       setError(explain(e))
     } finally {
@@ -114,87 +97,111 @@ export default function App() {
     if (!scan || !choices) return
     setBusy(true)
     setError(null)
+    setBundles([])
+    setFinished(false)
     try {
-      let out: ReturnType<typeof buildBundle> | null = null
-      // buildBundle reports each stage as it starts; yielding between them is
-      // what makes those labels visible rather than one long freeze.
-      const stages: string[] = []
-      await new Promise<void>((resolve, reject) => {
-        const run = async () => {
-          try {
-            out = buildBundle(scan, choices, st => {
-              stages.push(st)
-              setStage(st)
-            })
-            resolve()
-          } catch (e) { reject(e) }
-        }
-        setStage('Starting')
-        requestAnimationFrame(() => void run())
+      const col = splitBy ? scan.columns.find(c => c.name === splitBy) : null
+      const plan = col ? planSplit(col, scan.nnzPerCell ?? null, scan.nCells) : null
+      const split = plan
+        ? {
+            shards: plan.shards,
+            passes: plan.passes.map(p => p.map(s => plan.shards.indexOf(s))),
+          }
+        : null
+      await runConvert(choices, split, {
+        onStage: setStage,
+        onProgress: (_pass, f) => setFrac(f),
+        onBundle: b => setBundles(prev => [...prev, b]),
       })
-      const res = out! as ReturnType<typeof buildBundle>
-      const blobPart = new Uint8Array(res.zip)
-      setDone({
-        blob: new Blob([blobPart as unknown as BlobPart], { type: 'application/zip' }),
-        name: `${(choices.label || 'bundle').replace(/[^\w.-]+/g, '_')}.zip`,
-        meta: res.meta,
-        pseudobulkColumns: res.pseudobulkColumns,
-      })
+      setFinished(true)
     } catch (e) {
       setError(explain(e))
     } finally {
       setBusy(false)
       setStage('')
+      setFrac(0)
     }
   }
 
-  const download = () => {
-    if (!done) return
-    const url = URL.createObjectURL(done.blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = done.name
-    a.click()
-    setSaved(true)
-    setTimeout(() => URL.revokeObjectURL(url), 5000)
-  }
-
-  const restart = () => {
+  function restart() {
+    release()
     setScan(null)
     setChoices(null)
-    setDone(null)
+    setBundles([])
+    setFinished(false)
     setError(null)
-    setSaved(false)
+    setSaved(new Set())
   }
 
-  if (done) {
-    const mb = done.blob.size / 1e6
+  function save(b: BuiltBundle) {
+    saveBlob(b.blob, b.name)
+    setSaved(prev => new Set(prev).add(b.name))
+  }
+
+  if (finished && bundles.length > 0) {
+    const totalMb = bundles.reduce((n, b) => n + b.blob.size, 0) / 1e6
+    const cells = bundles.reduce((n, b) => n + b.meta.nCells, 0)
+    const allSaved = bundles.every(b => saved.has(b.name))
+    const many = bundles.length > 1
     return (
       <div className="wrap py-10">
         <Card
           eyebrow="Converted — the lab's job is done"
-          title={`${done.name} is ready for scRNA-seq Studio`}
-          sub={`${done.meta.nCells.toLocaleString()} cells · ${done.meta.nGenes.toLocaleString()} genes · ${done.meta.nnz.toLocaleString()} stored values · ${mb.toFixed(1)} MB`}
+          title={many
+            ? `${bundles.length} bundles are ready for scRNA-seq Studio`
+            : `${bundles[0].name} is ready for scRNA-seq Studio`}
+          sub={`${cells.toLocaleString()} cells · ${bundles[0].meta.nGenes.toLocaleString()} genes · ${totalMb.toFixed(1)} MB in total`}
         >
           <Flow at="done" />
 
-          {/* Two steps, and only one of them is live at a time: the studio cannot
-              open a file that has not been saved yet, so it stays secondary
-              until the download has actually happened. */}
           <div className="mt-5 grid gap-2.5">
-            <Handoff n={1} title="Save the bundle" done={saved}>
-              <button className={`btn ${saved ? '' : 'btn-primary'}`} onClick={download}>
-                {saved ? `Download ${done.name} again` : `Download ${done.name}`}
-              </button>
+            <Handoff n={1} title={many ? 'Save the bundles' : 'Save the bundle'} done={allSaved}>
+              {many && (
+                <button
+                  className={`btn mb-2.5 ${allSaved ? '' : 'btn-primary'}`}
+                  onClick={() => bundles.forEach((b, i) => setTimeout(() => save(b), i * 350))}
+                >
+                  Download all {bundles.length}
+                </button>
+              )}
+              <div className="scrollx" style={{ maxHeight: 320 }}>
+                <table className="t">
+                  <thead>
+                    <tr>
+                      <th>Bundle</th><th className="num">Cells</th>
+                      <th className="num">Values</th><th className="num">Size</th><th />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bundles.map(b => (
+                      <tr key={b.name}>
+                        <td className="font-semibold">{b.key ?? b.meta.label}</td>
+                        <td className="num">{b.meta.nCells.toLocaleString()}</td>
+                        <td className="num" style={{ color: 'var(--ink-2)' }}>
+                          {(b.meta.nnz / 1e6).toFixed(1)} M
+                        </td>
+                        <td className="num" style={{ color: 'var(--ink-2)' }}>
+                          {(b.blob.size / 1e6).toFixed(1)} MB
+                        </td>
+                        <td className="num">
+                          <button className="chip" onClick={() => save(b)}>
+                            {saved.has(b.name) ? 'saved ✓' : 'download'}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </Handoff>
-            <Handoff n={2} title="Open it in scRNA-seq Studio">
-              <a className={`btn ${saved ? 'btn-primary' : ''}`} href={STUDIO}
-                target="_blank" rel="noreferrer">
-                Open scRNA-seq Studio →
-              </a>
+
+            <Handoff n={2} title={many ? 'Open them in scRNA-seq Studio' : 'Open it in scRNA-seq Studio'}>
+              <a className={`btn ${allSaved ? 'btn-primary' : ''}`} href={STUDIO}
+                target="_blank" rel="noreferrer">Open scRNA-seq Studio →</a>
               <p className="sub mt-2">
-                Drop <span className="mono">{done.name}</span> onto its panel — it stays on your
-                machine.
+                {many
+                  ? 'Drop one bundle at a time onto its panel. Each opens with every tab working on its own cells, and the gene list and metadata columns are identical across all of them.'
+                  : 'Drop it onto the panel — it stays on your machine.'}
               </p>
             </Handoff>
           </div>
@@ -204,37 +211,14 @@ export default function App() {
           </div>
 
           <div className="mt-5">
-            <div className="eyebrow mb-2">What went in</div>
-            <div className="scrollx">
-              <table className="t">
-                <tbody>
-                  <tr><td className="font-semibold">Cell types</td>
-                    <td>{done.meta.clusters.length} — {done.meta.clusters.join(', ')}</td></tr>
-                  <tr><td className="font-semibold">Conditions</td>
-                    <td>{done.meta.conditions.join(', ')}</td></tr>
-                  <tr><td className="font-semibold">Samples</td>
-                    <td>{done.meta.samples.length} — {done.meta.samples.slice(0, 8).map(s => s.id).join(', ')}
-                      {done.meta.samples.length > 8 ? ' …' : ''}</td></tr>
-                  <tr><td className="font-semibold">Embedding</td><td className="mono">{done.meta.embedding}</td></tr>
-                  <tr><td className="font-semibold">Expression</td><td className="mono">{done.meta.expression}</td></tr>
-                  <tr><td className="font-semibold">Pseudobulk</td>
-                    <td>{done.pseudobulkColumns
-                      ? `${done.pseudobulkColumns} sample × cluster columns of summed raw counts`
-                      : 'not written — no raw counts in the object'}</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <div className="mt-5">
             <div className="eyebrow mb-2">Every decision the converter made</div>
             <ul className="grid gap-1">
-              {done.meta.notes.map((n, i) => (
+              {bundles[0].meta.notes.map((n, i) => (
                 <li key={i} className="text-[12.5px]" style={{ color: 'var(--ink-2)' }}>· {n}</li>
               ))}
             </ul>
             <p className="sub mt-2">
-              These travel inside the bundle and show again on the studio&rsquo;s Overview tab.
+              These travel inside every bundle and appear again on the studio&rsquo;s Overview tab.
             </p>
           </div>
         </Card>
@@ -250,10 +234,21 @@ export default function App() {
             <div className="note"><b>That did not convert.</b> {error}</div>
           </div>
         )}
+        <div className="wrap pt-7">
+          <Split scan={scan} splitBy={splitBy} onChange={setSplitBy} />
+        </div>
         <Review
           scan={scan} choices={choices} setChoices={setChoices}
-          onBuild={convert} busy={busy} stage={stage}
+          onBuild={convert} busy={busy}
+          stage={stage + (frac > 0 ? ` · ${(frac * 100).toFixed(0)}%` : '')}
         />
+        {busy && bundles.length > 0 && (
+          <div className="wrap pb-4">
+            <div className="note note-info">
+              <b>{bundles.length} written so far</b> — {bundles.map(b => b.key).join(', ')}
+            </div>
+          </div>
+        )}
         <div className="wrap pb-10">
           <button className="btn btn-ghost" onClick={restart}>Open a different file</button>
         </div>

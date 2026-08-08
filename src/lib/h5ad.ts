@@ -223,6 +223,86 @@ function readMatrix(m: H5, nCells: number, nGenes: number, key: string): CellMaj
   return dropZeros({ nCells, nGenes, indptr, indices, data })
 }
 
+
+/** Row offsets of a CSR matrix, as counts per cell. */
+function rowLengths(m: H5, nCells: number): Int32Array {
+  const indptr = toI32(m.get('indptr').value)
+  const out = new Int32Array(nCells)
+  for (let c = 0; c < nCells; c++) out[c] = indptr[c + 1] - indptr[c]
+  return out
+}
+
+/** Values read per slice. Large enough that chunk decompression amortizes. */
+const SCAN_BLOCK = 8_000_000
+
+/**
+ * Read disjoint cell subsets from a CSR matrix in one forward pass.
+ *
+ * A window slides forward over the stored values, never backwards, so each
+ * compressed chunk is decompressed at most once. Cells not in any group are
+ * skipped outright — the window jumps to the next selected row — so a split
+ * that touches a quarter of the cells reads far less than the whole file.
+ */
+function readGroupsCSR(
+  m: H5, groups: Int32Array[], nCells: number, nGenes: number,
+  onProgress?: (frac: number) => void,
+): CellMajor[] {
+  const indptr = toI32(m.get('indptr').value)
+  const dataDs = m.get('data')
+  const idxDs = m.get('indices')
+  const total = indptr[nCells]
+
+  // Which group each cell belongs to, and how big each group's arrays must be.
+  const groupOf = new Int32Array(nCells).fill(-1)
+  groups.forEach((cells, g) => { for (const c of cells) groupOf[c] = g })
+  const out = groups.map(cells => {
+    let nnz = 0
+    for (const c of cells) nnz += indptr[c + 1] - indptr[c]
+    return {
+      nCells: cells.length, nGenes,
+      indptr: new Int32Array(cells.length + 1),
+      indices: new Int32Array(nnz),
+      data: new Float32Array(nnz),
+    } as CellMajor
+  })
+  const at = new Int32Array(groups.length)      // write cursor per group
+  const row = new Int32Array(groups.length)     // next row index per group
+
+  let winStart = 0, winEnd = 0
+  let winData: Float32Array = new Float32Array(0)
+  let winIdx: Int32Array = new Int32Array(0)
+
+  for (let c = 0; c < nCells; c++) {
+    const g = groupOf[c]
+    if (g < 0) continue
+    const p0 = indptr[c], p1 = indptr[c + 1]
+    if (p0 < winStart || p1 > winEnd) {
+      winStart = p0
+      winEnd = Math.min(total, Math.max(p0 + SCAN_BLOCK, p1))
+      winData = toF32(dataDs.slice([[winStart, winEnd]]))
+      winIdx = toI32(idxDs.slice([[winStart, winEnd]]))
+      onProgress?.(p0 / total)
+    }
+    const o = out[g]
+    o.indptr[row[g]] = at[g]
+    for (let k = p0; k < p1; k++) {
+      const v = winData[k - winStart]
+      if (v === 0) continue
+      o.indices[at[g]] = winIdx[k - winStart]
+      o.data[at[g]] = v
+      at[g]++
+    }
+    row[g]++
+  }
+  // Explicit zeros were skipped, so the arrays may be shorter than reserved.
+  return out.map((o, g) => {
+    o.indptr[row[g]] = at[g]
+    return at[g] === o.data.length ? o : {
+      ...o, indices: o.indices.subarray(0, at[g]), data: o.data.subarray(0, at[g]),
+    }
+  })
+}
+
 /** Enough values to classify a matrix, without reading all of it. */
 function sampleMatrix(m: H5, want = 20000): Float64Array {
   if (isDataset(m)) {
@@ -259,40 +339,14 @@ export interface H5Module {
 }
 
 /** Read an .h5ad far enough to ask the user which columns to use. */
-export async function scanH5ad(
-  h5wasm: H5Module, bytes: Uint8Array, filename: string,
-): Promise<Scan> {
-  const { FS } = await h5wasm.ready
-
-  // h5wasm is a 32-bit WebAssembly build of HDF5, and its emulated filesystem
-  // holds the whole file. Lengths there are signed 32-bit, so 2 GB is a hard
-  // ceiling — measured exactly: 2047 MB writes, 2048 MB does not. Past it
-  // FS.writeFile throws an ErrnoError whose `message` is undefined, which the
-  // UI then rendered as "That file did not open. undefined". Refusing up front
-  // costs nothing and can say something true.
-  if (bytes.length >= MAX_H5AD_BYTES) {
-    throw new H5adError(
-      `this .h5ad is ${(bytes.length / 1e9).toFixed(1)} GB, and the HDF5 reader in this tab cannot open a file of 2 GB or more — it is a 32-bit WebAssembly build, so that is a limit of the reader rather than a setting. Subset the object in Python first (one tissue, one timepoint, or a downsample of cells) and convert that, or run tools/export_h5ad.py offline where there is no such limit.`)
-  }
-
-  // Written relative to the emulated working directory: the root of h5wasm's
-  // in-memory filesystem is not writable in its Node build.
-  const path = `scan_${filename.replace(/[^\w.-]/g, '_')}`
-  try { FS.unlink(path) } catch { /* first run */ }
-  try {
-    FS.writeFile(path, bytes)
-  } catch {
-    throw new H5adError(
-      `this .h5ad (${(bytes.length / 1e9).toFixed(1)} GB) would not fit in the reader's memory. Subset or downsample the object and convert that instead.`)
-  }
-
-  let f: H5
-  try {
-    f = new h5wasm.File(path, 'r')
-  } catch {
-    throw new H5adError('this file is not readable as HDF5. An .h5ad is an HDF5 file — if this came from Seurat, save it as .rds instead.')
-  }
-
+/**
+ * Scan an already-open HDF5 handle.
+ *
+ * Split from the entry points below because how the file got opened — copied
+ * into memory, or mounted lazily from a File inside a worker — changes nothing
+ * about how it is read.
+ */
+export function scanOpenH5ad(f: H5, filename: string): Scan {
   const notes: string[] = []
   const note = (s: string) => notes.push(s)
 
@@ -332,10 +386,17 @@ export async function scanH5ad(
   const add = (key: string, m: H5, geneSet: string, cells: number, genes: number) => {
     if (!m) return
     try {
+      const csr = !isDataset(m) &&
+        !text(attr(m, 'encoding-type') ?? attr(m, 'h5sparse_format') ?? '').includes('csc')
       matrices.push({
         key, geneSet, nCells: cells, nGenes: genes,
         kind: classify(sampleMatrix(m)),
         load: () => readMatrix(m, cells, genes, key),
+        ...(csr ? {
+          nnzPerCell: () => rowLengths(m, cells),
+          loadGroups: (groups, onProgress) =>
+            readGroupsCSR(m, groups, cells, genes, onProgress),
+        } : {}),
       })
     } catch (e) {
       note(`${key} could not be read (${(e as Error).message}); skipped`)
@@ -402,4 +463,152 @@ export async function scanH5ad(
     format: 'h5ad', source: filename, nCells, columns, matrices, embeddings,
     geneSets, provenance, notes,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Two ways in.
+
+/**
+ * Copy the whole file into h5wasm's in-memory filesystem, then scan it.
+ *
+ * Simple and synchronous once the bytes are in hand, but it holds the file
+ * twice and cannot exceed MAX_H5AD_BYTES. Used by the Node tests; the app now
+ * takes the lazy path below.
+ */
+export async function scanH5ad(
+  h5wasm: H5Module, bytes: Uint8Array, filename: string,
+): Promise<Scan> {
+  const { FS } = await h5wasm.ready
+
+  // h5wasm is a 32-bit WebAssembly build of HDF5, and its emulated filesystem
+  // holds the whole file. Lengths there are signed 32-bit, so 2 GB is a hard
+  // ceiling — measured exactly: 2047 MB writes, 2048 MB does not.
+  if (bytes.length >= MAX_H5AD_BYTES) {
+    throw new H5adError(
+      `this .h5ad is ${(bytes.length / 1e9).toFixed(1)} GB, which is past the 2 GB limit of the in-memory reader. Open it in the app, which mounts the file instead of copying it, or run tools/export_h5ad.py offline.`)
+  }
+
+  const path = `scan_${filename.replace(/[^\w.-]/g, '_')}`
+  try { FS.unlink(path) } catch { /* first run */ }
+  try {
+    FS.writeFile(path, bytes)
+  } catch {
+    throw new H5adError(
+      `this .h5ad (${(bytes.length / 1e9).toFixed(1)} GB) would not fit in the reader's memory.`)
+  }
+  return scanOpenH5ad(openOrFail(h5wasm, path), filename)
+}
+
+function openOrFail(h5wasm: H5Module, path: string): H5 {
+  try {
+    return new h5wasm.File(path, 'r')
+  } catch {
+    throw new H5adError('this file is not readable as HDF5. An .h5ad is an HDF5 file — if this came from Seurat, save it as .rds instead.')
+  }
+}
+
+/**
+ * Mount a File lazily and scan it, at any size.
+ *
+ * WORKERFS is Emscripten's read-only filesystem over Blob/File objects: it
+ * serves reads straight from the File with FileReaderSync rather than copying
+ * it into memory, so nothing is ever held except the bytes HDF5 actually asks
+ * for. That is what lifts the 2 GB ceiling — a 9.3 GB atlas opens in
+ * milliseconds because opening it reads only the superblock and the metadata.
+ *
+ * FileReaderSync exists only inside a worker, so this must run in one.
+ */
+/** Bytes fetched per block. Big enough that the per-read cost disappears. */
+const BLOCK = 4 << 20
+/** Blocks kept resident: 48 x 4 MB, so the cache is bounded at ~192 MB. */
+const MAX_BLOCKS = 48
+
+/**
+ * Present a File to HDF5 as a file it can read, without copying it anywhere.
+ *
+ * Emscripten ships WORKERFS for exactly this, and it is unusable here: it
+ * answers every read with a fresh Blob slice through FileReaderSync, and that
+ * call costs about 4.4 ms however few bytes it returns. HDF5 walks its metadata
+ * in thousands of small reads, so a scan that takes 2 s against a local file
+ * had still not finished after ten minutes through WORKERFS. Measured on the
+ * 9.3 GB atlas: 2000 reads of 4 KB took 8.8 s - 0.9 MB/s - while one large read
+ * ran at 20 MB/s. The cost is per call, not per byte.
+ *
+ * So reads are served out of 4 MB blocks with an LRU behind them. HDF5's small
+ * reads then land in memory, and the 4.4 ms is paid once per block instead of
+ * once per read.
+ *
+ * FileReaderSync exists only inside a worker, so this must run in one.
+ */
+function mountBlockCached(FS: H5, file: File, dir: string, name: string): string {
+  const fr = new FileReaderSync()
+  const cache = new Map<number, Uint8Array>()
+
+  const blockAt = (i: number): Uint8Array => {
+    const hit = cache.get(i)
+    if (hit) {
+      cache.delete(i)        // reinsert, so iteration order is least-recent first
+      cache.set(i, hit)
+      return hit
+    }
+    const start = i * BLOCK
+    const slice = file.slice(start, Math.min(file.size, start + BLOCK))
+    const block = new Uint8Array(fr.readAsArrayBuffer(slice) as ArrayBuffer)
+    cache.set(i, block)
+    if (cache.size > MAX_BLOCKS) cache.delete(cache.keys().next().value as number)
+    return block
+  }
+
+  try { FS.mkdir(dir) } catch { /* left from a previous file */ }
+  try { FS.unlink(`${dir}/${name}`) } catch { /* first time */ }
+
+  const node = FS.createFile(dir, name, {}, true, false)
+  // stat() reports `usedBytes`, not `size`. Setting only the latter leaves HDF5
+  // looking at what it believes is an empty file — which it does not report as
+  // an error, it just never finds a superblock and reads nothing, forever.
+  Object.defineProperty(node, 'usedBytes', { get: () => file.size })
+  node.size = file.size
+  node.stream_ops = {
+    llseek(stream: H5, offset: number, whence: number): number {
+      const base = whence === 1 ? stream.position : whence === 2 ? node.size : 0
+      const pos = base + offset
+      if (pos < 0) throw new FS.ErrnoError(28)
+      return pos
+    },
+    read(_s: H5, buffer: Uint8Array, offset: number, length: number, position: number): number {
+      if (position >= node.size) return 0
+      const end = Math.min(node.size, position + length)
+      let pos = position, done = 0
+      while (pos < end) {
+        const i = Math.floor(pos / BLOCK)
+        const block = blockAt(i)
+        const from = pos - i * BLOCK
+        const n = Math.min(end - pos, block.length - from)
+        if (n <= 0) break
+        buffer.set(block.subarray(from, from + n), offset + done)
+        done += n
+        pos += n
+      }
+      return done
+    },
+  }
+  return `${dir}/${name}`
+}
+
+/**
+ * Open a File lazily and scan it, at any size.
+ *
+ * Nothing is held but the blocks HDF5 actually asks for, so the 2 GB ceiling of
+ * the copy-it-all path does not apply here.
+ */
+export async function scanH5adFile(h5wasm: H5Module, file: File): Promise<{
+  scan: Scan; handle: H5
+}> {
+  const { FS } = await h5wasm.ready
+  if (typeof FileReaderSync === 'undefined') {
+    throw new H5adError('a file this large can only be read inside a worker, and this is not one.')
+  }
+  const safe = file.name.replace(/[^\w.-]/g, '_')
+  const handle = openOrFail(h5wasm, mountBlockCached(FS, file, '/lazy', safe))
+  return { scan: scanOpenH5ad(handle, file.name), handle }
 }
