@@ -30,8 +30,21 @@ const text = (v: unknown): string =>
   Array.isArray(v) ? String(v[0]) : v instanceof Uint8Array
     ? new TextDecoder().decode(v) : String(v)
 
-const isGroup = (o: H5): boolean => o?.constructor?.name === 'Group'
-const isDataset = (o: H5): boolean => o?.constructor?.name === 'Dataset'
+/**
+ * Which kind of HDF5 node this is, told by what it can do rather than by what
+ * it is called.
+ *
+ * These used to compare `constructor.name` against 'Group' and 'Dataset',
+ * which holds only for as long as nothing renames those classes. h5wasm is
+ * bundled and minified into this app, so the names surviving is luck rather
+ * than a guarantee — and the day it stopped being true the failure would be
+ * silent: every group would read as "not a group", and obs would come back
+ * empty with no error to explain it.
+ */
+const isGroup = (o: H5): boolean =>
+  !!o && typeof o.keys === 'function' && typeof o.get === 'function'
+const isDataset = (o: H5): boolean =>
+  !!o && !isGroup(o) && (Array.isArray(o.shape) || typeof o.slice === 'function')
 
 /** BigInt64Array and friends do not coerce, so every read goes through here. */
 function toF32(v: unknown): Float32Array {

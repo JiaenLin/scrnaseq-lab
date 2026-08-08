@@ -87,19 +87,9 @@ function call<T>(
   })
 }
 
-/**
- * Where the worker should load the HDF5 reader from.
- *
- * Resolved here rather than in the worker: the worker's own URL is
- * /src/lib/worker.ts in dev and /assets/worker-<hash>.js in a build, so a path
- * relative to it lands somewhere different each time. `document.baseURI`
- * follows Vite's base, so this is also correct under a GitHub Pages subpath.
- */
-const READER_URL = new URL('vendor/h5wasm/hdf5_hl.js', document.baseURI).href
-
 /** Open and scan a file. The worker keeps it open afterwards. */
 export const openFile = (file: File, h: Handlers = {}): Promise<ScanInfo> =>
-  call<ScanInfo>({ cmd: 'open', file, readerUrl: READER_URL }, h, d => d.info as ScanInfo)
+  call<ScanInfo>({ cmd: 'open', file }, h, d => d.info as ScanInfo)
 
 /**
  * Convert, either whole or split into shards.

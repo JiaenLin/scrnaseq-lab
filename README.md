@@ -27,7 +27,7 @@ send it to.
 
 | Format | Layouts | Read by |
 |---|---|---|
-| `.h5ad` | modern AnnData (obs/var as groups) and legacy (< 0.7, compound datasets, `uns/<col>_categories`) | [h5wasm](https://github.com/usnistgov/h5wasm), a WASM build of HDF5 |
+| `.h5ad` | modern AnnData (obs/var as groups) and legacy (< 0.7, compound datasets, `uns/<col>_categories`) | [h5wasm](https://github.com/usnistgov/h5wasm) in a worker, over a block-cached reader — **no size limit** |
 | `.rds` | Seurat v3/v4 (`@counts`, `@data`) and v5 (`@layers`), gzip or uncompressed | `src/lib/rds.ts` — a direct reader for R's serialization format |
 
 The `.rds` path parses R's format itself rather than shipping webR. webR is a ~30 MB download
@@ -45,6 +45,38 @@ slot alone can be a gigabyte of doubles nobody asked for, so numeric vectors are
 | walk the whole object graph | ~60 ms |
 | scan → questions on screen (in-browser, end to end) | ~2.6 s |
 | convert → `bundle.zip` (8.9 MB, 2.2 M stored values) | ~0.6 s |
+
+## Atlases
+
+There is no file-size limit. The reader never copies the file: it mounts it
+behind a 4 MB block cache and HDF5 pulls only the bytes it asks for, so opening
+a 9.3 GB object costs about as much as opening a small one.
+
+Measured end to end in Chrome on the 9.3 GB, 292,495-cell, 736 M-nonzero
+`developing_mouse_nervous_system.h5ad`:
+
+| | |
+|---|---|
+| scan, questions on screen | **9–13 s** |
+| cost every possible split, exactly | **12 ms** — from the row offsets, no values read |
+| convert to 43 bundles | **10.1 min** (7 forward passes) |
+| largest bundle | 12,282 cells · 39.3 M values · 177 MB |
+
+Objects too large for one bundle are **split**. The studio holds the matrix in
+memory, so one bundle tops out around 50 M stored values; the lab costs every
+categorical column as a candidate split and ranks them by how many pieces come
+out too big. On the atlas above it picks `donor_id` — 43 bundles, none oversized
+— over `dissection`, which leaves six that would not open. Each bundle keeps the
+full gene list and every metadata column; only the cells differ.
+
+Two measurements shaped the design, both on that file:
+
+- **Random row reads cost 20 ms each.** The payload is chunked and compressed,
+  so a scattered row decompresses a whole chunk for ~2,500 values. One pass that
+  way would take 100 minutes.
+- **Sequential streaming sustains 11 M nonzeros/s.** So every read is
+  forward-only, a window slides and never seeks backwards, and all the shards in
+  one pass are filled together.
 
 ## What the object needs
 
@@ -109,15 +141,14 @@ against an independent implementation of the same spec rather than against a rec
 
 ## Known limits
 
-- **`.h5ad` files must be under 2 GB.** h5wasm is a 32-bit WebAssembly build of HDF5 and its
-  emulated filesystem holds the whole file with signed-32-bit lengths, so 2^31-1 bytes is a hard
-  ceiling (measured: 2047 MB writes, 2048 MB throws). The lab refuses larger files up front with
-  that explanation rather than failing deep inside the reader. Subset the object first, or run
-  `tools/export_h5ad.py` offline, which streams and has no such limit.
-- **Very large objects are out of range regardless of format.** The conversion holds the matrix
-  in memory twice — once cell-major, once gene-major — so it needs roughly `nnz x 16` bytes.
-  A 700 M-nonzero atlas would want ~11 GB and produce a multi-GB bundle the studio could not
-  open either. Convert a subset.
+- **A single bundle tops out near 50 M stored values.** That is the studio's limit, not the
+  lab's: it holds the matrix resident because every marker and DE view scans all genes. Larger
+  objects are split; the lab shows the exact sizes before converting.
+- **Splitting needs a categorical column to split along.** An object with 700 M values and no
+  usable grouping cannot be divided.
+- **`.rds` is still read whole.** The lazy path is `.h5ad` only — R's serialization is a stream
+  with no index, so it cannot be read out of order. Very large Seurat objects remain limited by
+  memory.
 - **Dense `.h5ad` X** is materialized in full before being thinned to nonzeros. Sparse is the
   normal case and is streamed; a large dense matrix will be memory-hungry.
 - **Seurat v5** objects are read through `@layers`. Tested against v3/v4 objects; a v5 object

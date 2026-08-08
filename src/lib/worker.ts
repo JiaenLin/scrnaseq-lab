@@ -24,31 +24,23 @@ import { gunzipSync } from 'fflate'
 type H5Mod = any
 
 /**
- * Load h5wasm at runtime, from a copy the bundler never touches.
+ * The HDF5 reader, loaded once per session.
  *
- * Letting Vite bundle it into the worker produced a worker that loaded, threw
- * nothing, and never answered: the WebAssembly never finished arriving, and
- * with no error there was nothing to report. The stock ESM build works
- * unmodified in a module worker — that is how it is meant to be used — so it
- * is copied to public/vendor verbatim and imported by URL.
+ * A long detour ended here: an earlier version vendored h5wasm to public/ and
+ * imported it by URL, on the belief that Vite's worker pipeline broke it. It
+ * does not. `ready` settles in about 15 ms inside the bundled module worker,
+ * and the apparent hang was a stale selector in the browser probe looking for
+ * a heading that had been renamed. The plain import is correct.
  */
 let h5mod: H5Mod = null
-async function h5(url: string): Promise<H5Mod> {
+async function h5(): Promise<H5Mod> {
   if (!h5mod) {
-    void url
     const mod = await import('h5wasm')
-    h5mod = mod.default ?? mod
+    h5mod = (mod as { default?: H5Mod }).default ?? mod
     if (!h5mod?.File) throw new Error('the HDF5 reader did not load')
   }
   return h5mod
 }
-
-// A promise that rejects inside the reader would otherwise leave every call
-// pending with nothing to report.
-self.addEventListener('unhandledrejection', ev => {
-  const r = (ev as PromiseRejectionEvent).reason
-  post({ id: 0, event: 'fatal', message: r?.message ?? String(r), stack: String(r?.stack ?? '').slice(0, 400) })
-})
 
 let scan: Scan | null = null
 
@@ -65,7 +57,7 @@ function describe(s: Scan, nnzPerCell: Int32Array | null): ScanInfo {
 }
 
 type Msg =
-  | { id: number; cmd: 'open'; file: File; readerUrl: string }
+  | { id: number; cmd: 'open'; file: File }
   | { id: number; cmd: 'convert'; choices: Choices; shards: Shard[] | null; passes: number[][] | null }
 
 const post = (m: unknown, transfer: Transferable[] = []) =>
@@ -86,7 +78,7 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
         scan = scanSeurat(r, r.read(), file.name)
       } else if (name.endsWith('.h5ad') || name.endsWith('.h5')) {
         post({ id, event: 'stage', stage: 'Loading the HDF5 reader' })
-        const h5wasm = await h5(e.data.readerUrl)
+        const h5wasm = await h5()
         await h5wasm.ready
         // No copy: HDF5 reads only the bytes it asks for, straight from the File.
         post({ id, event: 'stage', stage: 'Scanning obs, var and obsm' })

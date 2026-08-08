@@ -21,9 +21,9 @@ const t0 = Date.now()
 await page.setInputFiles('input[type=file]', FILE)
 
 // Wait for whichever comes first: the questions, or a refusal.
-const ok = page.waitForSelector('text=Which column holds the cell type annotation?', { timeout: 600000 })
+const ok = page.waitForSelector('text=Which column is the cell type annotation?', { timeout: 600000 })
 const bad = page.waitForSelector('.note:not(.note-info) b', { timeout: 600000 })
-const first = await Promise.race([ok.then(() => 'ok'), bad.then(() => 'error')]).catch(e => 'timeout: ' + e.message)
+const first = await Promise.race([ok.then(() => 'ok'), bad.then(() => 'error')]).catch(() => 'NEITHER SELECTOR MATCHED — the page said: ' + bodyText)
 const secs = ((Date.now() - t0) / 1000).toFixed(1)
 
 if (first === 'ok') {

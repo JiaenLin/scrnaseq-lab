@@ -262,9 +262,29 @@ export function candidates(scan: ScanInfo, role: Role, exclude: (string | null)[
   return scan.columns
     .filter(c => !unusable(c, role, scan.nCells))
     .filter(c => !taken.some(t => t.name === c.name || samePartition(t, c)))
-    .map(c => ({ c, r: rank(c.name, names), k: c.levels.length }))
-    .sort((a, b) => a.r - b.r || a.k - b.k)
+    .map(c => ({ c, r: rank(c.name, names), k: c.levels.length, op: opaque(c) }))
+    // Opaque codings sink in every role. After that the roles want opposite
+    // things: a cell annotation is the finest *named* grouping in an object,
+    // while a sample or a condition is a coarse one — so cluster prefers more
+    // levels and the others fewer. Breaking cluster ties by fewest levels made
+    // a 5-value tissue-ontology column outrank 133 named cell types on a real
+    // atlas, and the bundle came out labelled UBERON:0000033.
+    .sort((a, b) => a.r - b.r || Number(a.op) - Number(b.op) ||
+      (role === 'cluster' ? b.k - a.k : a.k - b.k))
     .map(x => x.c)
+}
+
+/**
+ * Are these levels identifiers rather than names?
+ *
+ * `UBERON:0000955`, `EFO:0009899` and bare integers all group cells correctly
+ * and label a figure uselessly. They stay selectable — some objects really are
+ * annotated this way — but they should never win by default over something a
+ * reader can understand.
+ */
+function opaque(c: Column): boolean {
+  const named = c.levels.filter(l => /[A-Za-z]/.test(l) && !/^[A-Za-z]+[:_]\d+$/.test(l))
+  return named.length * 2 < c.levels.length
 }
 
 /**
