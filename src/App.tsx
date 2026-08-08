@@ -1,10 +1,12 @@
 import { useState, type ReactNode } from 'react'
 import Landing from './components/Landing.tsx'
 import Review from './components/Review.tsx'
-import Split from './components/Split.tsx'
 import { Card, Flow } from './components/Ui.tsx'
-import { convert as runConvert, openFile, release, type BuiltBundle } from './lib/client.ts'
-import { COMFORTABLE_NNZ, planSplit, splitCandidates } from './lib/shard.ts'
+import {
+  convert as runConvert, openFile, release, type BuiltCollection,
+} from './lib/client.ts'
+import { collectionPieces, writeCollection } from './lib/collection.ts'
+import { chooseSplit, type SplitDecision } from './lib/shard.ts'
 import { guessCluster, guessEmbedding, guessRole, type Choices, type ScanInfo } from './lib/scan.ts'
 
 const STUDIO = 'https://jiaenlin.github.io/scrnaseq-studio/'
@@ -40,31 +42,97 @@ const explain = (e: unknown): string => {
     : 'the reader failed without saying why. If the object is very large, try splitting it.'
 }
 
-function saveBlob(b: Blob, name: string) {
-  const url = URL.createObjectURL(b)
+/**
+ * Minimal shape of the File System Access API, which TypeScript's DOM library
+ * does not declare. Only the three calls used below.
+ */
+interface SavePicker {
+  showSaveFilePicker?: (o: {
+    suggestedName?: string
+    types?: { description: string; accept: Record<string, string[]> }[]
+  }) => Promise<{ createWritable: () => Promise<{
+    write: (d: BufferSource | Blob) => Promise<void>; close: () => Promise<void>
+  }> }>
+}
+
+/**
+ * Put the one file on the user's disk.
+ *
+ * Two things rule out the obvious route of composing a Blob and pointing an
+ * `<a download>` at a `blob:` URL, both measured in Chromium rather than
+ * assumed. A Blob past a few hundred megabytes spills to disk and then throws
+ * NotReadableError on every read, so the container cannot be built that way at
+ * all. And a `blob:` download is cancelled somewhere between 256 MB and
+ * 512 MB, while a 1 GB download over plain HTTP in the same browser saves fine.
+ * An atlas collection is 5.8 GB.
+ *
+ * So the zip is generated piece by piece and written straight into the file the
+ * user names, and nothing larger than one part is ever held twice. The Blob
+ * route stays as the fallback for browsers without showSaveFilePicker, where it
+ * is the only option and where the small objects it can carry are the ones
+ * those users convert anyway.
+ */
+async function saveCollection(
+  result: BuiltCollection, onProgress: (done: number) => void,
+): Promise<boolean> {
+  const pick = (window as unknown as SavePicker).showSaveFilePicker
+  if (pick) {
+    let handle
+    try {
+      handle = await pick({
+        suggestedName: result.name,
+        types: [{ description: 'scRNA-seq Studio dataset', accept: { 'application/zip': ['.zip'] } }],
+      })
+    } catch {
+      return false   // the user closed the picker; that is not an error
+    }
+    const w = await handle.createWritable()
+    // A part can be hundreds of megabytes; hand it over in 64 MB writes so the
+    // stream keeps flowing and there is a number to put on the button.
+    const STEP = 64 << 20
+    let done = 0
+    for (const piece of collectionPieces(result.meta, result.parts)) {
+      for (let at = 0; at < piece.length; at += STEP) {
+        await w.write(piece.subarray(at, Math.min(piece.length, at + STEP)))
+        done += Math.min(piece.length, at + STEP) - at
+        onProgress(done)
+      }
+    }
+    await w.close()
+    return true
+  }
+
+  const url = URL.createObjectURL(writeCollection(result.meta, result.parts))
   const a = document.createElement('a')
   a.href = url
-  a.download = name
+  a.download = result.name
   a.click()
-  setTimeout(() => URL.revokeObjectURL(url), 10_000)
+  // Long enough for the browser to have started writing; revoking on a short
+  // timer is what cancelled this download when it was the primary path.
+  setTimeout(() => URL.revokeObjectURL(url), 600_000)
+  return true
 }
 
 export default function App() {
   const [scan, setScan] = useState<ScanInfo | null>(null)
   const [choices, setChoices] = useState<Choices | null>(null)
-  const [splitBy, setSplitBy] = useState<string | null>(null)
-  const [bundles, setBundles] = useState<BuiltBundle[]>([])
-  const [finished, setFinished] = useState(false)
+  // How the lab decided to store the object. Never a question, never a control:
+  // the studio opens the result as one dataset with all its cells either way.
+  const [split, setSplit] = useState<SplitDecision | null>(null)
+  const [result, setResult] = useState<BuiltCollection | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [stage, setStage] = useState('')
   const [frac, setFrac] = useState(0)
   const [busy, setBusy] = useState(false)
-  const [saved, setSaved] = useState<Set<string>>(new Set())
+  const [saved, setSaved] = useState(false)
+  // Writing 5.8 GB to disk takes a while and the button must not be pressable
+  // twice while it happens.
+  const [saving, setSaving] = useState(false)
+  const [wrote, setWrote] = useState(0)
 
   async function open(file: File) {
     setError(null)
-    setBundles([])
-    setFinished(false)
+    setResult(null)
     setBusy(true)
     try {
       setStage(`Reading ${file.name}`)
@@ -77,14 +145,7 @@ export default function App() {
         embedding: guessEmbedding(s) ?? '',
         label: file.name.replace(/\.(h5ad|rds|h5)$/i, ''),
       })
-      // Pre-select the best split when the object is too large to be one
-      // bundle. Split renders nothing at all when it already fits, so a normal
-      // object never sees any of this.
-      let total = 0
-      for (const v of s.nnzPerCell ?? []) total += v
-      setSplitBy(total > COMFORTABLE_NNZ
-        ? splitCandidates(s.columns, s.nnzPerCell ?? null, s.nCells)[0]?.column.name ?? null
-        : null)
+      setSplit(chooseSplit(s.columns, s.nnzPerCell ?? null, s.nCells))
     } catch (e) {
       setError(explain(e))
     } finally {
@@ -97,23 +158,21 @@ export default function App() {
     if (!scan || !choices) return
     setBusy(true)
     setError(null)
-    setBundles([])
-    setFinished(false)
+    setResult(null)
+    setSaved(false)
     try {
-      const col = splitBy ? scan.columns.find(c => c.name === splitBy) : null
-      const plan = col ? planSplit(col, scan.nnzPerCell ?? null, scan.nCells) : null
-      const split = plan
+      const order = split
         ? {
-            shards: plan.shards,
-            passes: plan.passes.map(p => p.map(s => plan.shards.indexOf(s))),
+            column: split.column.name,
+            reason: split.reason,
+            shards: split.plan.shards,
+            passes: split.plan.passes.map(p => p.map(s => split.plan.shards.indexOf(s))),
           }
         : null
-      await runConvert(choices, split, {
+      setResult(await runConvert(choices, order, {
         onStage: setStage,
         onProgress: (_pass, f) => setFrac(f),
-        onBundle: b => setBundles(prev => [...prev, b]),
-      })
-      setFinished(true)
+      }))
     } catch (e) {
       setError(explain(e))
     } finally {
@@ -127,81 +186,57 @@ export default function App() {
     release()
     setScan(null)
     setChoices(null)
-    setBundles([])
-    setFinished(false)
+    setSplit(null)
+    setResult(null)
     setError(null)
-    setSaved(new Set())
+    setSaved(false)
   }
 
-  function save(b: BuiltBundle) {
-    saveBlob(b.blob, b.name)
-    setSaved(prev => new Set(prev).add(b.name))
-  }
-
-  if (finished && bundles.length > 0) {
-    const totalMb = bundles.reduce((n, b) => n + b.blob.size, 0) / 1e6
-    const cells = bundles.reduce((n, b) => n + b.meta.nCells, 0)
-    const allSaved = bundles.every(b => saved.has(b.name))
-    const many = bundles.length > 1
+  if (result) {
+    const { meta, name, bytes } = result
     return (
       <div className="wrap py-10">
         <Card
           eyebrow="Converted — the lab's job is done"
-          title={many
-            ? `${bundles.length} bundles are ready for scRNA-seq Studio`
-            : `${bundles[0].name} is ready for scRNA-seq Studio`}
-          sub={`${cells.toLocaleString()} cells · ${bundles[0].meta.nGenes.toLocaleString()} genes · ${totalMb.toFixed(1)} MB in total`}
+          title={`${name} is ready for scRNA-seq Studio`}
+          sub={`${meta.nCells.toLocaleString()} cells · ${meta.nGenes.toLocaleString()} genes · ${(bytes / 1e6).toFixed(1)} MB`}
         >
           <Flow at="done" />
 
           <div className="mt-5 grid gap-2.5">
-            <Handoff n={1} title={many ? 'Save the bundles' : 'Save the bundle'} done={allSaved}>
-              {many && (
-                <button
-                  className={`btn mb-2.5 ${allSaved ? '' : 'btn-primary'}`}
-                  onClick={() => bundles.forEach((b, i) => setTimeout(() => save(b), i * 350))}
-                >
-                  Download all {bundles.length}
-                </button>
+            <Handoff n={1} title="Save the file" done={saved}>
+              <button
+                className={`btn ${saved ? '' : 'btn-primary'}`}
+                disabled={saving}
+                onClick={async () => {
+                  setSaving(true)
+                  setWrote(0)
+                  try {
+                    if (await saveCollection(result, setWrote)) setSaved(true)
+                  } catch (e) {
+                    setError(`the file could not be written. ${explain(e)}`)
+                  } finally {
+                    setSaving(false)
+                  }
+                }}
+              >{saving
+                ? `Writing… ${(wrote / 1e9).toFixed(1)} of ${(bytes / 1e9).toFixed(1)} GB`
+                : saved ? 'Saved ✓ — download again' : `Download ${name}`}</button>
+              {error && <p className="sub mt-2" style={{ color: 'var(--bad)' }}>{error}</p>}
+              {/* Stated, not offered. The user made no decision here and has
+                  nothing to do about it; it is on the page because a 2 GB file
+                  that took forty minutes deserves an explanation. */}
+              {meta.reason && (
+                <p className="sub mt-2">{meta.reason}. It still opens as one dataset with all
+                  {' '}{meta.nCells.toLocaleString()} cells.</p>
               )}
-              <div className="scrollx" style={{ maxHeight: 320 }}>
-                <table className="t">
-                  <thead>
-                    <tr>
-                      <th>Bundle</th><th className="num">Cells</th>
-                      <th className="num">Values</th><th className="num">Size</th><th />
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {bundles.map(b => (
-                      <tr key={b.name}>
-                        <td className="font-semibold">{b.key ?? b.meta.label}</td>
-                        <td className="num">{b.meta.nCells.toLocaleString()}</td>
-                        <td className="num" style={{ color: 'var(--ink-2)' }}>
-                          {(b.meta.nnz / 1e6).toFixed(1)} M
-                        </td>
-                        <td className="num" style={{ color: 'var(--ink-2)' }}>
-                          {(b.blob.size / 1e6).toFixed(1)} MB
-                        </td>
-                        <td className="num">
-                          <button className="chip" onClick={() => save(b)}>
-                            {saved.has(b.name) ? 'saved ✓' : 'download'}
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
             </Handoff>
 
-            <Handoff n={2} title={many ? 'Open them in scRNA-seq Studio' : 'Open it in scRNA-seq Studio'}>
-              <a className={`btn ${allSaved ? 'btn-primary' : ''}`} href={STUDIO}
+            <Handoff n={2} title="Open it in scRNA-seq Studio">
+              <a className={`btn ${saved ? 'btn-primary' : ''}`} href={STUDIO}
                 target="_blank" rel="noreferrer">Open scRNA-seq Studio →</a>
               <p className="sub mt-2">
-                {many
-                  ? 'Drop one bundle at a time onto its panel. Each opens with every tab working on its own cells, and the gene list and metadata columns are identical across all of them.'
-                  : 'Drop it onto the panel — it stays on your machine.'}
+                Drop it onto the panel — it stays on your machine.
               </p>
             </Handoff>
           </div>
@@ -213,12 +248,12 @@ export default function App() {
           <div className="mt-5">
             <div className="eyebrow mb-2">Every decision the converter made</div>
             <ul className="grid gap-1">
-              {bundles[0].meta.notes.map((n, i) => (
+              {meta.notes.map((n, i) => (
                 <li key={i} className="text-[12.5px]" style={{ color: 'var(--ink-2)' }}>· {n}</li>
               ))}
             </ul>
             <p className="sub mt-2">
-              These travel inside every bundle and appear again on the studio&rsquo;s Overview tab.
+              These travel inside the file and appear again on the studio&rsquo;s Overview tab.
             </p>
           </div>
         </Card>
@@ -234,21 +269,11 @@ export default function App() {
             <div className="note"><b>That did not convert.</b> {error}</div>
           </div>
         )}
-        <div className="wrap pt-7">
-          <Split scan={scan} splitBy={splitBy} onChange={setSplitBy} />
-        </div>
         <Review
           scan={scan} choices={choices} setChoices={setChoices}
           onBuild={convert} busy={busy}
           stage={stage + (frac > 0 ? ` · ${(frac * 100).toFixed(0)}%` : '')}
         />
-        {busy && bundles.length > 0 && (
-          <div className="wrap pb-4">
-            <div className="note note-info">
-              <b>{bundles.length} written so far</b> — {bundles.map(b => b.key).join(', ')}
-            </div>
-          </div>
-        )}
         <div className="wrap pb-10">
           <button className="btn btn-ghost" onClick={restart}>Open a different file</button>
         </div>

@@ -6,7 +6,8 @@
 // pinned by tests that read a bundle back and compare against the matrix it
 // was built from.
 
-import { zipSync, strToU8 } from 'fflate'
+import { zipSync, strToU8, type ZippableFile } from 'fflate'
+import { CHUNK_GENES, writeChunked } from './chunked.ts'
 import {
   cellQC, expm1Round, log1p, lognormalize, sumCells, toGeneMajor,
   type CellMajor, type MatrixKind,
@@ -30,6 +31,13 @@ export interface BundleMeta {
   embedding: string
   expression: string
   hasRawCounts: boolean
+  /**
+   * Genes per block in `expr.chunk.bin`.
+   *
+   * Readers must use this number rather than the CHUNK_GENES constant: a bundle
+   * written by an older or a differently-tuned lab still has to open.
+   */
+  chunkGenes: number
   provenance: Record<string, string | null>
   notes: string[]
 }
@@ -238,6 +246,13 @@ export function buildBundle(
   onProgress('Transposing to gene-major')
   const csc = toGeneMajor(display)
 
+  // The same matrix a second time, cut into per-gene blocks, so the studio can
+  // plot one gene by slicing a few kilobytes out of the file instead of
+  // inflating the whole matrix. See chunked.ts: it costs about half again on
+  // top of the flat entries, and it is what makes a large part openable at all.
+  onProgress('Indexing genes for lazy reading')
+  const chunked = writeChunked(csc.indptr, csc.indices, csc.data, CHUNK_GENES)
+
   const qc = new Float32Array(3 * n)
   for (let i = 0; i < n; i++) {
     qc[3 * i] = total[i]
@@ -268,11 +283,12 @@ export function buildBundle(
     embedding: emb.key,
     expression,
     hasRawCounts: counts != null,
+    chunkGenes: CHUNK_GENES,
     provenance: { ...scan.provenance, clustering: choices.cluster },
     notes,
   }
 
-  const files: Record<string, Uint8Array> = {
+  const files: Record<string, ZippableFile> = {
     'meta.json': strToU8(JSON.stringify(meta, null, 1)),
     'genes.txt': strToU8(genes.join('\n')),
     'cluster.u16': new Uint8Array(clusterCodes.buffer),
@@ -282,6 +298,13 @@ export function buildBundle(
     'expr.indptr.i32': new Uint8Array(csc.indptr.buffer),
     'expr.indices.i32': new Uint8Array(csc.indices.buffer),
     'expr.data.f32': new Uint8Array(csc.data.buffer),
+    'expr.chunkptr.i32': new Uint8Array(chunked.ptr.buffer),
+    // STORED, never deflated. Each chunk is already its own deflate stream; the
+    // whole point is that chunk k occupies a known contiguous byte range of the
+    // zip, so a reader can slice it out. Compressing the entry would put every
+    // chunk behind one stream that has to be read from its start — which is the
+    // problem this format exists to solve.
+    'expr.chunk.bin': [chunked.bin, { level: 0 }],
   }
 
   // ---- pseudobulk -------------------------------------------------------

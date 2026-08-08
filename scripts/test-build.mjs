@@ -9,6 +9,7 @@ import { unzipSync, strFromU8 } from 'fflate'
 import { buildBundle, chooseMatrices, BuildError } from '../src/lib/build.ts'
 import { categorical, numeric, fromFactor } from '../src/lib/scan.ts'
 import { cellQC, lognormalize, sumCells, toGeneMajor, dropZeros } from '../src/lib/matrix.ts'
+import { CHUNK_GENES, readGenes } from '../src/lib/chunked.ts'
 
 let failed = 0
 const check = (name, got, want) => {
@@ -100,6 +101,7 @@ const open = res => {
     sample: view('sample.u16', Uint16Array),
     embed: view('embed.f32', Float32Array),
     qc: view('qc.f32', Float32Array),
+    chunkptr: view('expr.chunkptr.i32', Int32Array),
     pseudobulk: f['pseudobulk.tsv'] ? strFromU8(f['pseudobulk.tsv']) : null,
     names: Object.keys(f),
   }
@@ -262,6 +264,59 @@ console.log('\nMITOCHONDRIAL FRACTION IS PUT ON ONE SCALE')
   ] } }), { ...CHOICES, sample: null, condition: null }))
   near('a proportion is converted to a percentage', b.qc[2], 1)
   check('and it says so', b.meta.notes.some(n => /converted to a percentage/.test(n)), true)
+}
+
+console.log('\nTHE CHUNKED MATRIX IS STORED, AND SAYS THE SAME THING AS THE FLAT ONE')
+// The whole lazy reader rests on two properties of the written zip: that
+// expr.chunk.bin is method 0, so chunk k is a contiguous byte range the studio
+// can slice out of a Blob; and that what comes back out of it is the same
+// matrix as expr.indices/expr.data, which are still written unchanged. A
+// deflated entry here would still unzip perfectly and still pass every other
+// test in this file — and would make every gene lookup read the whole matrix.
+{
+  const res = buildBundle(scanOf(), CHOICES)
+  const zip = res.zip
+  const b = open(res)
+  check('both copies of the matrix are in the bundle',
+    ['expr.indices.i32', 'expr.data.f32', 'expr.chunk.bin', 'expr.chunkptr.i32']
+      .every(n => b.names.includes(n)), true)
+  check('meta carries the chunk size a reader must use', b.meta.chunkGenes, CHUNK_GENES)
+
+  // Walk the central directory from the tail — exactly what the studio does.
+  const dv = new DataView(zip.buffer, zip.byteOffset, zip.byteLength)
+  let eocd = -1
+  for (let i = zip.length - 22; i >= 0; i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break }
+  const count = dv.getUint16(eocd + 10, true)
+  const found = {}
+  let p = dv.getUint32(eocd + 16, true)
+  for (let i = 0; i < count; i++) {
+    const nameLen = dv.getUint16(p + 28, true)
+    const name = strFromU8(zip.subarray(p + 46, p + 46 + nameLen))
+    found[name] = { method: dv.getUint16(p + 10, true), size: dv.getUint32(p + 20, true),
+      local: dv.getUint32(p + 42, true) }
+    p += 46 + nameLen + dv.getUint16(p + 30, true) + dv.getUint16(p + 32, true)
+  }
+  check('expr.chunk.bin is stored, not deflated', found['expr.chunk.bin'].method, 0)
+  check('the flat entries are still compressed', found['expr.data.f32'].method, 8)
+
+  const e = found['expr.chunk.bin']
+  const base = e.local + 30 + dv.getUint16(e.local + 26, true) + dv.getUint16(e.local + 28, true)
+  check('the stored payload is exactly as long as the writer made it',
+    e.size, b.chunkptr[b.chunkptr.length - 1])
+
+  // Read every gene through the byte-range path and compare against the flat
+  // entries, value for value.
+  const getBytes = async (from, to) => zip.subarray(base + from, base + to)
+  const all = GENES.map((_g, i) => i)
+  const vecs = await readGenes(getBytes, b.chunkptr, b.indptr, b.meta.chunkGenes, all)
+  const flat = all.map(g => ({
+    gene: g,
+    cells: Array.from(b.indices.subarray(b.indptr[g], b.indptr[g + 1])),
+    values: Array.from(b.data.subarray(b.indptr[g], b.indptr[g + 1])),
+  }))
+  check('every gene reads back identically',
+    vecs.map(v => ({ gene: v.gene, cells: Array.from(v.cells), values: Array.from(v.values) })),
+    flat)
 }
 
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll build tests passed\n')

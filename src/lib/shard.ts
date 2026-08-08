@@ -108,6 +108,53 @@ export function splitCandidates(
       a.plan.shards.length - b.plan.shards.length)
 }
 
+/**
+ * The decision, made for the user rather than by them.
+ *
+ * `reason` is the sentence shown when the conversion finishes and stored in the
+ * collection index. It exists because the split is otherwise invisible: the
+ * studio opens the collection as one dataset with all its cells, so the only
+ * place the user ever learns their atlas was cut up is here, as a fact.
+ */
+export interface SplitDecision {
+  column: Column
+  plan: SplitPlan
+  reason: string
+}
+
+const M = (n: number) => `${n >= 1e9 ? (n / 1e9).toFixed(1) + ' B' : Math.round(n / 1e6) + ' M'}`
+
+/**
+ * Decide whether to split, and along what — with nothing left to ask.
+ *
+ * Null means one part: either the object already fits, or the source could not
+ * say how big it is (a .rds is read whole anyway, so there is nothing to cost
+ * and nothing to gain), or no column splits it. Otherwise the best candidate
+ * wins — `splitCandidates` ranks by how many pieces come out oversized, so the
+ * head of that list is the least-bad cut available.
+ *
+ * A split that still leaves large parts is used anyway. The studio reads genes
+ * out of a part lazily now, so a big part is slow to write, not impossible to
+ * open, and half a loaf beats refusing the file.
+ */
+export function chooseSplit(
+  columns: Column[], nnzPerCell: Int32Array | null, nCells: number,
+): SplitDecision | null {
+  if (!nnzPerCell) return null
+  let total = 0
+  for (const v of nnzPerCell) total += v
+  if (total <= COMFORTABLE_NNZ) return null
+
+  const best = splitCandidates(columns, nnzPerCell, nCells)[0]
+  if (!best || best.plan.shards.length < 2) return null
+
+  return {
+    column: best.column,
+    plan: best.plan,
+    reason: `${M(total)} stored values is more than one piece can hold, so the cells were stored in ${best.plan.shards.length} parts split along ${best.column.name}`,
+  }
+}
+
 /** Take one column down to a subset of its cells. */
 export function subsetColumn(col: Column, cells: Int32Array): Column {
   if (col.kind === 'numeric') {

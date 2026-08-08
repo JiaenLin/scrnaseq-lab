@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "lint": "oxlint",
     "check": "tsc -b --noEmit",
-    "test": "node scripts/test-rds.mjs && node scripts/test-build.mjs && node scripts/test-detect.mjs && node scripts/test-chunked.mjs"
+    "test": "node scripts/test-rds.mjs && node scripts/test-build.mjs && node scripts/test-detect.mjs && node scripts/test-split.mjs && node scripts/test-chunked.mjs && node scripts/test-collection.mjs"
   },
   "dependencies": {
     "fflate": "^0.8.2",

@@ -99,11 +99,12 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
       const { choices, shards, passes } = e.data
       const parent = scan
 
-      // Whole object, unsplit.
+      // Whole object, one part. Still a part: the container is written the same
+      // way either way, so the studio has one shape to understand.
       if (!shards || !passes) {
         post({ id, event: 'stage', stage: 'Reading the expression matrix' })
         const res = buildBundle(parent, choices, s => post({ id, event: 'stage', stage: s }))
-        post({ id, event: 'bundle', key: null, name: `${safe(choices.label)}.zip`,
+        post({ id, event: 'bundle', key: choices.label || parent.source,
           zip: res.zip, meta: res.meta, pseudobulkColumns: res.pseudobulkColumns },
           [res.zip.buffer])
         post({ id, event: 'done' })
@@ -115,8 +116,11 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
       let made = 0
       for (let pi = 0; pi < passes.length; pi++) {
         const group = passes[pi].map(i => shards[i])
+        // Worded as progress, not as structure. The user never chose to split
+        // and will never see the pieces, so the stage line says how far along
+        // the read is, not how the object was carved up.
         post({ id, event: 'stage',
-          stage: `Pass ${pi + 1} of ${passes.length} — reading ${group.length} shard${group.length > 1 ? 's' : ''}` })
+          stage: `Reading the expression matrix — pass ${pi + 1} of ${passes.length}` })
 
         // One forward traversal per pass; every shard in it is filled together.
         const mats: CellMajor[][] = []
@@ -130,15 +134,19 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
 
         for (let gi = 0; gi < group.length; gi++) {
           const s = group[gi]
-          post({ id, event: 'stage', stage: `Writing ${s.key} (${made + 1} of ${total})` })
+          post({ id, event: 'stage', stage: `Writing ${made + 1} of ${total}` })
           const sub = shardScan(parent, { ...s, cells: Int32Array.from(s.cells) },
             new Map([[src.key, mats[gi][0]]]), `${parent.source} · ${choices.label}`)
           const res = buildBundle(sub, { ...choices, label: `${choices.label} ${s.key}` })
           made++
           post({ id, event: 'bundle', key: s.key,
-            name: `${safe(choices.label)}__${safe(s.key)}.zip`,
             zip: res.zip, meta: res.meta, pseudobulkColumns: res.pseudobulkColumns },
             [res.zip.buffer])
+          // The shard's matrix is dead the moment its bundle is written, and a
+          // pass can hold 120 M nonzeros — a gigabyte — across its shards. Drop
+          // each one as it is used rather than keeping the whole pass alive
+          // while the last shard compresses.
+          mats[gi].length = 0
         }
       }
       post({ id, event: 'done' })
@@ -149,5 +157,3 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
     post({ id, event: 'error', message: msg && msg !== 'undefined' ? msg : 'the reader failed without saying why' })
   }
 }
-
-const safe = (s: string) => (s || 'bundle').replace(/[^\w.-]+/g, '_').replace(/_+/g, '_').slice(0, 80)

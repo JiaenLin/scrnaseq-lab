@@ -351,7 +351,7 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
       <div className="mt-5 flex items-center gap-3">
         <button className="btn btn-primary" disabled={busy || !choices.cluster || !choices.embedding}
           onClick={onBuild}>
-          {busy ? (stage || 'Converting…') : 'Convert to bundle.zip'}
+          {busy ? (stage || 'Converting…') : 'Convert'}
         </button>
         {busy && <span className="sub">{stage}</span>}
         {!busy && !choices.cluster && <span className="sub">Pick a cell annotation first.</span>}
