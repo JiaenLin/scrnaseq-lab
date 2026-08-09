@@ -126,13 +126,27 @@ export interface Scan {
   notes: string[]
 }
 
-/** The three questions the lab asks. */
+/** The three questions the lab asks, plus whatever else is worth carrying. */
 export interface Choices {
   cluster: string
   sample: string | null
   condition: string | null
   embedding: string
   label: string
+  /**
+   * Further categorical obs columns to carry per cell, by name.
+   *
+   * The three roles above are the ones every view depends on. A real object
+   * holds more groupings than that — the developing-mouse atlas annotates each
+   * cell with a dissection as well as an age, and with a Class above its
+   * Subclass — and which of them a reader wants to break a figure down by is
+   * not something the lab can know. So they travel as themselves, under the
+   * object's own column names, and the studio offers whichever arrived.
+   *
+   * Optional, and empty by default: a bundle carrying none is the bundle this
+   * format has always written.
+   */
+  extras?: string[]
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +237,7 @@ const rank = (name: string, list: string[]): number => {
   return partial >= 0 ? 100 + partial : 1000
 }
 
-export type Role = 'cluster' | 'sample' | 'condition'
+export type Role = 'cluster' | 'sample' | 'condition' | 'extra'
 
 /** Is this column usable in this role at all, and if not, why not. */
 export function unusable(col: Column, role: Role, nCells: number): string | null {
@@ -242,6 +256,13 @@ export function unusable(col: Column, role: Role, nCells: number): string | null
   }
   if (role === 'sample' && k > 200) return `${k} distinct values — too many to be samples`
   if (role === 'condition' && k > 50) return `${k} distinct values — too many to be groups`
+  // An extra column has no role to be too coarse or too fine for; the only
+  // thing it cannot be is an identifier. The ceiling is high on purpose — a
+  // second annotation level is a legitimate thing to carry, and this atlas's
+  // CellType has 748 of them.
+  if (role === 'extra' && k > 1000) {
+    return `${k} distinct values — that is an identifier, not an annotation`
+  }
   return null
 }
 
@@ -291,8 +312,13 @@ export function duplicateOf(columns: Column[]): Map<string, string> {
  * are the same partition — which produces comparisons with nothing to compare.
  */
 export function candidates(scan: ScanInfo, role: Role, exclude: (string | null)[] = []): Column[] {
+  // No name list for an extra column, deliberately. The other three roles have
+  // conventions worth ranking by; "another grouping this object happens to
+  // carry" has none, so the only ordering left is the shape of the grouping —
+  // legible levels first, then the coarsest.
   const names = role === 'cluster' ? CLUSTER_NAMES
-    : role === 'sample' ? SAMPLE_NAMES : CONDITION_NAMES
+    : role === 'sample' ? SAMPLE_NAMES
+    : role === 'condition' ? CONDITION_NAMES : []
   const taken = scan.columns.filter(c => exclude.includes(c.name))
   return scan.columns
     .filter(c => !unusable(c, role, scan.nCells))

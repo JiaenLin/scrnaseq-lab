@@ -5,7 +5,7 @@
 // parseBundle, and the chunked entry agreeing with the flat one gene for gene.
 //
 //   npm run build && npx vite preview --port 4242 --strictPort
-//   node scripts/browser-collection.mjs [file] [timeout-minutes]
+//   node scripts/browser-collection.mjs [file] [timeout-minutes] [extra,columns]
 //
 // The container is read through a file handle, never loaded: a real atlas
 // collection is gigabytes, and the point of the format is that a reader touches
@@ -28,6 +28,8 @@ const EXE = 'C:/Users/Lin/AppData/Local/ms-playwright/chromium-1228/chrome-win64
 const OUT = 'C:/Users/Lin/AppData/Local/Temp/labshots'
 const FILE = process.argv[2] ?? 'C:/Users/Lin/scrnaseq-studio/testdata/pbmc3k_processed.h5ad'
 const MINUTES = Number(process.argv[3] ?? 10)
+/** Columns to tick on the Extras card, by name. Nothing is ticked by default. */
+const EXTRAS = (process.argv[4] ?? '').split(',').map(s => s.trim()).filter(Boolean)
 const log = (...a) => console.log(new Date().toTimeString().slice(0, 8), ...a)
 
 let failed = 0
@@ -120,7 +122,17 @@ if (scanned !== 'ok') {
 const text = await page.locator('body').innerText()
 check('no split card', /Split it into several|This object is too large for one bundle/.test(text), false)
 check('no "do not split" option', /Do not split/.test(text), false)
-await page.screenshot({ path: `${OUT}/collection-review.png` })
+
+// The extra columns, ticked the way a person would. Scoped to that card: the
+// role pickers draw the same button for the same column, and clicking one of
+// those would change the answer to a different question.
+const EXTRA_CARD = 'section.card:has-text("Anything else worth breaking a figure down by")'
+for (const name of EXTRAS) {
+  const btn = page.locator(`${EXTRA_CARD} button:has(span.mono:text-is("${name}"))`)
+  check(`${name} is offered as an extra column`, await btn.count(), 1)
+  await btn.first().click()
+}
+await page.screenshot({ path: `${OUT}/collection-review.png`, fullPage: true })
 
 log('converting...')
 const t1 = Date.now()

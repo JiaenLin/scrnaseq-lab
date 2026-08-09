@@ -11,6 +11,7 @@
 // script and the app ever disagree, this script is wrong.
 //
 //   node --max-old-space-size=8192 scripts/convert-node.mjs <in.h5ad> <out.zip> [label]
+//                                                          [--extra <obs column>]…
 
 import h5wasm from 'h5wasm/node'
 import { createWriteStream, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -22,9 +23,15 @@ import { chooseSplit, shardScan } from '../src/lib/shard.ts'
 import { guessCluster, guessEmbedding, guessRole } from '../src/lib/scan.ts'
 import { COLLECTION_SCHEMA, INDEX_NAME, collectionPieces } from '../src/lib/collection.ts'
 
-const [input, output, labelArg] = process.argv.slice(2)
+const argv = process.argv.slice(2)
+// The columns to carry beyond the three roles, by name. Same as the lab's
+// Extras card, which is empty by default for the same reason: an object's other
+// annotations are worth offering and not worth assuming.
+const extras = argv.flatMap((a, i) => (a === '--extra' && argv[i + 1] ? [argv[i + 1]] : []))
+const positional = argv.filter((a, i) => a !== '--extra' && argv[i - 1] !== '--extra')
+const [input, output, labelArg] = positional
 if (!input || !output) {
-  console.error('usage: node scripts/convert-node.mjs <in.h5ad> <out.zip> [label]')
+  console.error('usage: node scripts/convert-node.mjs <in.h5ad> <out.zip> [label] [--extra <col>]…')
   process.exit(2)
 }
 const label = labelArg ?? input.split(/[\\/]/).pop().replace(/\.(h5ad|h5)$/i, '')
@@ -49,8 +56,14 @@ const choices = {
   condition: guessRole(scan, 'condition'),
   embedding: guessEmbedding(scan),
   label,
+  extras,
 }
 log('choices:', JSON.stringify(choices))
+for (const name of extras) {
+  const c = scan.columns.find(x => x.name === name)
+  if (!c) throw new Error(`this object has no obs column called "${name}"`)
+  log(`carrying ${name} as an extra column: ${c.levels.length} levels`)
+}
 
 // The app measures the matrix before deciding; so does this.
 const measurable = scan.matrices.find(m => m.nnzPerCell)
@@ -141,6 +154,15 @@ const meta = {
   nCells: partInfo.reduce((n, p) => n + p.nCells, 0),
   nGenes: firstMeta.nGenes,
   clusterOrder: scan.columns.find(c => c.name === choices.cluster)?.levels,
+  // The whole object's order for every categorical column a part can only carry
+  // part of. Without it the studio reconstructs what the parts imply and falls
+  // back to collation for the rest, which compares the digit run after the dot
+  // as a number and puts e16.5 before e16.25.
+  condOrder: scan.columns.find(c => c.name === choices.condition)?.levels,
+  extraOrder: Object.fromEntries(extras.flatMap(name => {
+    const levels = scan.columns.find(c => c.name === name)?.levels
+    return levels ? [[name, levels]] : []
+  })),
   embeddings: firstMeta.embeddings?.map(e => e.key),
   geneIdKind: firstMeta.geneIdKind,
   geneAlias: firstMeta.geneAlias

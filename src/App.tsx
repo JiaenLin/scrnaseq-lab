@@ -5,9 +5,14 @@ import { Card, Flow } from './components/Ui.tsx'
 import {
   convert as runConvert, openFile, release, type BuiltCollection,
 } from './lib/client.ts'
-import { collectionPieces, writeCollection } from './lib/collection.ts'
+import {
+  collectionPieces, writeCollection, type CollectionMeta,
+} from './lib/collection.ts'
 import { chooseSplit, type SplitDecision } from './lib/shard.ts'
-import { guessCluster, guessEmbedding, guessRole, type Choices, type ScanInfo } from './lib/scan.ts'
+import {
+  candidates, guessCluster, guessEmbedding, guessRole,
+  type Choices, type ScanInfo,
+} from './lib/scan.ts'
 
 const STUDIO = 'https://jiaenlin.github.io/scrnaseq-studio/'
 
@@ -27,6 +32,112 @@ function Handoff({ n, title, done, children }: {
       </div>
     </div>
   )
+}
+
+/**
+ * The other groupings this object carries — offered, never assumed.
+ *
+ * The three questions below this are roles: every view in the studio is per
+ * cell type, across groups, within samples. This is not a fourth role. It is
+ * the rest of what the object already knows about each cell — a dissection
+ * beside an age, a Class above a Subclass — carried under its own name so the
+ * studio can put any of it on either axis of a composition figure. Nothing is
+ * chosen by default: a bundle with none of these is the bundle the lab has
+ * always written, byte for byte.
+ */
+function Extras({ scan, choices, setChoices }: {
+  scan: ScanInfo; choices: Choices; setChoices: (c: Choices) => void
+}) {
+  const usable = candidates(scan, 'extra',
+    [choices.cluster, choices.sample, choices.condition])
+  if (!usable.length) return null
+  const picked = choices.extras ?? []
+  const toggle = (name: string) => setChoices({
+    ...choices,
+    extras: picked.includes(name) ? picked.filter(x => x !== name) : [...picked, name],
+  })
+
+  return (
+    <div className="wrap pt-7">
+      <Card
+        eyebrow="Extra columns · optional"
+        title="Anything else worth breaking a figure down by"
+        sub={`Carried per cell under the object's own name. The studio then offers every
+          combination of these with the cell type, the group and the sample — brain region
+          by age, cell type by region. Pick none and nothing changes.`}
+      >
+        <div className="mt-3.5 grid gap-2"
+          style={{ gridTemplateColumns: 'repeat(auto-fill,minmax(230px,1fr))' }}>
+          {usable.map(c => {
+            const on = picked.includes(c.name)
+            return (
+              <button key={c.name} onClick={() => toggle(c.name)}
+                className="w-full rounded-xl px-3 py-2.5 text-left"
+                style={{
+                  border: `1.5px solid ${on ? 'var(--accent)' : 'var(--line)'}`,
+                  background: on ? 'var(--accent-soft)' : 'var(--surface)',
+                }}>
+                <div className="flex items-baseline gap-2">
+                  <span className="mono text-[12.5px] font-semibold">{c.name}</span>
+                  <span className="badge badge-file">{c.levels.length} levels</span>
+                </div>
+                <div className="mt-1.5 text-[11.5px]" style={{ color: 'var(--ink-2)' }}>
+                  {c.levels.slice(0, 3).join(' · ')}
+                  {c.levels.length > 3 && ` · +${c.levels.length - 3} more`}
+                </div>
+              </button>
+            )
+          })}
+        </div>
+        {picked.length > 1 && (
+          <p className="sub mt-2.5">
+            {picked.length} extra columns. Every level of each one travels with every cell;
+            the cost is 2 bytes per cell per column, against a matrix measured in gigabytes.
+          </p>
+        )}
+      </Card>
+    </div>
+  )
+}
+
+/**
+ * The level orders a split would otherwise have to guess.
+ *
+ * A part is written with the levels it uses and no others, so no part carries
+ * the whole object's order — and the studio reconstructs what it can and falls
+ * back to collation for the rest. Collation compares the digit run after the
+ * dot as a number, which puts e16.5 before e16.25: no count changes, but every
+ * menu, contrast picker and axis then offers a sequence the experiment never
+ * had. The order is still here, in the scan, so it is written down.
+ *
+ * It lives here rather than in client.ts for the same reason `clusterOrder`
+ * takes a parameter: the client talks to the worker and has never seen the
+ * scan. These two want the same parameter list.
+ */
+function recordOrders(
+  built: BuiltCollection, scan: ScanInfo, choices: Choices,
+): BuiltCollection {
+  const levelsOf = (name: string | null | undefined): string[] | undefined =>
+    (name ? scan.columns.find(c => c.name === name)?.levels : undefined)
+
+  const extraOrder: Record<string, string[]> = {}
+  for (const name of choices.extras ?? []) {
+    const levels = levelsOf(name)
+    if (levels) extraOrder[name] = levels
+  }
+  const meta: CollectionMeta & {
+    condOrder?: string[]
+    extraOrder?: Record<string, string[]>
+  } = {
+    ...built.meta,
+    condOrder: levelsOf(choices.condition),
+    extraOrder: Object.keys(extraOrder).length ? extraOrder : undefined,
+  }
+  // The index is written from this object, so the byte total the save button
+  // counts down has to follow it.
+  const grew = JSON.stringify(meta, null, 1).length
+    - JSON.stringify(built.meta, null, 1).length
+  return { ...built, meta, bytes: built.bytes + grew }
 }
 
 /**
@@ -177,6 +288,7 @@ export default function App() {
         condition: guessRole(s, 'condition'),
         embedding: guessEmbedding(s) ?? '',
         label: file.name.replace(/\.(h5ad|rds|h5)$/i, ''),
+        extras: [],
       })
       setSplit(chooseSplit(s.columns, s.nnzPerCell ?? null, s.nCells))
     } catch (e) {
@@ -205,10 +317,11 @@ export default function App() {
       // The whole object's cluster order, before any part drops the levels it
       // has no cells for. It decides colour in the studio.
       const clusterOrder = scan.columns.find(c => c.name === choices.cluster)?.levels
-      setResult(await runConvert(choices, order, {
+      const built = await runConvert(choices, order, {
         onStage: setStage,
         onProgress: (_pass, f) => setFrac(f),
-      }, clusterOrder))
+      }, clusterOrder)
+      setResult(recordOrders(built, scan, choices))
     } catch (e) {
       setError(explain(e))
     } finally {
@@ -305,6 +418,10 @@ export default function App() {
             <div className="note"><b>That did not convert.</b> {error}</div>
           </div>
         )}
+        {/* Above the questions rather than after them: the Convert button is the
+            last thing on the Review card, and an optional step below it is a
+            step nobody sees. */}
+        <Extras scan={scan} choices={choices} setChoices={setChoices} />
         <Review
           scan={scan} choices={choices} setChoices={setChoices}
           onBuild={convert} busy={busy}

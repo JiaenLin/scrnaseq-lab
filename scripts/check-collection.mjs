@@ -98,6 +98,21 @@ export async function checkCollection(path) {
     meta.parts.reduce((n, p) => n + p.nCells, 0), meta.nCells)
   check('nothing but the parts and the index is in there', entries.size, meta.parts.length + 1)
 
+  // The level orders the parts cannot be trusted to imply. Optional, and older
+  // containers have none — but where one is recorded it has to be the whole
+  // object's list, or the studio reconstructs a sequence the experiment never
+  // had and every menu reads wrong while every count stays right.
+  const orders = [
+    ['clusterOrder', meta.clusterOrder],
+    ['condOrder', meta.condOrder],
+    ...Object.entries(meta.extraOrder ?? {}).map(([k, v]) => [`extraOrder.${k}`, v]),
+  ].filter(([, v]) => v)
+  for (const [name, levels] of orders) {
+    check(`${name} lists every level once`, new Set(levels).size, levels.length)
+    console.log(`  ${name}: ${levels.length} levels — ${levels.slice(0, 6).join(', ')}${levels.length > 6 ? ' …' : ''}`)
+  }
+  if (!orders.length) console.log('  no level orders recorded — the studio will reconstruct them')
+
   // First, middle and last. The last two sit past the 4 GB mark in an atlas,
   // which is exactly where a 32-bit offset would have wrapped.
   const pick = meta.parts.length > 2
@@ -132,6 +147,25 @@ export async function checkCollection(path) {
       }
       console.log(`  embeddings: ${embs.map(e => e.key).join(', ')}`)
     }
+    // The columns beyond the three roles. Optional, so absence is not a
+    // failure — but a part that kept a level it holds no cells for would give
+    // that level a different meaning here from every other part, and the union
+    // in the studio would then relabel cells rather than refuse.
+    const extras = bundle.meta.extras ?? []
+    for (const e of extras) {
+      check(`${e.key} is in the part as ${e.file}`, !!f[e.file], true)
+      const codes = new Uint16Array(f[e.file].slice().buffer)
+      check(`${e.key} has one level index per cell`, codes.length, p.nCells)
+      let outside = 0
+      for (const c of codes) if (c >= e.levels.length) outside++
+      check(`every ${e.key} code names a level this part defines`, outside, 0)
+      check(`${e.key} carries no level this part has no cells for`,
+        new Set(codes).size, e.levels.length)
+    }
+    console.log(extras.length
+      ? `  extra columns: ${extras.map(e => `${e.key} (${e.levels.length}: ${e.levels.slice(0, 4).join(', ')}${e.levels.length > 4 ? ' …' : ''})`).join(' · ')}`
+      : '  no extra columns in this part')
+
     const alias = bundle.meta.geneAlias
     if (alias) {
       const names = new TextDecoder().decode(f[alias.file]).split('\n')

@@ -9,6 +9,7 @@ import { unzipSync, strFromU8 } from 'fflate'
 import { buildBundle, chooseMatrices, streamableMatrix, BuildError } from '../src/lib/build.ts'
 import { categorical, numeric, fromFactor, geneNameKind, pickGeneAlias } from '../src/lib/scan.ts'
 import { cellQC, lognormalize, sumCells, toGeneMajor, dropZeros } from '../src/lib/matrix.ts'
+import { shardScan } from '../src/lib/shard.ts'
 import { CHUNK_GENES, readGenes } from '../src/lib/chunked.ts'
 
 let failed = 0
@@ -532,6 +533,66 @@ console.log(String.fromCharCode(10) + 'AN ACCESSION-ONLY OBJECT IS TOLD IT WILL 
   const b = open(buildBundle(scanOf({ scan: { geneSets: { RNA: ACC } } }), CHOICES))
   check('it says the sets will not match',
     b.meta.notes.some(n => n.includes('written as symbols will not match')), true)
+}
+
+console.log(String.fromCharCode(10) + 'AN EXTRA COLUMN TRAVELS WITH THE CELLS')
+// Whatever else the object knows about a cell. Not a fourth role: it is carried
+// under its own name, and nothing downstream is told which one it is.
+const REGION = categorical('dissection',
+  ['Forebrain', 'Forebrain', 'Midbrain', 'Midbrain', 'Hindbrain', 'Hindbrain'])
+/** One extra column's codes, read back out of the zip. */
+const extraOf = (res, file) =>
+  [...new Uint16Array(unzipSync(res.zip)[file].slice().buffer)]
+{
+  const res = buildBundle(scanOf({ columns: [REGION] }), { ...CHOICES, extras: ['dissection'] })
+  const b = open(res)
+  check('meta names it, under the object\'s own name',
+    b.meta.extras.map(e => e.key), ['dissection'])
+  check('with its levels in the object\'s order',
+    b.meta.extras[0].levels, ['Forebrain', 'Midbrain', 'Hindbrain'])
+  check('and an entry named by meta, one level index per cell',
+    extraOf(res, b.meta.extras[0].file), [0, 0, 1, 1, 2, 2])
+  check('the three roles are untouched',
+    [b.meta.clusters.length, b.meta.samples.length, b.meta.conditions.length], [3, 2, 2])
+  check('and which column each role came from is on the record',
+    [b.meta.provenance.clustering, b.meta.provenance.condition, b.meta.provenance.sample],
+    ['cell_type', 'group', 'sample'])
+}
+
+console.log(String.fromCharCode(10) + 'A PART DROPS THE LEVELS IT HAS NO CELLS FOR')
+// Already fixed once for cluster and sample. A shard that inherited the
+// parent's level list would make its own "region 2" a different region from
+// every other shard's, and every figure would still draw.
+{
+  const parent = scanOf({ columns: [REGION] })
+  const cells = Int32Array.from([2, 3, 4, 5])
+  const sub = shardScan(parent, { key: 'later half', cells, nnz: 0 },
+    new Map([['RNA@counts', fromDense(COUNTS.slice(2), 4)]]), 'test.rds · shard')
+  const res = buildBundle(sub, { ...CHOICES, extras: ['dissection'] })
+  const b = open(res)
+  check('the level this part does not hold is gone',
+    b.meta.extras[0].levels, ['Midbrain', 'Hindbrain'])
+  check('and the codes were renumbered onto what is left',
+    extraOf(res, b.meta.extras[0].file), [0, 0, 1, 1])
+  check('exactly as the cluster column is', b.meta.clusters, ['B cell', 'Myeloid'])
+  check('the note quotes the whole object, so every part says the same',
+    b.meta.notes.some(n => n.includes('dissection travels with the cells') && n.includes('3 levels')),
+    true)
+}
+
+console.log(String.fromCharCode(10) + 'WITHOUT ONE, THE BUNDLE IS WHAT IT ALWAYS WAS')
+{
+  const b = open(buildBundle(scanOf(), CHOICES))
+  check('no extra entry', b.names.some(n => n.startsWith('extra.')), false)
+  check('and nothing claims there is one', b.meta.extras, [])
+}
+
+console.log(String.fromCharCode(10) + 'A COLUMN ALREADY SPOKEN FOR IS NOT CARRIED TWICE')
+{
+  const b = open(buildBundle(scanOf(), { ...CHOICES, extras: ['group', 'percent.mt'] }))
+  check('the condition column is not duplicated', b.meta.extras, [])
+  check('and a measurement is refused with a reason',
+    b.meta.notes.some(n => n.includes('percent.mt') && n.includes('not a categorical')), true)
 }
 
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll build tests passed\n')

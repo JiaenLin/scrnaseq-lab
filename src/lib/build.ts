@@ -57,6 +57,25 @@ export interface GeneAliasMeta {
   duplicated: number
 }
 
+/**
+ * One further categorical column, carried per cell under its own name.
+ *
+ * The bundle has always had exactly three of these — cluster, sample,
+ * condition — because those are the three every view depends on. This is the
+ * rest of what the object knows: a dissection beside an age, a Class above a
+ * Subclass. Nothing here is a role, so nothing is renamed: `key` is the obs /
+ * meta.data column the levels came out of, and that is what the studio's menus
+ * say. A reader that does not know about this field opens the bundle unchanged.
+ */
+export interface ExtraColumn {
+  /** The column's own name in the object, e.g. `dissection`. */
+  key: string
+  /** Entry holding one uint16 level index per cell. */
+  file: string
+  /** Level names, in the object's own order, dropped to the ones this part uses. */
+  levels: string[]
+}
+
 export interface BundleMeta {
   schema: string
   label: string
@@ -67,6 +86,12 @@ export interface BundleMeta {
   clusters: string[]
   samples: { id: string; condition: string }[]
   conditions: string[]
+  /**
+   * Further categorical columns, in the order they were chosen.
+   *
+   * Absent in bundles written before today, which is the same as empty.
+   */
+  extras?: ExtraColumn[]
   /** The default embedding's key — `embeddings[0].key`. */
   embedding: string
   /**
@@ -367,6 +392,39 @@ export function buildBundle(
     sampleCond = sample.levels.map(() => 'all cells')
   }
 
+  // ---- the columns beyond the three roles --------------------------------
+  // Through the same `grouping` as cluster and sample, which is the whole point:
+  // a shard drops the levels it holds no cells for and renumbers its codes. A
+  // part that inherited the parent's level list would make its "dissection 3"
+  // a different region from the next part's, and every figure would still draw.
+  const roles = [choices.cluster, choices.sample, choices.condition]
+  const extras: ExtraColumn[] = []
+  const extraCodes: { file: string; codes: Uint16Array }[] = []
+  const extraFiles = new Set<string>()
+  for (const name of choices.extras ?? []) {
+    const col = column(scan, name)
+    if (roles.includes(name)) continue     // already carried, under its role
+    if (!col || col.kind !== 'categorical') {
+      note(`"${name}" is not a categorical column, so it is not carried as an extra grouping`)
+      continue
+    }
+    const g = grouping(col, 'all cells', n)
+    if (g.levels.length > 65535) {
+      note(`${col.name} has ${g.levels.length} levels, too many to store as a column`)
+      continue
+    }
+    let file = `extra.${safeEntry(col.name)}.u16`
+    for (let i = 2; extraFiles.has(file); i++) file = `extra.${safeEntry(col.name)}-${i}.u16`
+    extraFiles.add(file)
+    const codes = new Uint16Array(n)
+    for (let i = 0; i < n; i++) codes[i] = g.codes[i]
+    extras.push({ key: col.name, file, levels: g.levels })
+    extraCodes.push({ file, codes })
+    // The parent's level count, not this part's: subsetting a column keeps its
+    // levels whole, so this sentence reads the same in every part of a split.
+    note(`${col.name} travels with the cells as an extra grouping — ${col.levels.length} levels the studio can break a figure down by`)
+  }
+
   const emb = scan.embeddings.find(e => e.key === choices.embedding)
   if (!emb) throw new BuildError(`no embedding called "${choices.embedding}" in this object`)
   onProgress('Reading the embedding')
@@ -498,6 +556,7 @@ export function buildBundle(
     clusters: cluster.levels,
     samples: sample.levels.map((id, i) => ({ id, condition: sampleCond[i] })),
     conditions,
+    extras,
     embedding: emb.key,
     embeddings: embedFiles,
     geneIdKind,
@@ -505,7 +564,17 @@ export function buildBundle(
     expression,
     hasRawCounts: counts != null,
     chunkGenes: CHUNK_GENES,
-    provenance: { ...scan.provenance, clustering: choices.cluster },
+    // Which column each role was read from. `clustering` has always been here;
+    // the other two are recorded for the same reason — the studio's menus say
+    // "Group" because they have to say something, and an object that calls it
+    // Age should have the menu say Age. null means the object had no such
+    // column, which is a different fact from not knowing.
+    provenance: {
+      ...scan.provenance,
+      clustering: choices.cluster,
+      condition: condCol?.kind === 'categorical' ? condCol.name : null,
+      sample: sampleCol?.kind === 'categorical' ? sampleCol.name : null,
+    },
     notes,
   }
 
@@ -531,6 +600,7 @@ export function buildBundle(
   for (const e of extraXY) {
     files[e.file] = new Uint8Array(e.xy.buffer, e.xy.byteOffset, e.xy.byteLength)
   }
+  for (const e of extraCodes) files[e.file] = new Uint8Array(e.codes.buffer)
   if (aliasText != null) files['gene_alias.txt'] = strToU8(aliasText)
 
   // ---- pseudobulk -------------------------------------------------------
