@@ -11,7 +11,10 @@ you explore it in the Studio, not here.
 
 Drop the object in. The lab scans its metadata, shows every column it found, and asks the two
 questions it cannot answer for you: **which column holds the cell type annotation**, and
-**which — if any — is the condition to group by**. Then it writes `bundle.zip`.
+**which — if any — is the condition to group by**. Then it writes one `.zip`.
+
+Nothing else is asked. Any size is accepted, and an object too large to hold at once is split
+automatically into that one file — a storage detail the studio hides completely.
 
 ## Why this exists
 
@@ -48,35 +51,59 @@ slot alone can be a gigabyte of doubles nobody asked for, so numeric vectors are
 
 ## Atlases
 
-There is no file-size limit. The reader never copies the file: it mounts it
-behind a 4 MB block cache and HDF5 pulls only the bytes it asks for, so opening
-a 9.3 GB object costs about as much as opening a small one.
+**There is no size limit, and nothing to decide.** Drop a 9.3 GB object in; you
+get one `.zip` back.
+
+The reader never copies the file. It is mounted behind a 4 MB block cache and
+HDF5 pulls only the bytes it asks for, so opening a 9.3 GB object costs about
+what opening a small one costs.
+
+An object too large to hold at once is **split automatically**, into one file.
+The lab costs every categorical column from the CSR row offsets — exactly, before
+reading a single value — and takes the best cut itself. You are never asked. The
+studio opens the result as one intact dataset with every cell, so the split is a
+byte layout and never something you see.
 
 Measured end to end in Chrome on the 9.3 GB, 292,495-cell, 736 M-nonzero
 `developing_mouse_nervous_system.h5ad`:
 
 | | |
 |---|---|
-| scan, questions on screen | **9–13 s** |
+| scan, questions on screen | **1.5–13 s** |
 | cost every possible split, exactly | **12 ms** — from the row offsets, no values read |
-| convert to 43 bundles | **10.1 min** (7 forward passes) |
-| largest bundle | 12,282 cells · 39.3 M values · 177 MB |
-
-Objects too large for one bundle are **split**. The studio holds the matrix in
-memory, so one bundle tops out around 50 M stored values; the lab costs every
-categorical column as a candidate split and ranks them by how many pieces come
-out too big. On the atlas above it picks `donor_id` — 43 bundles, none oversized
-— over `dissection`, which leaves six that would not open. Each bundle keeps the
-full gene list and every metadata column; only the cells differ.
+| convert to one file | **~13 min** (43 parts, 7 forward passes, 5.83 GB, ZIP64) |
+| the studio opens it | **4.0 s**, all 292,495 cells |
 
 Two measurements shaped the design, both on that file:
 
-- **Random row reads cost 20 ms each.** The payload is chunked and compressed,
-  so a scattered row decompresses a whole chunk for ~2,500 values. One pass that
-  way would take 100 minutes.
+- **Random row reads cost 20 ms each.** The payload is chunked and compressed, so
+  a scattered row decompresses a whole chunk for ~2,500 values. One pass that way
+  would take 100 minutes.
 - **Sequential streaming sustains 11 M nonzeros/s.** So every read is
-  forward-only, a window slides and never seeks backwards, and all the shards in
-  one pass are filled together.
+  forward-only, a window slides and never seeks backwards, and every part in a
+  pass is filled together.
+
+## What comes out
+
+One `.zip`, always — whether it holds one piece or forty-three, so the studio has
+exactly one shape to understand.
+
+| | |
+|---|---|
+| `collection.json` | what it holds, what it was split along, and why |
+| `parts/<key>.zip` | each a complete `scrnaseq-studio/bundle@1` |
+
+Entries are **STORED, never deflated**: the parts are already compressed, and
+storing them verbatim makes each one a contiguous byte range, so the studio reads
+the index from the file's tail and pulls out only what it needs. Past 4 GB it
+goes ZIP64 — a real atlas needs it, and without it the offsets wrap and the file
+reads back as "not a collection".
+
+Inside each part the expression matrix is also written **gene-chunked**: blocks of
+64 genes, each deflated, with an offset index, so one gene can be read out of a
+multi-gigabyte file without holding the matrix. Gap-encoding the cell ids made
+that copy *smaller* than the flat one — −49.5% on real atlas data. One gene costs
+**3.9 ms cold, 0.018 ms warm**.
 
 ## What the object needs
 
@@ -141,17 +168,13 @@ against an independent implementation of the same spec rather than against a rec
 
 ## Known limits
 
-- **A single bundle tops out near 50 M stored values.** That is the studio's limit, not the
-  lab's: it holds the matrix resident because every marker and DE view scans all genes. Larger
-  objects are split; the lab shows the exact sizes before converting.
-- **Splitting needs a categorical column to split along.** An object with 700 M values and no
-  usable grouping cannot be divided.
-- **`.rds` is still read whole.** The lazy path is `.h5ad` only — R's serialization is a stream
+- **`.rds` is still read whole.** The lazy path is `.h5ad` only: R's serialization is a stream
   with no index, so it cannot be read out of order. Very large Seurat objects remain limited by
-  memory.
+  memory — save as `.h5ad` if yours is big.
+- **Splitting needs a categorical column to split along.** An object with hundreds of millions
+  of values and no usable grouping cannot be divided.
 - **Dense `.h5ad` X** is materialized in full before being thinned to nonzeros. Sparse is the
-  normal case and is streamed; a large dense matrix will be memory-hungry.
-- **Seurat v5** objects are read through `@layers`. Tested against v3/v4 objects; a v5 object
-  with a non-standard layer layout may need the assay named explicitly.
-- **bzip2/xz `.rds`** is refused with instructions to re-save as gzip (R's default).
-- Cell-level metadata beyond cluster/sample/condition is not carried into the bundle.
+  normal case and is streamed.
+- **Writing a file larger than a few hundred MB needs `showSaveFilePicker`** (Chrome, Edge).
+  A Chromium `Blob` past that size spills to disk and then fails every read, so elsewhere the
+  fallback path is limited to what a Blob can carry.

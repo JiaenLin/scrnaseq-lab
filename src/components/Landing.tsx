@@ -70,7 +70,7 @@ export default function Landing({ onFile, error, busy, stage }: {
             {busy ? (stage || 'Reading…') : 'Choose a file'}
           </button>
           <p className="mt-2.5 text-[12px]" style={{ color: 'var(--ink-3)' }}>
-            or drop it here — <code className="mono">.h5ad</code> or{' '}
+            or drop it here — <code className="mono">.h5ad</code> of any size, or{' '}
             <code className="mono">.rds</code>
           </p>
         </div>
@@ -82,6 +82,7 @@ export default function Landing({ onFile, error, busy, stage }: {
 
         <p className="mt-3 text-center text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
           Read in this tab — nothing is uploaded, and there is no Python or R to install.
+          A 9&nbsp;GB atlas is read in place rather than loaded, so it scans in seconds.
         </p>
 
         <details className="mt-5 rounded-xl px-3.5 py-2.5" style={{ background: 'var(--sunk)' }}>
