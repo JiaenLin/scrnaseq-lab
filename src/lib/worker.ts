@@ -52,7 +52,8 @@ function describe(s: Scan, nnzPerCell: Int32Array | null): ScanInfo {
       key: m.key, geneSet: m.geneSet, nGenes: m.nGenes, nCells: m.nCells, kind: m.kind,
     })),
     embeddings: s.embeddings.map(e => ({ key: e.key, nDims: e.nDims })),
-    geneSets: s.geneSets, provenance: s.provenance, notes: s.notes, nnzPerCell,
+    geneSets: s.geneSets, geneAliases: s.geneAliases,
+    provenance: s.provenance, notes: s.notes, nnzPerCell,
   }
 }
 

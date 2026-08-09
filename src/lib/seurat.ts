@@ -14,8 +14,8 @@ import {
   slot, strings, type RNum, type RValue,
 } from './rds.ts'
 import {
-  categorical, fromFactor, internGeneSet, maybeDiscrete, numeric,
-  type Column, type EmbeddingRef, type MatrixRef, type Scan,
+  categorical, fromFactor, internGeneSet, maybeDiscrete, numeric, pickGeneAlias,
+  type Column, type EmbeddingRef, type GeneAlias, type MatrixRef, type Scan,
 } from './scan.ts'
 import { classify, dropZeros, stridedSample, type CellMajor } from './matrix.ts'
 
@@ -71,11 +71,43 @@ function embedding2D(r: RdsReader, m: RValue | undefined, nCells: number): Float
   return out
 }
 
+/**
+ * The other naming of an assay's features, if the object carries one.
+ *
+ * Seurat has no dedicated place for it: `@meta.features` is a data.frame with
+ * one row per feature, and what is in it depends entirely on what the analyst
+ * put there. So every string column is offered to the same content-based
+ * chooser the .h5ad path uses, and usually nothing qualifies — which is the
+ * right answer for an object whose rows are already symbols.
+ */
+function assayAlias(
+  r: RdsReader, assay: RValue | undefined, genes: string[],
+): GeneAlias | null {
+  const mf = slot(assay, 'meta.features')
+  if (mf?.t !== 'list') return null
+  const names = namesOf(mf)
+  const columns: { name: string; values: string[] }[] = []
+  mf.v.forEach((c, i) => {
+    const lev = strings(attrOf(c, 'levels'))
+    if (lev.length && c.t === 'num') {
+      const codes = r.numbers(c) as Int32Array
+      columns.push({
+        name: names[i] ?? `V${i}`,
+        values: Array.from(codes, k => (k >= 1 && k <= lev.length ? lev[k - 1] : '')),
+      })
+      return
+    }
+    const s = c.t === 'str' ? c.v.map(x => x ?? '') : columnAsStrings(r, c)
+    if (s) columns.push({ name: names[i] ?? `V${i}`, values: s })
+  })
+  return pickGeneAlias(genes, columns)
+}
+
 /** Every assay's matrix slots, v3/v4 and v5 alike. */
 function assayMatrices(
   assays: RValue | undefined, note: (s: string) => void,
-): { key: string; value: RValue; genes: string[] }[] {
-  const out: { key: string; value: RValue; genes: string[] }[] = []
+): { key: string; value: RValue; genes: string[]; assay: RValue }[] {
+  const out: { key: string; value: RValue; genes: string[]; assay: RValue }[] = []
   const names = namesOf(assays)
   if (assays?.t !== 'list') return out
 
@@ -89,7 +121,7 @@ function assayMatrices(
       const ln = namesOf(layers)
       layers.v.forEach((m, li) => {
         const genes = dgcGenes(m)
-        out.push({ key: `${an}@layers$${ln[li] ?? li}`, value: m, genes })
+        out.push({ key: `${an}@layers$${ln[li] ?? li}`, value: m, genes, assay: a })
       })
       if (!out.length) note(`assay ${an} is ${cls[0] ?? 'v5'} with no readable layers`)
       return
@@ -98,7 +130,7 @@ function assayMatrices(
     for (const s of ['counts', 'data', 'scale.data']) {
       const m = slot(a, s)
       if (!m || m.t === 'null') continue
-      out.push({ key: `${an}@${s}`, value: m, genes: dgcGenes(m) })
+      out.push({ key: `${an}@${s}`, value: m, genes: dgcGenes(m), assay: a })
     }
   })
   return out
@@ -126,10 +158,11 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
   if (!found.length) throw new RdsError('this Seurat object has no assay matrices')
 
   const geneSets: Record<string, string[]> = {}
+  const geneAliases: Record<string, GeneAlias> = {}
   const matrices: MatrixRef[] = []
   let nCells = 0
 
-  for (const { key, value, genes } of found) {
+  for (const { key, value, genes, assay } of found) {
     const d = dgcDim(r, value)
     if (!d) {
       // scale.data is a plain dense matrix, not a dgCMatrix. It is scaled by
@@ -144,6 +177,10 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
       continue
     }
     const setKey = internGeneSet(geneSets, genes, key.replace(/@.*/, '') || 'features')
+    if (!(setKey in geneAliases)) {
+      const alias = assayAlias(r, assay, genes)
+      if (alias) geneAliases[setKey] = alias
+    }
     const x = slot(value, 'x') as RNum | undefined
     if (!x || x.t !== 'num') continue
     matrices.push({
@@ -220,7 +257,8 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
 
   const names = columns.map(c => c.name)
   return {
-    format: 'seurat', source: filename, nCells, columns, matrices, embeddings, geneSets,
+    format: 'seurat', source: filename, nCells, columns, matrices, embeddings,
+    geneSets, geneAliases,
     provenance: {
       normalization: null,
       integration: embeddings.some(e => /harmony|integrated|mnn/i.test(e.key)) ? 'present' : null,

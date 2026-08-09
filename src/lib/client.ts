@@ -177,6 +177,13 @@ export async function convert(
     nCells: parts.reduce((n, p) => n + p.meta.nCells, 0),
     nGenes: first.nGenes,
     clusterOrder,
+    // Identical in every part — they come from one object — so they describe
+    // the collection and are lifted out of the first part rather than repeated.
+    embeddings: first.embeddings?.map(e => e.key),
+    geneIdKind: first.geneIdKind,
+    geneAlias: first.geneAlias
+      ? { kind: first.geneAlias.kind, column: first.geneAlias.column }
+      : null,
     parts: partInfo,
     // The conversion notes are decisions about the object as a whole — which
     // matrix, which normalization, what was missing — so they are identical in

@@ -1,6 +1,6 @@
 import { useMemo } from 'react'
 import {
-  candidates, column, crossCheck, duplicateOf, replicatesPerCondition,
+  candidates, column, crossCheck, duplicateOf, geneNameKind, replicatesPerCondition,
   samePartition, unusable,
   type Choices, type Column, type Role, type ScanInfo,
 } from '../lib/scan.ts'
@@ -192,6 +192,22 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
   const hasCounts = scan.matrices.some(m => m.kind === 'counts' || m.kind === 'log-counts')
   const usableMatrix = scan.matrices.some(m => m.kind !== 'scaled')
 
+  // How the genes are named, and whether the other naming was found. An atlas
+  // indexed by Ensembl accessions matches no gene set written in symbols, and
+  // that is worth knowing before a quarter of an hour of conversion, not after.
+  const geneNote = (() => {
+    const set = scan.matrices.find(m => m.kind !== 'scaled')?.geneSet
+    const genes = set ? scan.geneSets[set] : null
+    if (!genes?.length) return null
+    const kind = geneNameKind(genes)
+    if (kind === 'symbol') return null
+    const alias = set ? scan.geneAliases?.[set] : null
+    const what = kind === 'accession' ? 'accessions' : 'a mix of accessions and symbols'
+    return alias
+      ? `Genes are named by ${what} (${genes[0]}); the symbols in var/${alias.column} travel with them, so gene sets will still match.`
+      : `Genes are named by ${what} (${genes[0]}), and this object has no symbol column — gene sets and marker lists written as symbols will not match.`
+  })()
+
   return (
     <div className="wrap py-7">
       <div className="flex items-baseline gap-2.5">
@@ -210,6 +226,10 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
           re-save including the raw counts or the log-normalized matrix.
         </div>
       )}
+
+      {/* Which naming the genes carry, said before the conversion rather than
+          discovered afterwards when every gene set matches nothing. */}
+      {geneNote && <p className="sub mt-3">{geneNote}</p>}
 
       <Card
         eyebrow="Step 1 · required"
@@ -254,7 +274,10 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
       {clash && <div className="note mt-4"><b>These two do not nest.</b> {clash}</div>}
 
       <Card eyebrow="Step 4" title="Embedding and label">
-        <Field label="Embedding" hint="What the Cells and Feature plot tabs draw on.">
+        {/* Every 2D embedding goes into the bundle now, so this is no longer a
+            choice between them — only which one the studio opens on. Saying so
+            stops it reading as "the others are discarded", which it used to be. */}
+        <Field label="Embedding" hint="Which one the studio opens on. All of them travel in the file.">
           <div className="seg">
             {scan.embeddings.map(e => (
               <button key={e.key} className={e.key === choices.embedding ? 'sel' : ''}
@@ -270,6 +293,11 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
           )}
           {/pca/i.test(choices.embedding) && (
             <p className="sub mt-2">Principal components only — a coarser picture than a UMAP.</p>
+          )}
+          {scan.embeddings.length > 1 && (
+            <p className="sub mt-2">
+              All {scan.embeddings.length} travel in the file; the studio can switch between them.
+            </p>
           )}
         </Field>
 

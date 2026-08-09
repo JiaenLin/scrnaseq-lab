@@ -114,6 +114,23 @@ that copy *smaller* than the flat one — −49.5% on real atlas data. One gene 
 | Expression | log-normalized values, or raw counts to build them from | **Required** |
 | A sample column | donor, animal, run | Optional — without it, composition cannot show between-animal spread |
 | A condition column | the experimental group | Optional — without it the object opens single-condition |
+| Gene symbols | a `var` column beside accession-named rows | Optional — without it, gene sets written as symbols will not match, and the lab says so |
+
+## What it carries that the object had
+
+**Every 2D embedding, not the one you picked.** An object usually holds a UMAP and a t-SNE
+of the same cells; which to look at is the reader's question, not the converter's. The one
+you choose opens first and is still `embed.f32`, so nothing that reads bundles has to
+change; the rest travel beside it at 8 bytes a cell.
+
+**Both namings of the genes.** `genes.txt` is whatever the matrix rows are indexed by —
+`ENSMUSG00000038751` as often as `Sox2` — and `meta.geneIdKind` says which, judged from the
+names themselves. Where the object also had the other naming in `var`, it is written line
+for line beside it as `gene_alias.txt`. No mapping table ships with the app: one would be
+species-specific and would go stale, and the file being converted already knows the answer.
+Genes with no symbol keep their accession and are counted; several accessions sharing one
+symbol keep their own rows and are counted — merging them would sum two genes under one
+name.
 
 ## Decisions it makes, and shows
 

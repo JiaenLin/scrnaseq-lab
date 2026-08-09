@@ -12,11 +12,50 @@ import {
   cellQC, expm1Round, log1p, lognormalize, sumCells, toGeneMajor,
   type CellMajor, type MatrixKind,
 } from './matrix.ts'
-import { column, type Choices, type Column, type MatrixRef, type Scan } from './scan.ts'
+import {
+  column, geneNameKind,
+  type Choices, type Column, type GeneIdKind, type MatrixRef, type Scan,
+} from './scan.ts'
 
 export const SCHEMA = 'scrnaseq-studio/bundle@1'
 
 export class BuildError extends Error {}
+
+/** One 2D embedding inside the bundle. */
+export interface EmbeddingEntry {
+  /** The name the object gave it, e.g. `X_UMAP`. */
+  key: string
+  /** Entry holding interleaved x,y — float32, 2 × nCells. */
+  file: string
+}
+
+/**
+ * The gene names the matrix rows are *not* indexed by.
+ *
+ * Written when the object carried both namings. Aligned with `genes.txt`, one
+ * line per matrix row, so the studio converts by index and never by lookup.
+ */
+export interface GeneAliasMeta {
+  /** What `gene_alias.txt` holds — the opposite of `geneIdKind`. */
+  kind: 'symbol' | 'accession'
+  /** The var / feature column it was read from, for the record. */
+  column: string
+  /** Entry name. */
+  file: string
+  /**
+   * Rows the object had no alias for. Those lines repeat `genes.txt`, so the
+   * file is always a usable display name and never a blank.
+   */
+  missing: number
+  /**
+   * Rows whose alias is shared with another row.
+   *
+   * Nothing is merged: several accessions really do map to one symbol, and
+   * collapsing them would silently sum two genes' expression. The studio has to
+   * decide how to show a repeated name; the bundle keeps the rows apart.
+   */
+  duplicated: number
+}
 
 export interface BundleMeta {
   schema: string
@@ -28,7 +67,19 @@ export interface BundleMeta {
   clusters: string[]
   samples: { id: string; condition: string }[]
   conditions: string[]
+  /** The default embedding's key — `embeddings[0].key`. */
   embedding: string
+  /**
+   * Every 2D embedding the object had, the default first.
+   *
+   * Absent in bundles written before today; a reader without it has exactly one
+   * embedding, `embed.f32`, named by `embedding`.
+   */
+  embeddings?: EmbeddingEntry[]
+  /** What `genes.txt` holds. Absent in older bundles, where it is unknown. */
+  geneIdKind?: GeneIdKind
+  /** The other naming, when the object had one. */
+  geneAlias?: GeneAliasMeta | null
   expression: string
   hasRawCounts: boolean
   /**
@@ -176,6 +227,41 @@ function grouping(col: Column | undefined, fallback: string, nCells: number): {
   return { codes, levels }
 }
 
+/** An entry name that survives a zip and a file system. */
+const safeEntry = (s: string) =>
+  (s || 'x').replace(/[^\w.-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'x'
+
+/**
+ * The alias list as it goes into the bundle, and what had to be decided.
+ *
+ * Two things the object does to this list, both of which have to be said out
+ * loud rather than papered over:
+ *
+ *   - an empty symbol. The row keeps its accession, so every line of the file
+ *     is a name something can be labelled with.
+ *   - a symbol shared by several accessions. Real: read-through transcripts and
+ *     paralogue annotations both do it. The rows stay separate — merging them
+ *     would add two genes' expression together under one name — and the count
+ *     is recorded so the studio can disambiguate rather than pick one.
+ */
+function alignAlias(genes: string[], alias: { names: string[] }): {
+  names: string[]; missing: number; duplicated: number
+} {
+  const names = new Array<string>(genes.length)
+  let missing = 0
+  const seen = new Map<string, number>()
+  for (let i = 0; i < genes.length; i++) {
+    const raw = (alias.names[i] ?? '').trim()
+    const ok = raw && raw !== 'NA' && raw !== 'nan'
+    if (!ok) missing++
+    names[i] = ok ? raw : genes[i]
+    seen.set(names[i], (seen.get(names[i]) ?? 0) + 1)
+  }
+  let duplicated = 0
+  for (const nm of names) if ((seen.get(nm) ?? 0) > 1) duplicated++
+  return { names, missing, duplicated }
+}
+
 /** A numeric obs column by any of several conventional names. */
 function qcColumn(scan: Scan, names: string[]): Float32Array | null {
   for (const n of names) {
@@ -243,6 +329,40 @@ export function buildBundle(
     note('using the first two principal components, which is a much coarser picture than a UMAP')
   }
 
+  // Every other 2D embedding as well. An object routinely holds a UMAP and a
+  // t-SNE of the same cells, and until now the lab kept one and threw the rest
+  // away — 8 bytes a cell to carry, against a matrix that costs 8 bytes a
+  // *stored value*. The chosen one stays first and stays in `embed.f32`, so a
+  // reader that knows nothing about this sees no change at all.
+  const others = scan.embeddings.filter(e => e.key !== emb.key && e.nDims >= 2)
+  const embedFiles: EmbeddingEntry[] = [{ key: emb.key, file: 'embed.f32' }]
+  const extraXY: { file: string; xy: Float32Array }[] = []
+  const usedNames = new Set(['embed.f32'])
+  for (const e of others) {
+    let file = `embed.${safeEntry(e.key)}.f32`
+    for (let i = 2; usedNames.has(file); i++) file = `embed.${safeEntry(e.key)}-${i}.f32`
+    usedNames.add(file)
+    onProgress(`Reading the ${e.key} embedding`)
+    let coords: Float32Array
+    try {
+      coords = e.load()
+    } catch (err) {
+      // One unreadable extra embedding must not lose the conversion: the
+      // default one is already in hand and is what the studio opens with.
+      note(`${e.key} could not be read (${(err as Error).message}); it is not in the bundle`)
+      continue
+    }
+    if (coords.length !== 2 * n) {
+      note(`${e.key} has ${coords.length / 2} points for ${n} cells; it is not in the bundle`)
+      continue
+    }
+    extraXY.push({ file, xy: coords })
+    embedFiles.push({ key: e.key, file })
+  }
+  if (extraXY.length) {
+    note(`${embedFiles.length} embeddings carried (${embedFiles.map(e => e.key).join(', ')}); ${emb.key} opens by default`)
+  }
+
   // ---- QC ---------------------------------------------------------------
   onProgress('Computing QC')
   let total = qcColumn(scan, ['n_counts', 'total_counts', 'nCount_RNA'])
@@ -296,6 +416,32 @@ export function buildBundle(
     throw new BuildError('more than 65 535 clusters or samples — that is not an annotation')
   }
 
+  // ---- gene names -------------------------------------------------------
+  // Which naming the matrix rows carry, and the other one beside it. The
+  // built-in gene sets in the studio are symbols; on this atlas the rows are
+  // Ensembl accessions, which is the entire reason those sets matched nothing.
+  const geneIdKind = geneNameKind(genes)
+  const rawAlias = scan.geneAliases?.[geneSet]
+  let geneAlias: GeneAliasMeta | null = null
+  let aliasText: string | null = null
+  if (rawAlias && rawAlias.names.length === genes.length) {
+    const a = alignAlias(genes, rawAlias)
+    geneAlias = {
+      kind: rawAlias.kind, column: rawAlias.column, file: 'gene_alias.txt',
+      missing: a.missing, duplicated: a.duplicated,
+    }
+    aliasText = a.names.join('\n')
+    note(`gene names are ${geneIdKind === 'accession' ? 'accessions' : geneIdKind === 'symbol' ? 'symbols' : 'a mix of accessions and symbols'}; var/${rawAlias.column} carries the ${rawAlias.kind}s and travels with them`)
+    if (a.missing) {
+      note(`${a.missing} of ${genes.length} genes have no ${rawAlias.kind} in the object; those keep the name the matrix is indexed by`)
+    }
+    if (a.duplicated) {
+      note(`${a.duplicated} genes share a ${rawAlias.kind} with another gene; the rows are kept separate rather than summed`)
+    }
+  } else if (geneIdKind === 'accession') {
+    note('gene names are accessions and this object holds no symbol column, so gene sets and marker lists written as symbols will not match')
+  }
+
   const meta: BundleMeta = {
     schema: SCHEMA,
     label: choices.label || scan.source,
@@ -307,6 +453,9 @@ export function buildBundle(
     samples: sample.levels.map((id, i) => ({ id, condition: sampleCond[i] })),
     conditions,
     embedding: emb.key,
+    embeddings: embedFiles,
+    geneIdKind,
+    geneAlias,
     expression,
     hasRawCounts: counts != null,
     chunkGenes: CHUNK_GENES,
@@ -332,6 +481,11 @@ export function buildBundle(
     // problem this format exists to solve.
     'expr.chunk.bin': [chunked.bin, { level: 0 }],
   }
+
+  for (const e of extraXY) {
+    files[e.file] = new Uint8Array(e.xy.buffer, e.xy.byteOffset, e.xy.byteLength)
+  }
+  if (aliasText != null) files['gene_alias.txt'] = strToU8(aliasText)
 
   // ---- pseudobulk -------------------------------------------------------
   let pbColumns = 0

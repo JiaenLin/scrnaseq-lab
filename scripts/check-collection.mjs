@@ -117,6 +117,32 @@ export async function checkCollection(path) {
 
     // Now the lazy path, byte ranges and all — exactly the studio's recipe.
     const f = unzipSync(raw)
+
+    // The two format additions. Both are optional, so absence is not a failure
+    // — but when they are there they must line up with the matrix, because a
+    // misaligned name list mislabels every figure without ever throwing.
+    const embs = bundle.meta.embeddings
+    if (embs) {
+      check('the default embedding is first and lives in embed.f32',
+        [embs[0].key, embs[0].file], [bundle.meta.embedding, 'embed.f32'])
+      for (const e of embs) {
+        check(`${e.key} is in the part as ${e.file}`, !!f[e.file], true)
+        check(`${e.key} has two coordinates for every cell`,
+          new Float32Array(f[e.file].slice().buffer).length, 2 * p.nCells)
+      }
+      console.log(`  embeddings: ${embs.map(e => e.key).join(', ')}`)
+    }
+    const alias = bundle.meta.geneAlias
+    if (alias) {
+      const names = new TextDecoder().decode(f[alias.file]).split('\n')
+      check('the alias has one name per matrix row', names.length, bundle.genes.length)
+      check('and none of them is blank', names.every(n => n.length > 0), true)
+      console.log(`  genes are ${bundle.meta.geneIdKind}s; ${alias.kind}s from var/${alias.column}: ${bundle.genes[0]} → ${names[0]} (${alias.missing} missing, ${alias.duplicated} shared)`)
+    } else {
+      console.log(bundle.meta.geneIdKind
+        ? `  genes are ${bundle.meta.geneIdKind}s, and the object held no second naming`
+        : '  written before gene naming was recorded — genes.txt is whatever the object had')
+    }
     const chunkptr = new Int32Array(f['expr.chunkptr.i32'].slice().buffer)
     const inner = storedOffset(raw, 'expr.chunk.bin')
     check('expr.chunk.bin is stored inside the part', inner >= 0, true)

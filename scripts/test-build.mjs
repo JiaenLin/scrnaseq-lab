@@ -7,7 +7,7 @@
 
 import { unzipSync, strFromU8 } from 'fflate'
 import { buildBundle, chooseMatrices, streamableMatrix, BuildError } from '../src/lib/build.ts'
-import { categorical, numeric, fromFactor } from '../src/lib/scan.ts'
+import { categorical, numeric, fromFactor, geneNameKind, pickGeneAlias } from '../src/lib/scan.ts'
 import { cellQC, lognormalize, sumCells, toGeneMajor, dropZeros } from '../src/lib/matrix.ts'
 import { CHUNK_GENES, readGenes } from '../src/lib/chunked.ts'
 
@@ -341,5 +341,145 @@ console.log(String.fromCharCode(10) + 'THE SPLIT PATH PICKS THE SAME MATRIX AS T
   check('nothing streamable but scaled data returns null, so the caller can say why',
     pick([mk('X', 'scaled', true)]), null)
 }
+
+console.log(String.fromCharCode(10) + 'EVERY 2D EMBEDDING IS CARRIED, NOT JUST THE CHOSEN ONE')
+// An object routinely holds a UMAP and a t-SNE of the same cells. The lab used
+// to keep one and discard the rest, which is a decision the user never made and
+// could not undo without converting again.
+{
+  const umap = Float32Array.from([0,0, 1,1, 2,2, 3,3, 4,4, 5,5])
+  const tsne = Float32Array.from([9,9, 8,8, 7,7, 6,6, 5,5, 4,4])
+  const pca = Float32Array.from([1,2, 3,4, 5,6, 7,8, 9,10, 11,12])
+  const res = buildBundle(scanOf({ scan: { embeddings: [
+    { key: 'X_umap', nDims: 2, load: () => umap },
+    { key: 'X_tSNE', nDims: 2, load: () => tsne },
+    { key: 'X_pca', nDims: 50, load: () => pca },
+  ] } }), { ...CHOICES, embedding: 'X_umap' })
+  const b = open(res)
+  check('the chosen one is still embed.f32, byte for byte', Array.from(b.embed), Array.from(umap))
+  check('meta names it as the default', b.meta.embedding, 'X_umap')
+  check('and lists them all, the default first', b.meta.embeddings, [
+    { key: 'X_umap', file: 'embed.f32' },
+    { key: 'X_tSNE', file: 'embed.X_tSNE.f32' },
+    { key: 'X_pca', file: 'embed.X_pca.f32' },
+  ])
+  const f = unzipSync(res.zip)
+  const read = name => Array.from(new Float32Array(f[name].slice().buffer))
+  check('the t-SNE is really in the file', read('embed.X_tSNE.f32'), Array.from(tsne))
+  check('and so is the PCA', read('embed.X_pca.f32'), Array.from(pca))
+
+  // Choosing a different default must move the bytes, not just the label: a
+  // reader that knows nothing of meta.embeddings reads embed.f32 alone.
+  const b2 = open(buildBundle(scanOf({ scan: { embeddings: [
+    { key: 'X_umap', nDims: 2, load: () => umap },
+    { key: 'X_tSNE', nDims: 2, load: () => tsne },
+  ] } }), { ...CHOICES, embedding: 'X_tSNE' }))
+  check('picking the t-SNE puts the t-SNE in embed.f32', Array.from(b2.embed), Array.from(tsne))
+  check('and the UMAP moves to a named entry', b2.meta.embeddings, [
+    { key: 'X_tSNE', file: 'embed.f32' },
+    { key: 'X_umap', file: 'embed.X_umap.f32' },
+  ])
+}
+
+console.log(String.fromCharCode(10) + 'ONE EMBEDDING STILL WRITES EXACTLY WHAT IT USED TO')
+{
+  const b = open(buildBundle(scanOf(), CHOICES))
+  check('no extra embedding entries', b.names.filter(n => n.startsWith('embed.')), ['embed.f32'])
+  check('and the list has the one', b.meta.embeddings, [{ key: 'umap', file: 'embed.f32' }])
+}
+
+console.log(String.fromCharCode(10) + 'AN UNREADABLE EXTRA EMBEDDING DOES NOT LOSE THE CONVERSION')
+// Twenty minutes of reading must not be thrown away over a decoration.
+{
+  const b = open(buildBundle(scanOf({ scan: { embeddings: [
+    { key: 'umap', nDims: 2, load: () => Float32Array.from([0,0, 1,1, 2,2, 3,3, 4,4, 5,5]) },
+    { key: 'broken', nDims: 2, load: () => { throw new Error('bad chunk') } },
+    { key: 'short', nDims: 2, load: () => Float32Array.from([0, 0]) },
+  ] } }), CHOICES))
+  check('the bundle is written anyway', b.meta.nCells, 6)
+  check('only the readable one is listed', b.meta.embeddings, [{ key: 'umap', file: 'embed.f32' }])
+  check('and it says why', b.meta.notes.some(n => n.includes('broken') && n.includes('bad chunk')), true)
+  check('a wrong-length one is refused too',
+    b.meta.notes.some(n => n.includes('short') && n.includes('1 points for 6 cells')), true)
+}
+
+console.log(String.fromCharCode(10) + 'GENE NAMES ARE CLASSIFIED BY WHAT THEY LOOK LIKE')
+{
+  check('Ensembl mouse', geneNameKind(['ENSMUSG00000038751', 'ENSMUSG00000030762']), 'accession')
+  check('Ensembl human', geneNameKind(['ENSG00000141510', 'ENSG00000012048']), 'accession')
+  check('versioned Ensembl', geneNameKind(['ENSG00000141510.17', 'ENSG00000012048.23']), 'accession')
+  check('symbols', geneNameKind(['Sox2', 'Actb', 'Gapdh', 'Mki67']), 'symbol')
+  // A symbol that starts with an accession's letters is still a symbol; the
+  // digits are what make an identifier.
+  check('ENSA is a real gene symbol', geneNameKind(['ENSA', 'Sox2', 'Actb']), 'symbol')
+  check('bare Entrez ids', geneNameKind(['100038431', '17869', '11461']), 'accession')
+  check('two references concatenated',
+    geneNameKind(['ENSG00000141510', 'ENSG00000012048', 'Sox2', 'Actb']), 'mixed')
+}
+
+console.log(String.fromCharCode(10) + 'THE SYMBOL COLUMN IS FOUND BY CONTENT, NOT BY ITS NAME')
+{
+  const acc = ['ENSMUSG00000000001', 'ENSMUSG00000000002', 'ENSMUSG00000000003', 'ENSMUSG00000000004']
+  const pick = cols => pickGeneAlias(acc, cols)
+  check('a column called Gene holding symbols',
+    pick([{ name: 'Gene', values: ['Sox2', 'Actb', 'Gapdh', 'Mki67'] }]),
+    { kind: 'symbol', column: 'Gene', names: ['Sox2', 'Actb', 'Gapdh', 'Mki67'] })
+  check('a chromosome column is not a naming — too few distinct values',
+    pick([{ name: 'Chromosome', values: ['1', '1', '2', '2'] }]), null)
+  check('nor is a biotype', pick([{ name: 'feature_type',
+    values: ['Gene Expression', 'Gene Expression', 'Gene Expression', 'Gene Expression'] }]), null)
+  check('a column called Gene holding accessions is not the symbols',
+    pick([{ name: 'Gene', values: acc }]), null)
+  check('the conventional name wins when two columns both qualify', pick([
+    { name: 'other_name', values: ['aa', 'bb', 'cc', 'dd'] },
+    { name: 'gene_symbol', values: ['Sox2', 'Actb', 'Gapdh', 'Mki67'] },
+  ]).column, 'gene_symbol')
+  // The reverse layout: rows are symbols already and the accessions are the
+  // column. Scanpy writes exactly this.
+  check('symbols indexed, accessions in var',
+    pickGeneAlias(['Sox2', 'Actb', 'Gapdh', 'Mki67'], [{ name: 'gene_ids', values: acc }]),
+    { kind: 'accession', column: 'gene_ids', names: acc })
+}
+
+console.log(String.fromCharCode(10) + 'BOTH NAMINGS TRAVEL IN THE BUNDLE')
+{
+  const ACC = ['ENSMUSG00000000001', 'ENSMUSG00000000002', 'ENSMUSG00000000003', 'ENSMUSG00000000004']
+  const res = buildBundle(scanOf({ scan: {
+    geneSets: { RNA: ACC },
+    geneAliases: { RNA: { kind: 'symbol', column: 'Gene', names: ['Sox2', 'Actb', 'Sox2', ''] } },
+  } }), CHOICES)
+  const b = open(res)
+  const f = unzipSync(res.zip)
+  check('genes.txt is still what the matrix rows are indexed by', b.genes, ACC)
+  check('meta says which naming that is', b.meta.geneIdKind, 'accession')
+  // Row 4 had no symbol, so it keeps its accession — every line is usable.
+  check('the alias is a file beside it', strFromU8(f['gene_alias.txt']).split('\n'),
+    ['Sox2', 'Actb', 'Sox2', 'ENSMUSG00000000004'])
+  check('and meta describes it', b.meta.geneAlias,
+    { kind: 'symbol', column: 'Gene', file: 'gene_alias.txt', missing: 1, duplicated: 2 })
+  check('rows sharing a symbol are not merged', b.meta.nGenes, 4)
+  check('the empty one is reported',
+    b.meta.notes.some(n => n.includes('1 of 4 genes have no symbol')), true)
+  check('and so is the collision',
+    b.meta.notes.some(n => n.includes('2 genes share a symbol')), true)
+}
+
+console.log(String.fromCharCode(10) + 'WITHOUT AN ALIAS THE BUNDLE IS WHAT IT ALWAYS WAS')
+{
+  const b = open(buildBundle(scanOf(), CHOICES))
+  check('no alias file', b.names.includes('gene_alias.txt'), false)
+  check('meta says there is none', b.meta.geneAlias, null)
+  check('and still classifies what it does have', b.meta.geneIdKind, 'symbol')
+}
+
+console.log(String.fromCharCode(10) + 'AN ACCESSION-ONLY OBJECT IS TOLD IT WILL NOT MATCH GENE SETS')
+// The reason the studio's built-in sets matched nothing on the real atlas.
+{
+  const ACC = ['ENSMUSG00000000001', 'ENSMUSG00000000002', 'ENSMUSG00000000003', 'ENSMUSG00000000004']
+  const b = open(buildBundle(scanOf({ scan: { geneSets: { RNA: ACC } } }), CHOICES))
+  check('it says the sets will not match',
+    b.meta.notes.some(n => n.includes('written as symbols will not match')), true)
+}
+
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll build tests passed\n')
 process.exit(failed ? 1 : 0)

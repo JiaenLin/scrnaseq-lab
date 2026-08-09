@@ -55,6 +55,26 @@ export interface EmbeddingRef {
   load: () => Float32Array
 }
 
+/** What a list of gene names is made of, judged by the names themselves. */
+export type GeneIdKind = 'accession' | 'symbol' | 'mixed'
+
+/**
+ * The same genes named the other way round.
+ *
+ * An object indexes its matrix rows by one naming — this atlas uses Ensembl
+ * accessions — and keeps the other in a var column. Both are facts the file
+ * already holds, so both travel: `names` is aligned with the gene set it
+ * belongs to, one entry per matrix row, in the same order.
+ */
+export interface GeneAlias {
+  /** What these names are, decided by content rather than by column name. */
+  kind: 'symbol' | 'accession'
+  /** The var / feature column they were read from. */
+  column: string
+  /** One per gene, aligned with the gene set. Empty where the file had none. */
+  names: string[]
+}
+
 /**
  * Everything about a scan that survives postMessage.
  *
@@ -70,6 +90,8 @@ export interface ScanInfo {
   matrices: { key: string; geneSet: string; nGenes: number; nCells: number; kind: MatrixKind }[]
   embeddings: { key: string; nDims: number }[]
   geneSets: Record<string, string[]>
+  /** The other naming of a gene set's rows, keyed the same way as `geneSets`. */
+  geneAliases: Record<string, GeneAlias>
   provenance: Record<string, string | null>
   notes: string[]
   /** Nonzeros per cell, when the source could supply them cheaply. */
@@ -86,6 +108,8 @@ export interface Scan {
   embeddings: EmbeddingRef[]
   /** Gene names per gene set named by `MatrixRef.geneSet`. */
   geneSets: Record<string, string[]>
+  /** The other naming of a gene set's rows, keyed the same way as `geneSets`. */
+  geneAliases: Record<string, GeneAlias>
   provenance: Record<string, string | null>
   /** Everything the reader had to decide, in the order it decided it. */
   notes: string[]
@@ -347,6 +371,112 @@ export function internGeneSet(
   for (let i = 2; key in sets; i++) key = `${preferred}#${i}`
   sets[key] = genes
   return key
+}
+
+// ---------------------------------------------------------------------------
+// Gene names: which naming is which.
+//
+// A gene set is either accessions (ENSMUSG00000038751) or symbols (Sox2), and
+// which one it is decides whether every built-in gene set in the studio matches
+// anything at all. The object usually holds both — one as the var index, the
+// other as a var column — so the answer is in the file and does not need a
+// lookup table, which would be species-specific and would go stale.
+//
+// This is decided by content, the same way matrices are classified by their
+// numbers rather than by their slot names: a column called "Gene" holding
+// accessions is accessions.
+
+/**
+ * Shapes that only an identifier has.
+ *
+ * Ensembl for any species (the letters between ENS and the type code are the
+ * species prefix, absent for human), FlyBase, WormBase, Arabidopsis AGI codes,
+ * NCBI LOC ids, and bare numbers — an all-digit "gene name" is an Entrez id.
+ * A version suffix (`ENSG00000141510.17`) is common in GENCODE-derived objects.
+ */
+const ACCESSION_RE =
+  /^(ENS[A-Z]{0,5}[GTPRE]\d{6,}|FB(gn|tr|pp)\d{5,}|WBGene\d{5,}|AT[1-5CM]G\d{5}|LOC\d{3,}|\d{3,})(\.\d+)?$/
+
+/** Up to `want` entries spread across the list, so the head is not the sample. */
+function spread(names: string[], want: number): string[] {
+  if (names.length <= want) return names
+  const step = names.length / want
+  const out: string[] = []
+  for (let i = 0; i < want; i++) out.push(names[Math.floor(i * step)])
+  return out
+}
+
+/**
+ * Are these gene names accessions or symbols?
+ *
+ * `mixed` is a real answer, not a failure: objects concatenated from two
+ * references do exist, and calling one of those "symbols" would make every
+ * gene-set lookup half-miss with no explanation.
+ */
+export function geneNameKind(names: string[]): GeneIdKind {
+  const s = spread(names.filter(n => n.length > 0), 4000)
+  if (!s.length) return 'mixed'
+  let acc = 0
+  for (const n of s) if (ACCESSION_RE.test(n)) acc++
+  const frac = acc / s.length
+  if (frac >= 0.9) return 'accession'
+  if (frac <= 0.1) return 'symbol'
+  return 'mixed'
+}
+
+/**
+ * Column names that conventionally hold each naming.
+ *
+ * A hint only — the content check above has the final say, and a column that
+ * matches nothing here can still win on content alone.
+ */
+const SYMBOL_COLUMNS = [
+  'feature_name', 'gene_symbol', 'gene_symbols', 'gene_name', 'gene_names',
+  'symbol', 'hgnc_symbol', 'mgi_symbol', 'gene', 'genes', 'name',
+]
+const ACCESSION_COLUMNS = [
+  'gene_ids', 'gene_id', 'ensembl_id', 'ensembl_ids', 'ensembl', 'accession',
+  'accessions', 'feature_id', 'id', 'gene_stable_id',
+]
+
+/**
+ * Pick the column that names the same genes the other way.
+ *
+ * Two filters beyond the content check, both there to stop a plausible-looking
+ * column being mistaken for a naming. A naming is nearly unique — one name per
+ * gene — so a column with forty distinct values across thirty thousand genes is
+ * a chromosome or a biotype, whatever it is called. And a column whose content
+ * classifies the same way as the index adds nothing.
+ */
+export function pickGeneAlias(
+  index: string[], columns: { name: string; values: string[] }[],
+): GeneAlias | null {
+  const indexKind = geneNameKind(index)
+  const want: 'symbol' | 'accession' = indexKind === 'accession' ? 'symbol' : 'accession'
+  const names = want === 'symbol' ? SYMBOL_COLUMNS : ACCESSION_COLUMNS
+
+  const scored = columns
+    .filter(c => c.values.length === index.length)
+    .map(c => ({ c, kind: geneNameKind(c.values), unique: distinctFraction(c.values) }))
+    .filter(x => x.kind === want && x.unique > 0.5)
+    .map(x => ({ ...x, r: rank(x.c.name, names) }))
+    .sort((a, b) => a.r - b.r || b.unique - a.unique)
+
+  const hit = scored[0]
+  return hit ? { kind: want, column: hit.c.name, names: hit.c.values } : null
+}
+
+/** Distinct non-empty values over total, on a sample. Cheap uniqueness test. */
+function distinctFraction(values: string[]): number {
+  const s = spread(values, 4000)
+  const seen = new Set<string>()
+  let n = 0
+  for (const v of s) {
+    if (!v) continue
+    seen.add(v)
+    n++
+  }
+  return n ? seen.size / n : 0
 }
 
 /**

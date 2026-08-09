@@ -11,8 +11,8 @@
 // one fails on exactly the files people already have.
 
 import {
-  categorical, fromFactor, internGeneSet, maybeDiscrete, numeric,
-  type Column, type EmbeddingRef, type MatrixRef, type Scan,
+  categorical, fromFactor, internGeneSet, maybeDiscrete, numeric, pickGeneAlias,
+  type Column, type EmbeddingRef, type GeneAlias, type MatrixRef, type Scan,
 } from './scan.ts'
 import { classify, dropZeros, stridedSample, type CellMajor } from './matrix.ts'
 
@@ -174,6 +174,71 @@ function readVar(v: H5, label: string): string[] {
   throw new H5adError(`${label} has no gene names`)
 }
 
+/**
+ * Every string-valued var column except the index.
+ *
+ * Read whole rather than sampled: a var table is one row per gene, so even an
+ * atlas's is a few megabytes, and the alias is written into the bundle in full
+ * anyway. Categoricals are expanded here — on this atlas the symbols are stored
+ * as 31 017 categories over 31 053 codes, and reading only the categories would
+ * misalign every gene after the first duplicate.
+ */
+function readVarStringColumns(v: H5, nGenes: number, note: (s: string) => void): {
+  name: string; values: string[]
+}[] {
+  const out: { name: string; values: string[] }[] = []
+  const comp = compound(v)
+  if (comp) {
+    for (const name of comp.names) {
+      if (name === 'index' || name === '_index') continue
+      const f = fieldOf(comp, name)
+      if (!f || f.length !== nGenes) continue
+      if (typeof f[0] !== 'string' && !(f[0] instanceof Uint8Array)) continue
+      out.push({ name, values: toStrings(f) })
+    }
+    return out
+  }
+  if (!isGroup(v)) return out
+
+  const indexName = text(attr(v, '_index') ?? '_index')
+  for (const key of v.keys()) {
+    if (key === indexName || key === '_index' || key === 'index') continue
+    try {
+      const o = v.get(key)
+      if (!o) continue
+      if (isGroup(o)) {
+        const cats = o.get('categories')
+        const codes = o.get('codes')
+        if (!cats || !codes) continue
+        const levels = toStrings(cats.value)
+        const c = toI32(codes.value)
+        if (c.length !== nGenes) continue
+        out.push({ name: key, values: Array.from(c, i => (i >= 0 ? levels[i] ?? '' : '')) })
+        continue
+      }
+      const val = o.value
+      if (!val || val.length !== nGenes) continue
+      if (typeof val[0] !== 'string' && !(val[0] instanceof Uint8Array)) continue
+      out.push({ name: key, values: toStrings(val) })
+    } catch {
+      note(`var/${key} could not be read; skipped`)
+    }
+  }
+  return out
+}
+
+/** Symbols beside accessions, or the reverse — whichever the var table adds. */
+function readVarAlias(
+  v: H5, genes: string[], note: (s: string) => void,
+): GeneAlias | null {
+  try {
+    return pickGeneAlias(genes, readVarStringColumns(v, genes.length, note))
+  } catch (e) {
+    note(`the var table's other gene names could not be read (${(e as Error).message})`)
+    return null
+  }
+}
+
 /** A matrix, dense or sparse, in either the modern or the h5sparse layout. */
 function readMatrix(m: H5, nCells: number, nGenes: number, key: string): CellMajor {
   if (isDataset(m)) {
@@ -316,6 +381,19 @@ function readGroupsCSR(
   })
 }
 
+/**
+ * Read an embedding once and keep it.
+ *
+ * A 292 k-cell coordinate array is 2.3 MB — nothing beside the matrix — and a
+ * split asks for it once per part per embedding. At 43 parts and two
+ * embeddings that is 86 traversals of the same dataset through a block cache
+ * that the matrix pass keeps evicting.
+ */
+function once(e: EmbeddingRef): EmbeddingRef {
+  let held: Float32Array | null = null
+  return { ...e, load: () => (held ??= e.load()) }
+}
+
 /** Enough values to classify a matrix, without reading all of it. */
 function sampleMatrix(m: H5, want = 20000): Float64Array {
   if (isDataset(m)) {
@@ -385,12 +463,24 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
 
   // ---- gene lists -------------------------------------------------------
   const geneSets: Record<string, string[]> = {}
-  const varSet = internGeneSet(geneSets, readVar(f.get('var'), 'var'), 'var')
+  const geneAliases: Record<string, GeneAlias> = {}
+  const varDs = f.get('var')
+  const varGenes = readVar(varDs, 'var')
+  const varSet = internGeneSet(geneSets, varGenes, 'var')
+  const varAlias = readVarAlias(varDs, varGenes, note)
+  if (varAlias) geneAliases[varSet] = varAlias
   const rawVarDs = f.get('raw/var') ?? f.get('raw.var')
   let rawSet: string | null = null
   if (rawVarDs) {
     try {
-      rawSet = internGeneSet(geneSets, readVar(rawVarDs, 'raw.var'), 'raw')
+      const rawGenes = readVar(rawVarDs, 'raw.var')
+      rawSet = internGeneSet(geneSets, rawGenes, 'raw')
+      // internGeneSet reuses an identical list, so raw and var can land on the
+      // same key — do not overwrite an alias that is already there.
+      if (!geneAliases[rawSet]) {
+        const a = readVarAlias(rawVarDs, rawGenes, note)
+        if (a) geneAliases[rawSet] = a
+      }
     } catch { /* no raw genes */ }
   }
 
@@ -434,7 +524,7 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
     comp.members.forEach((m: H5, i: number) => {
       const width = m.array_type?.shape?.[0] ?? 0
       if (width < 2) return
-      embeddings.push({
+      embeddings.push(once({
         key: m.name, nDims: width,
         load: () => {
           const xy = new Float32Array(nCells * 2)
@@ -445,20 +535,20 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
           }
           return xy
         },
-      })
+      }))
     })
   } else if (isGroup(obsm)) {
     for (const k of obsm.keys()) {
       const ds = obsm.get(k)
       const s = ds?.shape as number[] | undefined
       if (!s || s.length < 2 || s[1] < 2 || s[0] !== nCells) continue
-      embeddings.push({
+      embeddings.push(once({
         key: k, nDims: s[1],
         load: () => {
           const flat = toF32(ds.slice([[0, nCells], [0, 2]]))
           return flat.length === nCells * 2 ? flat : toF32(ds.value).filter((_v, i) => i % s[1] < 2)
         },
-      })
+      }))
     }
   }
 
@@ -474,7 +564,7 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
 
   return {
     format: 'h5ad', source: filename, nCells, columns, matrices, embeddings,
-    geneSets, provenance, notes,
+    geneSets, geneAliases, provenance, notes,
   }
 }
 
