@@ -50,8 +50,14 @@ function Extras({ scan, choices, setChoices }: {
 }) {
   const usable = candidates(scan, 'extra',
     [choices.cluster, choices.sample, choices.condition])
-  if (!usable.length) return null
   const picked = choices.extras ?? []
+  // A column chosen as one of the three roles drops off the list above, and the
+  // builder will not carry it twice — but if it were also ticked here it would
+  // vanish while still ticked, with no way to untick it. So a stale pick stays
+  // on screen until the user takes it off.
+  const shown = [...usable, ...scan.columns.filter(c =>
+    picked.includes(c.name) && !usable.some(u => u.name === c.name))]
+  if (!shown.length) return null
   const toggle = (name: string) => setChoices({
     ...choices,
     extras: picked.includes(name) ? picked.filter(x => x !== name) : [...picked, name],
@@ -68,7 +74,7 @@ function Extras({ scan, choices, setChoices }: {
       >
         <div className="mt-3.5 grid gap-2"
           style={{ gridTemplateColumns: 'repeat(auto-fill,minmax(230px,1fr))' }}>
-          {usable.map(c => {
+          {shown.map(c => {
             const on = picked.includes(c.name)
             return (
               <button key={c.name} onClick={() => toggle(c.name)}
