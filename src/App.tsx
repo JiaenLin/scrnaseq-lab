@@ -198,12 +198,50 @@ interface SavePicker {
  * naming are few and all recoverable, and after a conversion that took a
  * quarter of an hour the one thing that must not happen is a dead end.
  */
+/**
+ * A save that failed, carrying how far it got.
+ *
+ * The distinction is the whole point. Chromium writes through a swap file and
+ * renames it at the end, so a failure DURING the writes leaves a partial file
+ * worth discarding, while a failure AT THE RENAME leaves a complete one worth
+ * keeping. Told apart, the second is not a failure at all — it is a finished
+ * file under the wrong name.
+ */
+class SaveFailed extends Error {
+  readonly written: number
+  readonly total: number
+  readonly swap: string
+  constructor(e: unknown, written: number, total: number, swap: string) {
+    super(e instanceof Error ? e.message : String(e))
+    this.name = e instanceof Error ? e.name : 'Error'
+    this.written = written
+    this.total = total
+    this.swap = swap
+  }
+}
+
 function whyNotWritten(e: unknown, bytes: number): string {
   const raw = e instanceof Error ? e.message : String(e)
   const gb = (bytes / 1e9).toFixed(1)
   const name = e instanceof Error ? e.name : ''
   const locked = /NoModificationAllowed|state of the underlying filesystem|in use|locked/i.test(raw)
   const space = /space|quota|disk full|ENOSPC/i.test(raw) || name === 'QuotaExceededError'
+
+  // Every byte is already on disk and only the last step failed. Chrome runs a
+  // Safe Browsing check over an archive before putting it in place, and on a
+  // file this size that check does not come back — measured on a 5.80 GB
+  // conversion whose swap file was complete to the byte. Converting again would
+  // take another quarter of an hour and produce the same bytes that are already
+  // sitting there, so the thing to say is where they are.
+  if (e instanceof SaveFailed && e.written >= e.total) {
+    const scan = /safe browsing/i.test(raw)
+    return `Every byte was written — all ${gb} GB of it — and only the last step failed`
+      + (scan ? ', the check Chrome runs over an archive before putting it in place.' : `: ${raw}.`)
+      + ` Your file is finished and sitting beside where you chose to save it, named`
+      + ` ${e.swap}. Rename it to ${e.swap.replace(/\.crswap$/, '')} and it is ready for the`
+      + ` studio — there is no need to convert again. Pressing the button also works if you`
+      + ` would rather have the browser do it.`
+  }
 
   const why = space
     ? `There is not enough room where you chose to save it. This file is ${gb} GB, and while it is being written the browser needs about that much again beside it for a temporary copy.`
@@ -238,6 +276,7 @@ async function saveCollection(
     // A part can be hundreds of megabytes; hand it over in 64 MB writes so the
     // stream keeps flowing and there is a number to put on the button.
     const STEP = 64 << 20
+    const swap = `${handle.name}.crswap`
     let done = 0
     try {
       for (const piece of collectionPieces(result.meta, result.parts)) {
@@ -247,15 +286,35 @@ async function saveCollection(
           onProgress(done)
         }
       }
-      await w.close()
     } catch (e) {
-      // Chromium writes through a swap file beside the destination and renames
-      // it at close. If that fails half way, an abandoned stream keeps the swap
-      // file — and the destination — locked, so the next attempt fails for a
-      // different reason than the first. Abort before rethrowing.
+      // Failed part way through the writes. The swap file holds a truncated
+      // container that is no use to anyone, and an abandoned stream keeps both
+      // it and the destination locked — so the next attempt would fail for a
+      // different reason than this one. Abort discards it, which is right here
+      // and would be very wrong below.
       try { await w.abort() } catch { /* the stream was already gone */ }
-      throw e
+      throw new SaveFailed(e, done, result.bytes, swap)
     }
+
+    // Every byte is on disk; all that is left is the rename. Keep the FIRST
+    // error if a retry also fails — a second close on an already-errored stream
+    // reports the stream's state rather than what went wrong, and what went
+    // wrong is the only useful thing here.
+    let closed: unknown = null
+    try {
+      await w.close()
+    } catch (first) {
+      closed = first
+      try {
+        await new Promise(r => setTimeout(r, 1500))
+        await w.close()
+        closed = null
+      } catch { /* keep `first` */ }
+    }
+    // Deliberately NOT aborting: abort() discards the swap file, and the swap
+    // file is now the finished object. Leaving it costs the user a rename;
+    // discarding it costs them the conversion.
+    if (closed) throw new SaveFailed(closed, result.bytes, result.bytes, swap)
     return true
   }
 
