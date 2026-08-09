@@ -439,6 +439,17 @@ console.log(String.fromCharCode(10) + 'THE SYMBOL COLUMN IS FOUND BY CONTENT, NO
   check('symbols indexed, accessions in var',
     pickGeneAlias(['Sox2', 'Actb', 'Gapdh', 'Mki67'], [{ name: 'gene_ids', values: acc }]),
     { kind: 'accession', column: 'gene_ids', names: acc })
+  // A mixed index — two references concatenated — takes symbols if it can get
+  // them, because that is what makes gene sets match.
+  check('a mixed index prefers the symbols', pickGeneAlias(
+    ['ENSG00000141510', 'ENSG00000012048', 'Sox2', 'Actb'], [
+      { name: 'ensembl_id', values: ['ENSG00000141510', 'ENSG00000012048', 'ENSG00000181449', 'ENSG00000075624'] },
+      { name: 'gene_symbol', values: ['TP53', 'BRCA1', 'SOX2', 'ACTB'] },
+    ]).kind, 'symbol')
+  check('and falls back to the accessions when there are no symbols', pickGeneAlias(
+    ['ENSG00000141510', 'ENSG00000012048', 'Sox2', 'Actb'],
+    [{ name: 'ensembl_id', values: ['ENSG00000141510', 'ENSG00000012048', 'ENSG00000181449', 'ENSG00000075624'] }]
+  ).kind, 'accession')
 }
 
 console.log(String.fromCharCode(10) + 'BOTH NAMINGS TRAVEL IN THE BUNDLE')

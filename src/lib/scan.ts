@@ -452,18 +452,28 @@ export function pickGeneAlias(
   index: string[], columns: { name: string; values: string[] }[],
 ): GeneAlias | null {
   const indexKind = geneNameKind(index)
-  const want: 'symbol' | 'accession' = indexKind === 'accession' ? 'symbol' : 'accession'
-  const names = want === 'symbol' ? SYMBOL_COLUMNS : ACCESSION_COLUMNS
+  // Rows indexed by accessions want symbols; rows indexed by symbols want the
+  // accessions. A mixed index — two references concatenated — wants symbols
+  // first, because a clean symbol list is what makes gene sets match; a clean
+  // accession list is the fallback.
+  const wanted: ('symbol' | 'accession')[] = indexKind === 'accession'
+    ? ['symbol']
+    : indexKind === 'symbol' ? ['accession'] : ['symbol', 'accession']
 
-  const scored = columns
+  const scan = columns
     .filter(c => c.values.length === index.length)
     .map(c => ({ c, kind: geneNameKind(c.values), unique: distinctFraction(c.values) }))
-    .filter(x => x.kind === want && x.unique > 0.5)
-    .map(x => ({ ...x, r: rank(x.c.name, names) }))
-    .sort((a, b) => a.r - b.r || b.unique - a.unique)
+    .filter(x => x.unique > 0.5)
 
-  const hit = scored[0]
-  return hit ? { kind: want, column: hit.c.name, names: hit.c.values } : null
+  for (const want of wanted) {
+    const names = want === 'symbol' ? SYMBOL_COLUMNS : ACCESSION_COLUMNS
+    const hit = scan
+      .filter(x => x.kind === want)
+      .map(x => ({ ...x, r: rank(x.c.name, names) }))
+      .sort((a, b) => a.r - b.r || b.unique - a.unique)[0]
+    if (hit) return { kind: want, column: hit.c.name, names: hit.c.values }
+  }
+  return null
 }
 
 /** Distinct non-empty values over total, on a sample. Cheap uniqueness test. */
