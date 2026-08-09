@@ -210,7 +210,14 @@ function whyNotWritten(e: unknown, bytes: number): string {
     : locked
       ? `That location would not accept the file. The usual reasons are a folder that syncs or is not a plain local disk — OneDrive, a network share, a phone or a memory stick — or a file of the same name already open in another tab or program. The browser also needs about ${gb} GB free there for a temporary copy while it writes.`
       : raw
-  return `The file was not written. ${why} Nothing was lost — the converted data is still here, so choose a plain folder on your own disk and press the button again.`
+  // The browser's own words, kept even when they have been translated into the
+  // sentence above. Those two branches each cover several causes, so without
+  // this a second occurrence is indistinguishable from the first and there is
+  // nothing to tell them apart by — which is exactly the position this left us
+  // in when it happened twice.
+  const said = [name, raw].filter(Boolean).join(': ')
+  const detail = said && said !== why ? ` (the browser said: ${said})` : ''
+  return `The file was not written. ${why} Nothing was lost — the converted data is still here, so choose a plain folder on your own disk and press the button again.${detail}`
 }
 
 async function saveCollection(
@@ -364,6 +371,12 @@ export default function App() {
                 className={`btn ${saved ? '' : 'btn-primary'}`}
                 disabled={saving}
                 onClick={async () => {
+                  // The last failure's message goes with the attempt it belongs
+                  // to. Left standing, it sits under a button that reads
+                  // "Writing…" and tells the user their file was not written
+                  // while it is being written — and the message itself is what
+                  // told them to press again.
+                  setError(null)
                   setSaving(true)
                   setWrote(0)
                   try {
