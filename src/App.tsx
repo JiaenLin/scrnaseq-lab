@@ -160,16 +160,33 @@ const explain = (e: unknown): string => {
 }
 
 /**
- * Minimal shape of the File System Access API, which TypeScript's DOM library
- * does not declare. Only the three calls used below.
+ * The part of the File System Access API used here, which TypeScript's DOM
+ * library does not declare.
+ *
+ * Written out rather than left to inference. `let handle` with no annotation is
+ * an evolving `any`, so every member reached through it — `abort`, `name`,
+ * `move` — typechecked whether or not it existed, on the one code path in this
+ * app that cannot be exercised by a test. `move` is optional because it is
+ * Chromium-only and the code has to cope with its absence.
  */
+interface FileWriter {
+  // Uint8Array, not BufferSource: a Uint8Array may be backed by a
+  // SharedArrayBuffer, which BufferSource excludes, and these views come
+  // straight off the generator that builds the container.
+  write: (d: Uint8Array | Blob) => Promise<void>
+  close: () => Promise<void>
+  abort: () => Promise<void>
+}
+interface SaveHandle {
+  readonly name: string
+  createWritable: () => Promise<FileWriter>
+  move?: (to: string) => Promise<void>
+}
 interface SavePicker {
   showSaveFilePicker?: (o: {
     suggestedName?: string
     types?: { description: string; accept: Record<string, string[]> }[]
-  }) => Promise<{ createWritable: () => Promise<{
-    write: (d: BufferSource | Blob) => Promise<void>; close: () => Promise<void>
-  }> }>
+  }) => Promise<SaveHandle>
 }
 
 /**
@@ -207,6 +224,43 @@ interface SavePicker {
  * keeping. Told apart, the second is not a failure at all — it is a finished
  * file under the wrong name.
  */
+/**
+ * The extension the file is WRITTEN under, which is not the one it keeps.
+ *
+ * Chromium runs a Safe Browsing check over a finished file before renaming its
+ * swap into place, and only for extensions its download protection treats as
+ * risky — .zip among them, because an archive can carry an executable. On a
+ * 5.80 GB container that check does not come back: close() rejects with
+ * "Failed to perform Safe Browsing check" AFTER every byte is already on disk,
+ * and the whole conversion is stranded in a .crswap file the page cannot reach.
+ * Measured on this object, twice.
+ *
+ * A name its download protection does not claim is never checked, so the write
+ * finishes. The file is still a zip byte for byte — the studio reads the
+ * container, never the name — and `promote` below asks for the .zip name back
+ * once the bytes are safely down, where failing costs nothing.
+ */
+const DATA_EXT = '.scstudio'
+
+/**
+ * Ask for the familiar name, and do not mind being refused.
+ *
+ * Renaming is where the check we just avoided would run again, so this is
+ * attempted only after close() has succeeded and the object is safe on disk. A
+ * refusal leaves a file that works and reads oddly; treating it as an error
+ * would throw away a finished conversion over a file extension.
+ */
+async function promote(handle: SaveHandle): Promise<string> {
+  const want = handle.name.replace(new RegExp(`${DATA_EXT}$`), '.zip')
+  if (want === handle.name || typeof handle.move !== 'function') return handle.name
+  try {
+    await handle.move(want)
+    return want
+  } catch {
+    return handle.name
+  }
+}
+
 class SaveFailed extends Error {
   readonly written: number
   readonly total: number
@@ -258,19 +312,20 @@ function whyNotWritten(e: unknown, bytes: number): string {
   return `The file was not written. ${why} Nothing was lost — the converted data is still here, so choose a plain folder on your own disk and press the button again.${detail}`
 }
 
+/** The name the file ended up with, or null if the picker was dismissed. */
 async function saveCollection(
   result: BuiltCollection, onProgress: (done: number) => void,
-): Promise<boolean> {
+): Promise<string | null> {
   const pick = (window as unknown as SavePicker).showSaveFilePicker
   if (pick) {
-    let handle
+    let handle: SaveHandle
     try {
       handle = await pick({
-        suggestedName: result.name,
-        types: [{ description: 'scRNA-seq Studio dataset', accept: { 'application/zip': ['.zip'] } }],
+        suggestedName: result.name.replace(/\.zip$/, DATA_EXT),
+        types: [{ description: 'scRNA-seq Studio dataset', accept: { 'application/octet-stream': [DATA_EXT] } }],
       })
     } catch {
-      return false   // the user closed the picker; that is not an error
+      return null   // the user closed the picker; that is not an error
     }
     const w = await handle.createWritable()
     // A part can be hundreds of megabytes; hand it over in 64 MB writes so the
@@ -315,7 +370,7 @@ async function saveCollection(
     // file is now the finished object. Leaving it costs the user a rename;
     // discarding it costs them the conversion.
     if (closed) throw new SaveFailed(closed, result.bytes, result.bytes, swap)
-    return true
+    return promote(handle)
   }
 
   const url = URL.createObjectURL(writeCollection(result.meta, result.parts))
@@ -326,7 +381,7 @@ async function saveCollection(
   // Long enough for the browser to have started writing; revoking on a short
   // timer is what cancelled this download when it was the primary path.
   setTimeout(() => URL.revokeObjectURL(url), 600_000)
-  return true
+  return result.name
 }
 
 export default function App() {
@@ -340,7 +395,10 @@ export default function App() {
   const [stage, setStage] = useState('')
   const [frac, setFrac] = useState(0)
   const [busy, setBusy] = useState(false)
-  const [saved, setSaved] = useState(false)
+  // The name the file actually ended up with, not merely that it was saved —
+  // the two differ whenever Chromium refuses to rename a large object into an
+  // archive extension, and the user has to be told which one to look for.
+  const [saved, setSaved] = useState<string | null>(null)
   // Writing 5.8 GB to disk takes a while and the button must not be pressable
   // twice while it happens.
   const [saving, setSaving] = useState(false)
@@ -376,7 +434,7 @@ export default function App() {
     setBusy(true)
     setError(null)
     setResult(null)
-    setSaved(false)
+    setSaved(null)
     try {
       const order = split
         ? {
@@ -410,7 +468,7 @@ export default function App() {
     setSplit(null)
     setResult(null)
     setError(null)
-    setSaved(false)
+    setSaved(null)
   }
 
   if (result) {
@@ -425,7 +483,7 @@ export default function App() {
           <Flow at="done" />
 
           <div className="mt-5 grid gap-2.5">
-            <Handoff n={1} title="Save the file" done={saved}>
+            <Handoff n={1} title="Save the file" done={!!saved}>
               <button
                 className={`btn ${saved ? '' : 'btn-primary'}`}
                 disabled={saving}
@@ -439,7 +497,8 @@ export default function App() {
                   setSaving(true)
                   setWrote(0)
                   try {
-                    if (await saveCollection(result, setWrote)) setSaved(true)
+                    const wrote = await saveCollection(result, setWrote)
+                    if (wrote) setSaved(wrote)
                   } catch (e) {
                     setError(whyNotWritten(e, result.bytes))
                   } finally {
@@ -450,6 +509,18 @@ export default function App() {
                 ? `Writing… ${(wrote / 1e9).toFixed(1)} of ${(bytes / 1e9).toFixed(1)} GB`
                 : saved ? 'Saved ✓ — download again' : `Download ${name}`}</button>
               {error && <p className="sub mt-2" style={{ color: 'var(--bad)' }}>{error}</p>}
+              {/* Only when the name is not the one that was offered. Chromium
+                  will not rename a file this size into an archive extension —
+                  see DATA_EXT — so on a large object the file keeps the name it
+                  was written under, and the studio opens it either way. Saying
+                  nothing would leave the user hunting for a .zip that is not
+                  there. */}
+              {saved && !saved.endsWith('.zip') && (
+                <p className="sub mt-2">Saved as <b>{saved}</b>. It is a zip inside, and the studio
+                  opens it as it is — Chrome will not put a file this large under a{' '}
+                  <code>.zip</code> name, because it cannot finish the safety check it runs on an
+                  archive. Rename it if you want to look inside with an archive tool.</p>
+              )}
               {/* Stated, not offered. The user made no decision here and has
                   nothing to do about it; it is on the page because a 2 GB file
                   that took forty minutes deserves an explanation. */}
