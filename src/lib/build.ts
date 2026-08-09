@@ -112,6 +112,32 @@ export function chooseMatrices(scan: Scan, note: (s: string) => void): {
     `every matrix in this object holds scaled data (${kinds.map(m => m.key).join(', ')}), and the studio cannot plot z-scores. Re-save with the log-normalized or raw-count matrix included — in Seurat that is the @counts or @data slot, in Scanpy .raw or layers["counts"].`)
 }
 
+
+/**
+ * Which matrix the split path should stream.
+ *
+ * `chooseMatrices` decides by loading candidates, which a 700 M-value object
+ * cannot afford, so this makes the same decision from the classifications
+ * alone. It has to agree: the split path used to take the first matrix that
+ * could be streamed, which on the commonest atlas layout — a scaled `X` next to
+ * raw counts in `.raw` — is the scaled one. That either ships z-scores as
+ * expression or dies at the end of a twenty-minute conversion complaining that
+ * every matrix is scaled, on a file that plainly is not.
+ *
+ * Preference matches `chooseMatrices`: an already log-normalized matrix first,
+ * then counts it can build one from. Only one matrix is streamed, so when the
+ * object keeps expression and counts apart, the display matrix wins and
+ * pseudobulk is left out rather than paying a second pass over the whole file.
+ */
+export function streamableMatrix(scan: Scan): MatrixRef | null {
+  const usable = scan.matrices.filter(m => m.loadGroups && m.kind !== 'scaled')
+  for (const kind of ['lognorm', 'counts', 'log-counts', 'linear'] as const) {
+    const hit = usable.find(m => m.kind === kind)
+    if (hit) return hit
+  }
+  return null
+}
+
 /** Codes and level names for a role, falling back to one level for the whole object. */
 function grouping(col: Column | undefined, fallback: string, nCells: number): {
   codes: Int32Array; levels: string[]

@@ -169,10 +169,13 @@ export default function App() {
             passes: split.plan.passes.map(p => p.map(s => split.plan.shards.indexOf(s))),
           }
         : null
+      // The whole object's cluster order, before any part drops the levels it
+      // has no cells for. It decides colour in the studio.
+      const clusterOrder = scan.columns.find(c => c.name === choices.cluster)?.levels
       setResult(await runConvert(choices, order, {
         onStage: setStage,
         onProgress: (_pass, f) => setFrac(f),
-      }))
+      }, clusterOrder))
     } catch (e) {
       setError(explain(e))
     } finally {

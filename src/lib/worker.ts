@@ -14,7 +14,7 @@
 import { scanH5adFile } from './h5ad.ts'
 import { decompressRds, RdsReader } from './rds.ts'
 import { scanSeurat } from './seurat.ts'
-import { buildBundle } from './build.ts'
+import { buildBundle, streamableMatrix } from './build.ts'
 import { shardScan, type Shard } from './shard.ts'
 import type { Choices, Scan, ScanInfo } from './scan.ts'
 import type { CellMajor } from './matrix.ts'
@@ -111,7 +111,11 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
         return
       }
 
-      const src = parent.matrices.find(m => m.loadGroups)
+      const src = streamableMatrix(parent)
+      if (!src) {
+        throw new Error(
+          'this object is too large to convert in one piece, and none of its matrices can be read in parts — every one is either scaled or stored in a layout that cannot be streamed.')
+      }
       const total = passes.reduce((n, p) => n + p.length, 0)
       let made = 0
       for (let pi = 0; pi < passes.length; pi++) {

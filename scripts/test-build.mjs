@@ -6,7 +6,7 @@
 // A transpose that is subtly wrong still produces a bundle that opens.
 
 import { unzipSync, strFromU8 } from 'fflate'
-import { buildBundle, chooseMatrices, BuildError } from '../src/lib/build.ts'
+import { buildBundle, chooseMatrices, streamableMatrix, BuildError } from '../src/lib/build.ts'
 import { categorical, numeric, fromFactor } from '../src/lib/scan.ts'
 import { cellQC, lognormalize, sumCells, toGeneMajor, dropZeros } from '../src/lib/matrix.ts'
 import { CHUNK_GENES, readGenes } from '../src/lib/chunked.ts'
@@ -319,5 +319,27 @@ console.log('\nTHE CHUNKED MATRIX IS STORED, AND SAYS THE SAME THING AS THE FLAT
     flat)
 }
 
+
+console.log(String.fromCharCode(10) + 'THE SPLIT PATH PICKS THE SAME MATRIX AS THE WHOLE PATH')
+// It used to take the first streamable matrix, which on the commonest atlas
+// layout - a scaled X beside raw counts in .raw - is the scaled one. That
+// either ships z-scores as expression or dies at the end of a twenty-minute
+// conversion saying every matrix is scaled, on a file that plainly is not.
+{
+  const mk = (key, kind, streamable) => ({
+    key, geneSet: 'RNA', nGenes: 4, nCells: 6, kind,
+    load: () => fromDense(COUNTS, 4),
+    ...(streamable ? { loadGroups: () => [fromDense(COUNTS, 4)] } : {}),
+  })
+  const pick = ms => { const m = streamableMatrix(scanOf({ matrices: ms })); return m && m.key }
+  check('a scaled X is never chosen over raw counts',
+    pick([mk('X', 'scaled', true), mk('raw.X', 'counts', true)]), 'raw.X')
+  check('an already log-normalized matrix wins, as it does unsplit',
+    pick([mk('X', 'counts', true), mk('RNA@data', 'lognorm', true)]), 'RNA@data')
+  check('a matrix that cannot be streamed is not chosen',
+    pick([mk('X', 'lognorm', false), mk('raw.X', 'counts', true)]), 'raw.X')
+  check('nothing streamable but scaled data returns null, so the caller can say why',
+    pick([mk('X', 'scaled', true)]), null)
+}
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll build tests passed\n')
 process.exit(failed ? 1 : 0)

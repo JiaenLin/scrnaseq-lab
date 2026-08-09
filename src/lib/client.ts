@@ -133,6 +133,13 @@ const safe = (s: string) => (s || 'part').replace(/[^\w.-]+/g, '_').replace(/_+/
  */
 export async function convert(
   choices: Choices, split: SplitOrder | null, h: Handlers = {},
+  /**
+   * The cluster names as the whole object had them, before parts dropped the
+   * ones they had no cells for. Cluster order decides colour, so without it the
+   * studio has to guess an order and a cell type changes colour when an object
+   * is split — the most visible way to break "no difference".
+   */
+  clusterOrder?: string[],
 ): Promise<BuiltCollection> {
   const parts: BuiltPart[] = []
   const partInfo: PartInfo[] = []
@@ -169,6 +176,7 @@ export async function convert(
     reason: split ? split.reason : null,
     nCells: parts.reduce((n, p) => n + p.meta.nCells, 0),
     nGenes: first.nGenes,
+    clusterOrder,
     parts: partInfo,
     // The conversion notes are decisions about the object as a whole — which
     // matrix, which normalization, what was missing — so they are identical in
