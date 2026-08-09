@@ -72,6 +72,30 @@ interface SavePicker {
  * is the only option and where the small objects it can carry are the ones
  * those users convert anyway.
  */
+/**
+ * Why a save failed, in terms of what to do about it.
+ *
+ * Chromium hands through the operating system's own sentence — "a file or
+ * directory which could not be modified due to the state of the underlying
+ * filesystem" — which names no cause and suggests no action. The causes worth
+ * naming are few and all recoverable, and after a conversion that took a
+ * quarter of an hour the one thing that must not happen is a dead end.
+ */
+function whyNotWritten(e: unknown, bytes: number): string {
+  const raw = e instanceof Error ? e.message : String(e)
+  const gb = (bytes / 1e9).toFixed(1)
+  const name = e instanceof Error ? e.name : ''
+  const locked = /NoModificationAllowed|state of the underlying filesystem|in use|locked/i.test(raw)
+  const space = /space|quota|disk full|ENOSPC/i.test(raw) || name === 'QuotaExceededError'
+
+  const why = space
+    ? `There is not enough room where you chose to save it. This file is ${gb} GB, and while it is being written the browser needs about that much again beside it for a temporary copy.`
+    : locked
+      ? `That location would not accept the file. The usual reasons are a folder that syncs or is not a plain local disk — OneDrive, a network share, a phone or a memory stick — or a file of the same name already open in another tab or program. The browser also needs about ${gb} GB free there for a temporary copy while it writes.`
+      : raw
+  return `The file was not written. ${why} Nothing was lost — the converted data is still here, so choose a plain folder on your own disk and press the button again.`
+}
+
 async function saveCollection(
   result: BuiltCollection, onProgress: (done: number) => void,
 ): Promise<boolean> {
@@ -91,14 +115,23 @@ async function saveCollection(
     // stream keeps flowing and there is a number to put on the button.
     const STEP = 64 << 20
     let done = 0
-    for (const piece of collectionPieces(result.meta, result.parts)) {
-      for (let at = 0; at < piece.length; at += STEP) {
-        await w.write(piece.subarray(at, Math.min(piece.length, at + STEP)))
-        done += Math.min(piece.length, at + STEP) - at
-        onProgress(done)
+    try {
+      for (const piece of collectionPieces(result.meta, result.parts)) {
+        for (let at = 0; at < piece.length; at += STEP) {
+          await w.write(piece.subarray(at, Math.min(piece.length, at + STEP)))
+          done += Math.min(piece.length, at + STEP) - at
+          onProgress(done)
+        }
       }
+      await w.close()
+    } catch (e) {
+      // Chromium writes through a swap file beside the destination and renames
+      // it at close. If that fails half way, an abandoned stream keeps the swap
+      // file — and the destination — locked, so the next attempt fails for a
+      // different reason than the first. Abort before rethrowing.
+      try { await w.abort() } catch { /* the stream was already gone */ }
+      throw e
     }
-    await w.close()
     return true
   }
 
@@ -217,7 +250,7 @@ export default function App() {
                   try {
                     if (await saveCollection(result, setWrote)) setSaved(true)
                   } catch (e) {
-                    setError(`the file could not be written. ${explain(e)}`)
+                    setError(whyNotWritten(e, result.bytes))
                   } finally {
                     setSaving(false)
                   }

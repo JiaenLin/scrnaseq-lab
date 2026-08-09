@@ -29,3 +29,4 @@ dist-ssr
 *.h5Seurat
 *.loom
 *.zip
+.verify-tmp/
