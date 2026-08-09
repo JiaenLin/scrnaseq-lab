@@ -30,6 +30,17 @@ export interface MatrixRef {
   /** Read it in full. Deferred: most objects hold more matrices than we need. */
   load: () => CellMajor
   /**
+   * Fraction of the gene list this matrix ever has a value for, sampled.
+   *
+   * Not every source can answer, and `undefined` means "not asked" rather than
+   * zero. It exists because the values alone do not tell you whether a matrix
+   * is the object's expression: a velocity model's output is small positive
+   * non-integers, exactly like log-normalized expression, and on the developing
+   * mouse atlas it covers 2 000 of 31 053 genes. Choosing it hands the studio a
+   * gene list 94% of which is empty everywhere. See `usableCoverage`.
+   */
+  coverage?: () => number
+  /**
    * Nonzeros per cell, without reading the values.
    *
    * For a CSR matrix this is a difference of the row offsets — a few hundred KB

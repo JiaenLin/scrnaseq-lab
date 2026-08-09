@@ -107,7 +107,7 @@ let firstMeta
 if (!split) {
   firstMeta = keep(label, buildBundle(scan, choices, s => log('   ' + s)))
 } else {
-  const src = streamableMatrix(scan)
+  const src = streamableMatrix(scan, s => { scan.notes.push(s); log('   ' + s) })
   if (!src) throw new Error('no matrix in this object can be read in parts')
   log(`streaming ${src.key}`)
   for (let pi = 0; pi < split.plan.passes.length; pi++) {

@@ -342,6 +342,48 @@ console.log(String.fromCharCode(10) + 'THE SPLIT PATH PICKS THE SAME MATRIX AS T
     pick([mk('X', 'scaled', true)]), null)
 }
 
+
+console.log(String.fromCharCode(10) + 'A MATRIX OVER A CORNER OF THE GENE LIST IS NOT THE EXPRESSION')
+// Measured on the real atlas: layers["expected"] is a velocity model's output.
+// Its values are small positive non-integers, which classifies as lognorm and
+// therefore wins the preference order — and it holds values for exactly 2000 of
+// 31053 genes, so the studio would report 94% of the gene list as expressed
+// nowhere. Value classification cannot see this; coverage can.
+{
+  const mk = (key, kind, coverage) => ({
+    key, geneSet: 'RNA', nGenes: 4, nCells: 6, kind,
+    load: () => fromDense(COUNTS, 4),
+    loadGroups: () => [fromDense(COUNTS, 4)],
+    ...(coverage === undefined ? {} : { coverage: () => coverage }),
+  })
+  const notes = []
+  const pick = ms => {
+    notes.length = 0
+    const m = streamableMatrix(scanOf({ matrices: ms }), s => notes.push(s))
+    return m && m.key
+  }
+  check('a 6%-coverage lognorm loses to counts that cover the list',
+    pick([mk('layers["expected"]', 'lognorm', 0.064), mk('X', 'counts', 0.9)]), 'X')
+  check('and it says why, in the notes that travel into the bundle',
+    notes.some(n => n.includes('layers["expected"]') && n.includes('6% of the genes')), true)
+  check('a lognorm with real coverage is still preferred',
+    pick([mk('RNA@data', 'lognorm', 0.8), mk('X', 'counts', 0.9)]), 'RNA@data')
+  check('a sparse matrix with nothing to lose against is kept',
+    pick([mk('X', 'lognorm', 0.05)]), 'X')
+  check('two equally thin matrices are both kept — this chooses, it never refuses',
+    pick([mk('X', 'lognorm', 0.05), mk('raw.X', 'counts', 0.06)]), 'X')
+  check('a source that cannot report coverage is never vetoed',
+    pick([mk('layers["expected"]', 'lognorm', undefined), mk('X', 'counts', 0.9)]),
+    'layers["expected"]')
+  // The unsplit path has to make the same decision, or an object converts one
+  // way whole and another way split.
+  const res = buildBundle(scanOf({ matrices: [
+    mk('layers["expected"]', 'lognorm', 0.064), mk('X', 'counts', 0.9),
+  ] }), CHOICES)
+  check('the whole-object path agrees with the split path',
+    res.meta.notes.some(n => n.includes('expression computed here as log1p(CP10K) from the counts')), true)
+}
+
 console.log(String.fromCharCode(10) + 'EVERY 2D EMBEDDING IS CARRIED, NOT JUST THE CHOSEN ONE')
 // An object routinely holds a UMAP and a t-SNE of the same cells. The lab used
 // to keep one and discard the rest, which is a decision the user never made and

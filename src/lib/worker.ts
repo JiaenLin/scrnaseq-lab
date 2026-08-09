@@ -112,7 +112,10 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
         return
       }
 
-      const src = streamableMatrix(parent)
+      // Notes from the choice go onto the parent scan, so every part carries
+      // them: buildBundle copies scan.notes, and the split path never calls
+      // chooseMatrices on anything that can still see the rejected matrix.
+      const src = streamableMatrix(parent, s => parent.notes.push(s))
       if (!src) {
         throw new Error(
           'this object is too large to convert in one piece, and none of its matrices can be read in parts — every one is either scaled or stored in a layout that cannot be streamed.')

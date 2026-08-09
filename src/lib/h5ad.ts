@@ -302,6 +302,33 @@ function readMatrix(m: H5, nCells: number, nGenes: number, key: string): CellMaj
 }
 
 
+/**
+ * How much of the gene list a CSR matrix ever touches.
+ *
+ * Read the same way values are sampled — a few contiguous blocks spread across
+ * the index vector — because a single block covers only a handful of cells and
+ * would understate a matrix whose detected genes vary from cell to cell. That
+ * is the whole distinction being measured: a real expression matrix touches
+ * different genes in different cells and adds up to most of the list, while a
+ * model fitted on selected features touches the same few in every cell however
+ * far you read.
+ */
+function geneCoverage(m: H5, nGenes: number): number {
+  const idx = m.get('indices')
+  const n = (idx.shape as number[])[0]
+  if (!n || !nGenes) return 1
+  const blocks = 24
+  const per = Math.max(1, Math.min(200_000, Math.floor(n / blocks)))
+  const seen = new Set<number>()
+  for (let b = 0; b < blocks; b++) {
+    const at = Math.max(0, Math.min(n - per, Math.floor((n / blocks) * b)))
+    const s = idx.slice([[at, at + per]]) as ArrayLike<number | bigint>
+    for (let i = 0; i < s.length; i++) seen.add(Number(s[i]))
+    if (seen.size >= nGenes) break
+  }
+  return seen.size / nGenes
+}
+
 /** Row offsets of a CSR matrix, as counts per cell. */
 function rowLengths(m: H5, nCells: number): Int32Array {
   const indptr = toI32(m.get('indptr').value)
@@ -497,6 +524,9 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
         load: () => readMatrix(m, cells, genes, key),
         ...(csr ? {
           nnzPerCell: () => rowLengths(m, cells),
+          // Only CSR: in a CSC matrix `indices` are cell ids, and counting
+          // distinct cells would answer a different question entirely.
+          coverage: () => geneCoverage(m, genes),
           loadGroups: (groups, onProgress) =>
             readGroupsCSR(m, groups, cells, genes, onProgress),
         } : {}),

@@ -110,13 +110,58 @@ type Progress = (stage: string) => void
  * log1p(counts) in .raw must come out using .raw, and picking by slot name
  * would pick X every time.
  */
+/**
+ * Below this share of the gene list, a matrix is not the object's expression.
+ *
+ * Deliberately far below anything a real matrix reaches. The case this exists
+ * for is not marginal: on the developing mouse atlas `layers["expected"]` — a
+ * velocity model's output — holds values in exactly 2 000 of 31 053 genes, 6%,
+ * while `X` reaches most of the list.
+ */
+const COVERAGE_FLOOR = 0.25
+
+/**
+ * Drop matrices that only ever touch a corner of the gene list.
+ *
+ * Classification by value cannot catch this. A model's expected counts are
+ * small positive non-integers, which is precisely the signature of
+ * log-normalized expression, so it wins the preference order and the studio
+ * then reports 29 053 of 31 053 genes as expressed in no cell anywhere — every
+ * marker panel silently empty, every gene set matching nothing that plots.
+ *
+ * A candidate is dropped only when it is far below the floor *and* another
+ * candidate covers at least twice as much, so an object whose only matrix is
+ * sparse keeps it: the point is to choose between matrices, never to refuse the
+ * object.
+ */
+export function usableCoverage(
+  matrices: MatrixRef[], note: (s: string) => void,
+): MatrixRef[] {
+  const cov = new Map<MatrixRef, number>()
+  for (const m of matrices) {
+    if (!m.coverage) continue
+    try {
+      cov.set(m, m.coverage())
+    } catch { /* an unreadable index is not a reason to reject a matrix */ }
+  }
+  if (cov.size < 2) return matrices
+  const best = Math.max(...cov.values())
+  const out = matrices.filter(m => {
+    const c = cov.get(m)
+    if (c === undefined || c >= COVERAGE_FLOOR || c * 2 > best) return true
+    note(`${m.key} has values for only ${(c * 100).toFixed(0)}% of the genes, against ${(best * 100).toFixed(0)}% elsewhere — it is a model over selected features, not this object's expression, so it is not used`)
+    return false
+  })
+  return out.length ? out : matrices
+}
+
 export function chooseMatrices(scan: Scan, note: (s: string) => void): {
   display: CellMajor
   counts: CellMajor | null
   geneSet: string
   expression: string
 } {
-  const kinds = scan.matrices
+  const kinds = usableCoverage(scan.matrices, note)
   for (const m of kinds) note(`${m.key} looks like ${m.kind}`)
 
   const first = (k: MatrixKind): MatrixRef | undefined => kinds.find(m => m.kind === k)
@@ -180,8 +225,9 @@ export function chooseMatrices(scan: Scan, note: (s: string) => void): {
  * object keeps expression and counts apart, the display matrix wins and
  * pseudobulk is left out rather than paying a second pass over the whole file.
  */
-export function streamableMatrix(scan: Scan): MatrixRef | null {
-  const usable = scan.matrices.filter(m => m.loadGroups && m.kind !== 'scaled')
+export function streamableMatrix(scan: Scan, note: (s: string) => void = () => {}): MatrixRef | null {
+  const usable = usableCoverage(scan.matrices, note)
+    .filter(m => m.loadGroups && m.kind !== 'scaled')
   for (const kind of ['lognorm', 'counts', 'log-counts', 'linear'] as const) {
     const hit = usable.find(m => m.kind === kind)
     if (hit) return hit
