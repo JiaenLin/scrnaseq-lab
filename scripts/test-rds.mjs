@@ -10,6 +10,8 @@ import { RdsReader, RdsError, decompressRds, attrOf, classOf, columnAsStrings,
          factorLabels, namesOf, slot, strings } from '../src/lib/rds.ts'
 import { Bytes } from '../src/lib/bytes.ts'
 import { classify, stridedSample } from '../src/lib/matrix.ts'
+import { GzWindow } from '../src/lib/gzwindow.ts'
+import { gzipSync } from 'zlib'
 
 let failed = 0
 const check = (name, got, want) => {
@@ -411,6 +413,110 @@ console.log('\nWHAT KIND OF MATRIX IT IS SURVIVES THE PIECES')
   check('every kind is recognised, and identically in pieces',
     allAgree ? true : report.join(' '), true)
   check('and the five kinds are distinct', report.length, 5)
+}
+
+
+console.log('\nSTREAMED, NEVER HELD')
+{
+  // GzWindow reads an .rds without ever holding it: the parser drives the
+  // gunzip and the bytes behind the head are dropped. It exists because a
+  // 16.26 GB Seurat object cannot be materialised in a tab that tops out around
+  // 15.6 GB, whatever the machine's RAM. Everything below reads the SAME
+  // fixture flat and streamed and demands the same answer, at feed sizes small
+  // enough that a chunk boundary falls inside every read the class makes.
+  const mk = () => {
+    const w = new W()
+    w.list([
+      x => x.real([1.5, -2.25, 1e300, 0.125, 3, 7.75, -0.5]),
+      x => x.intv([1, -1, 2147483647, -2147483648, 0, 99]),
+      x => x.str(['alpha', 'beta', 'a much longer symbol name than the others', '']),
+      x => x.real(Array.from({ length: 5000 }, (_v, i) => i * 0.5)),
+    ])
+    return w.done(3)
+  }
+  const bytes = mk()
+  const gz = new Uint8Array(gzipSync(Buffer.from(bytes)))
+  const src = feed => new GzWindow(
+    gz.length,
+    (a, b) => gz.subarray(a, b),
+    () => {},
+    feed)
+
+  const flat = new RdsReader(bytes)
+  const fo = flat.read()
+  const want = {
+    nums: Array.from(flat.numbers(fo.v[0])),
+    ints: Array.from(flat.numbers(fo.v[1])),
+    names: strings(fo.v[2]),
+    big: Array.from(flat.numbers(fo.v[3])).slice(0, 40),
+    bigLen: flat.numbers(fo.v[3]).length,
+  }
+
+  let agree = true
+  let bad = null
+  for (const feed of [16, 64, 257, 4096, 1 << 20]) {
+    const r = new RdsReader(src(feed))
+    const o = r.read()
+    const got = {
+      nums: Array.from(r.numbers(o.v[0])),
+      ints: Array.from(r.numbers(o.v[1])),
+      names: strings(o.v[2]),
+      big: Array.from(r.numbers(o.v[3])).slice(0, 40),
+      bigLen: r.numbers(o.v[3]).length,
+    }
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      agree = false
+      if (!bad) bad = { feed, got }
+    }
+  }
+  check('streamed gives the same object as held, at every feed size',
+    agree ? true : `feed ${bad.feed}`, true)
+  check('including a vector long enough to span many pushes', want.bigLen, 5000)
+
+  // The header is read before anything else and is four separate int32s in the
+  // first twenty bytes; at feed 16 each arrives in its own push.
+  const tiny = new RdsReader(src(16))
+  check('the header survives arriving in pieces', [tiny.version, tiny.writer], [3, '4.6.0'])
+
+  // Single-element access, which is the path the matrix classifier uses.
+  const one = new RdsReader(src(64))
+  const oo = one.read()
+  check('one element at a time agrees', [0, 1, 2, 3, 4, 5, 6].map(i => one.at(oo.v[0], i)),
+    want.nums)
+  check('and the kind is classified the same either way',
+    classify(stridedSample(7, 100, i => one.at(oo.v[0], i))),
+    classify(stridedSample(7, 100, i => flat.at(fo.v[0], i))))
+}
+
+console.log('\nTHE DIET: scale.data GOES PAST WITHOUT BEING KEPT')
+{
+  // What DietSeurat does in R, done while reading so nobody has to open R.
+  // scale.data is a DENSE genes x cells matrix the studio cannot use — every
+  // view refuses scaled values — and on a large object it is most of the file.
+  const w = new W()
+  w.s4([
+    ['counts', x => x.real([1, 2, 3, 4])],
+    ['scale.data', x => x.real([-1.5, 0.5, 2.5, -0.25, 9, 9, 9, 9])],
+    ['data', x => x.real([0.5, 0.7, 1.1, 1.3])],
+  ])
+  const bytes = w.done(3)
+  const gz = new Uint8Array(gzipSync(Buffer.from(bytes)))
+
+  const held = new RdsReader(bytes)
+  const ho = held.read()
+  const hs = slot(ho, 'scale.data')
+  check('held, scale.data is there', Array.from(held.numbers(hs)).length, 8)
+
+  const r = new RdsReader(new GzWindow(gz.length, (a, b) => gz.subarray(a, b), () => {}, 64))
+  const o = r.read()
+  // The slots either side must be intact — dropping the payload must not shift
+  // the walk by a byte, which is the failure this whole file risks.
+  check('streamed, counts is intact', Array.from(r.numbers(slot(o, 'counts'))), [1, 2, 3, 4])
+  check('and data after it is intact',
+    Array.from(r.numbers(slot(o, 'data'))), [0.5, 0.7, 1.1, 1.3])
+  const ss = slot(o, 'scale.data')
+  check('scale.data is marked dropped rather than wrong', ss.dropped === true, true)
+  rejects('and asking for it says why', () => r.numbers(ss), 'scale.data')
 }
 
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll RDS tests passed\n')

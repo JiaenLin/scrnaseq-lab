@@ -13,6 +13,16 @@
 // slots the caller actually pulls are ever turned into arrays.
 
 import { Bytes, oneChunk } from './bytes.ts'
+import type { GzWindow } from './gzwindow.ts'
+
+/**
+ * The offset of a payload that was read past and thrown away.
+ *
+ * Not -1: that is a legitimate `extra` index (-1 - 0). Any value below every
+ * possible one works, and a named constant beats a magic number in a file where
+ * a wrong offset is a silently wrong answer.
+ */
+const DROPPED = -1e9
 
 /** SEXP type codes, from R's Rinternals.h. Only the ones that appear here. */
 const NILSXP = 0, SYMSXP = 1, LISTSXP = 2, CLOSXP = 3, ENVSXP = 4, PROMSXP = 5,
@@ -28,6 +38,8 @@ const NILSXP = 0, SYMSXP = 1, LISTSXP = 2, CLOSXP = 3, ENVSXP = 4, PROMSXP = 5,
 
 /** A numeric vector left in the buffer: read it with `numbers()`. */
 export interface RNum {
+  /** True when the payload was skipped by the diet; see RdsReader#payload. */
+  dropped?: boolean
   t: 'num'
   /** 'double' | 'int' | 'logical' — logical is stored as int32 with NA = INT_MIN. */
   kind: 'double' | 'int' | 'logical'
@@ -89,15 +101,17 @@ export function decompressRds(
 }
 
 export class RdsReader {
-  readonly buf: Bytes
-  private readonly dv: Bytes
+  readonly buf: Bytes | GzWindow
+  private readonly dv: Bytes | GzWindow
+  /** Set when the source is a stream, which is when the diet applies. */
+  private readonly stream: GzWindow | null
   private p = 0
   /** Symbols and environments, referenced later by index. Order matters. */
   private refs: RValue[] = []
   readonly version: number
   readonly writer: string
 
-  constructor(raw: Uint8Array | Bytes) {
+  constructor(raw: Uint8Array | Bytes | GzWindow) {
     // A Uint8Array is still accepted and is still the common case — oneChunk
     // wraps it with no copy. Bytes exists for the files that cannot BE a
     // Uint8Array: V8 caps a single buffer at 2.15 GB on this machine, and a
@@ -105,6 +119,9 @@ export class RdsReader {
     // lib/bytes.ts.
     this.buf = raw instanceof Uint8Array ? oneChunk(raw) : raw
     this.dv = this.buf
+    // `take` is what a stream has and a byte array does not: the chance to
+    // materialise or discard a payload at the moment it goes past.
+    this.stream = 'take' in this.buf ? (this.buf as GzWindow) : null
 
     // this.buf, not `raw`: a Bytes is a class and has no numeric indexer, so
     // `raw[0]` on one is undefined and every file large enough to need chunking
@@ -212,7 +229,19 @@ export class RdsReader {
           const t = this.item()
           tag = t.t === 'sym' ? t.v : null
         }
+        /**
+         * The slot name, remembered while its value is read.
+         *
+         * This is the whole of the diet's machinery. R writes a tagged pairlist
+         * node as attributes, tag, CAR, CDR in that fixed order, so by the time
+         * the value is parsed its name is known — and `scale.data` is the one
+         * name worth acting on. Saved and restored because the walk is
+         * recursive and a nested list must not inherit its parent's name.
+         */
+        const outer = this.slotTag
+        if (tag) this.slotTag = tag
         const car = this.item()
+        this.slotTag = outer
         const cdr = this.item()
         return { t: 'lang', car, cdr, tag, attr }
       }
@@ -224,18 +253,20 @@ export class RdsReader {
 
       case LGLSXP: case INTSXP: {
         const n = this.length()
-        const off = this.p
+        const off = this.payload(n, false)
         this.p += n * 4
         const v: RNum = { t: 'num', kind: type === LGLSXP ? 'logical' : 'int', n, off }
+        if (off === DROPPED) v.dropped = true
         if (hasAttr) v.attr = this.attrList()
         return v
       }
 
       case REALSXP: {
         const n = this.length()
-        const off = this.p
+        const off = this.payload(n, true)
         this.p += n * 8
         const v: RNum = { t: 'num', kind: 'double', n, off }
+        if (off === DROPPED) v.dropped = true
         if (hasAttr) v.attr = this.attrList()
         return v
       }
@@ -395,10 +426,64 @@ export class RdsReader {
     return this.withAttr(state, attr)
   }
 
-  /** Expanded ALTREP data does not live in the buffer, so it is parked here. */
-  private extra: Float64Array[] = []
+  private refuseDropped(): never {
+    throw new RdsError(
+      'this slot is scale.data, which was skipped while reading so that an object '
+      + 'too large to hold could be opened at all. It holds z-scores, which no view '
+      + 'in the studio can use — pick the counts or data matrix instead.')
+  }
 
-  private inline(data: Float64Array, kind: 'int' | 'double', attr: RValue): RValue {
+  /** Which slot the walk is inside, for the diet. See LISTSXP above. */
+  private slotTag: string | null = null
+
+  /**
+   * What to do with a numeric payload the walk has just reached.
+   *
+   * On a byte array: nothing. The bytes stay where they are and the offset is
+   * recorded, exactly as before — this is the path every file that fits takes,
+   * and it allocates nothing.
+   *
+   * On a stream the bytes exist only now, so the choice has to be made here.
+   * Everything is kept except `scale.data`, which is a DENSE genes x cells
+   * matrix — no zeros omitted — that the studio cannot use for anything:
+   * `chooseMatrices` will not pick a scaled matrix and every view refuses one.
+   * On the reported 16.26 GB object it is most of the file. Dropping it is what
+   * `DietSeurat(obj, scale.data = FALSE)` does in R, done here so that nobody
+   * has to open R to convert their own object.
+   */
+  private payload(n: number, wide: boolean): number {
+    if (!this.stream) return this.p
+    const keep = this.slotTag !== 'scale.data'
+    // A vector that cannot BE a vector.
+    //
+    // V8 caps one typed array at 2.15 GB (measured). The reported object holds
+    // 618,618,142 non-zeros in each of two matrices: 4.95 GB as doubles, and
+    // still 2.47 GB as float32, so neither `x` nor a narrowed copy of it fits
+    // in a single array however the reading is done. Streaming solved holding
+    // the FILE; it cannot solve holding one slot. Said here, where the number
+    // is known, rather than as a bare allocation failure from three frames up.
+    if (keep && n * (wide ? 8 : 4) > 2.1e9) {
+      throw new RdsError(
+        `one slot of this object holds ${n.toLocaleString()} values — `
+        + `${(n * (wide ? 8 : 4) / 1e9).toFixed(2)} GB — and a browser caps a single array `
+        + 'at about 2.15 GB, so it cannot be read whole however the file is unpacked. '
+        + 'Split the object in R and convert the pieces:\n\n'
+        + '    for (ct in unique(obj$cell_type)) {\n'
+        + '      saveRDS(subset(obj, cell_type == ct), paste0(ct, ".rds"))\n'
+        + '    }\n\n'
+        + 'The studio opens the pieces together as one collection.')
+    }
+    const got = this.stream.take(this.p, n, wide, keep)
+    if (!got) return DROPPED
+    const slot = this.extra.length
+    this.extra.push(got)
+    return -1 - slot
+  }
+
+  /** Expanded ALTREP data does not live in the buffer, so it is parked here. */
+  private extra: (Float64Array | Int32Array)[] = []
+
+  private inline(data: Float64Array | Int32Array, kind: 'int' | 'double', attr: RValue): RValue {
     const slot = this.extra.length
     this.extra.push(data)
     const v: RNum = { t: 'num', kind, n: data.length, off: -1 - slot }
@@ -433,6 +518,7 @@ export class RdsReader {
 
   /** Materialize a numeric vector. This is where the bytes are finally read. */
   numbers(v: RNum): Float64Array | Int32Array {
+    if (v.off === DROPPED) this.refuseDropped()
     if (v.off < 0) return this.extra[-1 - v.off]
     if (v.kind === 'double') {
       const out = new Float64Array(v.n)
@@ -446,6 +532,7 @@ export class RdsReader {
 
   /** One element, without materializing the vector — for sampling a huge slot. */
   at(v: RNum, i: number): number {
+    if (v.off === DROPPED) this.refuseDropped()
     if (v.off < 0) return this.extra[-1 - v.off][i]
     return v.kind === 'double'
       ? this.dv.getFloat64(v.off + i * 8)
@@ -454,6 +541,7 @@ export class RdsReader {
 
   /** Materialize as float32 — half the memory, and the bundle stores f32 anyway. */
   floats(v: RNum): Float32Array {
+    if (v.off === DROPPED) this.refuseDropped()
     if (v.off < 0) return Float32Array.from(this.extra[-1 - v.off])
     const out = new Float32Array(v.n)
     this.dv.read(out, v.off, v.n, v.kind === 'double')
