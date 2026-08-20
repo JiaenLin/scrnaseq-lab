@@ -45,6 +45,127 @@ function dgc(r: RdsReader, m: RValue | undefined, key: string): CellMajor | null
   })
 }
 
+
+/**
+ * Per-cell non-zero counts, straight off the column pointers.
+ *
+ * A dgCMatrix is CSC with one column per cell, so this is a difference of
+ * `p` — a megabyte for a quarter-million cells — and a split can be costed
+ * exactly before a single value is read.
+ */
+function dgcNnzPerCell(indptr: Int32Array, nCells: number): Int32Array {
+  const out = new Int32Array(nCells)
+  for (let c = 0; c < nCells; c++) out[c] = indptr[c + 1] - indptr[c]
+  return out
+}
+
+/**
+ * Several disjoint cell subsets, read in one forward pass.
+ *
+ * The reason the .rds path can convert an object it cannot hold. A dgCMatrix
+ * stores cells as COLUMNS, so its values already arrive cell by cell: with `p`
+ * in hand — which is small — every non-zero can be attributed to a cell as it
+ * streams past, and written straight into the array of whichever shard that
+ * cell belongs to. Nothing whole is ever materialised. The 618-million-nonzero
+ * matrix that cannot be one array becomes twenty that can.
+ *
+ * `i` precedes `x` in the slot order R writes, and both are read from the same
+ * fresh stream in that order, so one extra decompression serves both.
+ */
+function dgcGroups(
+  r: RdsReader, value: RValue | undefined, key: string,
+  groups: Int32Array[], onProgress?: (frac: number) => void,
+): CellMajor[] {
+  const dim = slot(value, 'Dim')
+  const iv = slot(value, 'i') as RNum | undefined
+  const pv = slot(value, 'p') as RNum | undefined
+  const xv = slot(value, 'x') as RNum | undefined
+  if (dim?.t !== 'num' || iv?.t !== 'num' || pv?.t !== 'num' || xv?.t !== 'num') {
+    throw new RdsError(`${key} is not a readable dgCMatrix`)
+  }
+  const d = r.numbers(dim) as Int32Array
+  const nGenes = d[0], nCells = d[1]
+  const indptr = Int32Array.from(r.numbers(pv) as Int32Array)
+  const nnz = indptr[nCells]
+
+  const groupOf = new Int32Array(nCells).fill(-1)
+  groups.forEach((cells, g) => { for (const c of cells) groupOf[c] = g })
+  const out: CellMajor[] = groups.map(cells => {
+    let k = 0
+    for (const c of cells) k += indptr[c + 1] - indptr[c]
+    return {
+      nCells: cells.length,
+      nGenes,
+      indptr: new Int32Array(cells.length + 1),
+      indices: new Int32Array(k),
+      data: new Float32Array(k),
+    }
+  })
+  // Each shard's cells keep the order the shard lists them in, which is the
+  // order the split chose; the pass below visits cells in FILE order, so the
+  // write position for a cell has to be looked up rather than counted.
+  const slotOf = new Int32Array(nCells).fill(-1)
+  groups.forEach((cells, g) => cells.forEach((c, j) => { slotOf[c] = j; void g }))
+  const cursor = groups.map(cells => {
+    const starts = new Int32Array(cells.length + 1)
+    for (let j = 0; j < cells.length; j++) {
+      starts[j + 1] = starts[j] + (indptr[cells[j] + 1] - indptr[cells[j]])
+    }
+    return starts
+  })
+  out.forEach((m, g) => m.indptr.set(cursor[g]))
+
+  /**
+   * Only a payload that was passed over needs the file opened again.
+   *
+   * A matrix small enough to hold is already in hand — `numbers()` returns it —
+   * and re-decompressing sixteen gigabytes to re-read four megabytes would be
+   * absurd. So the stream is created only if one of the two slots was deferred,
+   * and both are then served from it.
+   */
+  const needsStream = iv.deferred || xv.deferred
+  if (needsStream && !r.reopen) {
+    throw new RdsError(`${key} was read past and there is no way to read it again`)
+  }
+  const st = needsStream ? r.reopen!() : null
+  const BITE = 1 << 22
+  const idx = new Int32Array(BITE)
+  const val = new Float64Array(BITE)
+
+  // Pass over `i`, then over `x`, in that order — which is the order R wrote
+  // them, so one forward stream serves both.
+  for (const which of ['i', 'x'] as const) {
+    const v = which === 'i' ? iv : xv
+    const wide = which === 'x'
+    const held = v.deferred ? null : r.numbers(v)
+    let k = 0
+    let cell = 0
+    while (k < nnz) {
+      const take = Math.min(BITE, nnz - k)
+      if (held) {
+        for (let t = 0; t < take; t++) {
+          if (wide) val[t] = held[k + t]
+          else idx[t] = held[k + t]
+        }
+      } else if (wide) st!.read(val, v.off + k * 8, take, true)
+      else st!.read(idx, v.off + k * 4, take, false)
+      for (let t = 0; t < take; t++) {
+        // The column this non-zero belongs to. k only ever increases, so the
+        // pointer only ever walks forward — no search per value.
+        while (cell < nCells && indptr[cell + 1] <= k + t) cell++
+        const g = cell < nCells ? groupOf[cell] : -1
+        if (g < 0) continue
+        const at = cursor[g][slotOf[cell]] + (k + t - indptr[cell])
+        if (wide) out[g].data[at] = val[t]
+        else out[g].indices[at] = idx[t]
+      }
+      k += take
+      if (onProgress) onProgress(((which === 'i' ? 0 : 1) + k / nnz) / 2)
+    }
+  }
+  return out
+}
+
 /** Gene names off a dgCMatrix's Dimnames. */
 function dgcGenes(m: RValue | undefined): string[] {
   const dn = slot(m, 'Dimnames')
@@ -183,9 +304,20 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
     }
     const x = slot(value, 'x') as RNum | undefined
     if (!x || x.t !== 'num') continue
+    const pv = slot(value, 'p') as RNum | undefined
     matrices.push({
       key, geneSet: setKey, nGenes: g, nCells: c,
       kind: classify(stridedSample(x.n, 20000, i => r.at(x, i))),
+      // The two the split path needs. With them an object far larger than the
+      // tab can hold converts into a collection, exactly as an .h5ad atlas
+      // does; without them the .rds path could only ever read a whole matrix
+      // into one array, and 618 million non-zeros do not fit in one.
+      nnzPerCell: pv && pv.t === 'num' && !pv.deferred
+        ? () => dgcNnzPerCell(Int32Array.from(r.numbers(pv) as Int32Array), c)
+        : undefined,
+      loadGroups: r.reopen
+        ? (groups, onProgress) => dgcGroups(r, value, key, groups, onProgress)
+        : undefined,
       load: () => {
         const m = dgc(r, value, key)
         if (!m) throw new RdsError(`${key} could not be read`)

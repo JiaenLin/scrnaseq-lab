@@ -240,6 +240,44 @@ export class GzWindow {
    * thrown away, and the slot is marked so that asking for it later says why
    * rather than handing back zeros.
    */
+  /**
+   * Skip a payload but keep a strided sample of it.
+   *
+   * The scan has to know what KIND of matrix this is — counts, lognorm, scaled
+   * — and `classify` needs only a few thousand values to say. Reading all
+   * 618 million to answer that would be the whole problem again, so the sample
+   * is taken as the payload goes past: the indices ascend, so each one is a
+   * forward seek that discards what it passes, and nothing is retained but the
+   * sample itself.
+   */
+  sample(p: number, n: number, wide: boolean, want: number): Float64Array {
+    const size = wide ? 8 : 4
+    const take = Math.min(n, want)
+    const out = new Float64Array(take)
+    if (!take) { this.skip(p, n * size); return out }
+    const step = Math.max(1, Math.floor(n / take))
+    for (let k = 0; k < take; k++) {
+      const at = p + Math.min(n - 1, k * step) * size
+      out[k] = wide ? this.getFloat64(at) : this.getInt32(at)
+    }
+    // Land the head past the payload either way, so the parser's own `p` and
+    // the stream agree about where the next field starts.
+    this.skip(p, n * size)
+    return out
+  }
+
+  /** Discard to `from + bytes` without storing anything. */
+  skip(from: number, bytes: number) {
+    const end = from + bytes
+    if (end <= this.start) return
+    this.advance(this.start > from ? this.start : from)
+    const have = Math.min(this.queued, end - this.start)
+    this.advance(this.start + have)
+    this.dropping = end - this.start
+    this.pump(end)
+    this.dropping = 0
+  }
+
   take(p: number, n: number, wide: boolean, keep: boolean): Float64Array | Int32Array | null {
     const bytes = n * (wide ? 8 : 4)
     if (keep) {
@@ -247,14 +285,7 @@ export class GzWindow {
       this.read(out, p, n, wide)
       return out
     }
-    this.advance(p)
-    // Whatever is already queued can go straight away; the rest is dropped as
-    // it arrives, without ever being stored.
-    const have = Math.min(this.queued, bytes)
-    this.advance(p + have)
-    this.dropping = bytes - have
-    this.pump(p + bytes)
-    this.dropping = 0
+    this.skip(p, bytes)
     return null
   }
 }

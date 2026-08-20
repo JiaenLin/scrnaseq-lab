@@ -24,6 +24,15 @@ import type { GzWindow } from './gzwindow.ts'
  */
 const DROPPED = -1e9
 
+/**
+ * Elements above which a payload is passed over rather than held.
+ *
+ * 200 million. A Float64Array of that many is 1.6 GB, comfortably inside V8's
+ * ~2.15 GB per-array cap with room for `floats()` or `numbers()` to widen a
+ * narrower payload on the way out.
+ */
+const DEFER_ABOVE = 200_000_000
+
 /** SEXP type codes, from R's Rinternals.h. Only the ones that appear here. */
 const NILSXP = 0, SYMSXP = 1, LISTSXP = 2, CLOSXP = 3, ENVSXP = 4, PROMSXP = 5,
   LANGSXP = 6, CHARSXP = 9, LGLSXP = 10, INTSXP = 13, REALSXP = 14, CPLXSXP = 15,
@@ -40,6 +49,17 @@ const NILSXP = 0, SYMSXP = 1, LISTSXP = 2, CLOSXP = 3, ENVSXP = 4, PROMSXP = 5,
 export interface RNum {
   /** True when the payload was skipped by the diet; see RdsReader#payload. */
   dropped?: boolean
+  /**
+   * True when the payload was too large to hold and was passed over instead.
+   *
+   * `off` still points at it in the decompressed stream, and `n` is still its
+   * length, so a caller that can re-open the stream can read it in pieces —
+   * which is what a dgCMatrix's `loadGroups` does. What cannot be done is
+   * `numbers()`, because the answer would not fit in one array.
+   */
+  deferred?: boolean
+  /** A strided sample of a deferred payload, for classify(). */
+  sample?: Float64Array
   t: 'num'
   /** 'double' | 'int' | 'logical' — logical is stored as int32 with NA = INT_MIN. */
   kind: 'double' | 'int' | 'logical'
@@ -111,7 +131,29 @@ export class RdsReader {
   readonly version: number
   readonly writer: string
 
-  constructor(raw: Uint8Array | Bytes | GzWindow) {
+  /**
+   * A fresh stream over the same file.
+   *
+   * A deferred payload is read after the walk has gone past it, and the walk's
+   * own stream cannot go back. So the caller hands over the means to start
+   * another one — see `dgcGroups`, which uses it to read a matrix straight into
+   * the per-shard arrays rather than into one that would not fit.
+   */
+  reopen: (() => GzWindow) | null = null
+
+  /**
+   * Elements above which a payload is passed over. DEFER_ABOVE in production;
+   * a test sets it to single digits so the streamed path runs on a fixture that
+   * fits in a file, instead of only on objects nobody can put in a test.
+   */
+  private readonly deferAbove: number
+
+  constructor(
+    raw: Uint8Array | Bytes | GzWindow,
+    reopen?: () => GzWindow,
+    deferAbove: number = DEFER_ABOVE,
+  ) {
+    this.deferAbove = deferAbove
     // A Uint8Array is still accepted and is still the common case — oneChunk
     // wraps it with no copy. Bytes exists for the files that cannot BE a
     // Uint8Array: V8 caps a single buffer at 2.15 GB on this machine, and a
@@ -122,6 +164,7 @@ export class RdsReader {
     // `take` is what a stream has and a byte array does not: the chance to
     // materialise or discard a payload at the moment it goes past.
     this.stream = 'take' in this.buf ? (this.buf as GzWindow) : null
+    this.reopen = reopen ?? null
 
     // this.buf, not `raw`: a Bytes is a class and has no numeric indexer, so
     // `raw[0]` on one is undefined and every file large enough to need chunking
@@ -257,6 +300,7 @@ export class RdsReader {
         this.p += n * 4
         const v: RNum = { t: 'num', kind: type === LGLSXP ? 'logical' : 'int', n, off }
         if (off === DROPPED) v.dropped = true
+        if (this.deferredHere) { v.deferred = true; v.sample = this.deferredHere }
         if (hasAttr) v.attr = this.attrList()
         return v
       }
@@ -267,6 +311,7 @@ export class RdsReader {
         this.p += n * 8
         const v: RNum = { t: 'num', kind: 'double', n, off }
         if (off === DROPPED) v.dropped = true
+        if (this.deferredHere) { v.deferred = true; v.sample = this.deferredHere }
         if (hasAttr) v.attr = this.attrList()
         return v
       }
@@ -426,6 +471,13 @@ export class RdsReader {
     return this.withAttr(state, attr)
   }
 
+  private refuseDeferred(v: RNum): never {
+    throw new RdsError(
+      `this slot holds ${v.n.toLocaleString()} values, more than one array can, so it was `
+      + 'read past rather than held. It can still be read in parts — that is what the '
+      + 'split path does — but not all at once.')
+  }
+
   private refuseDropped(): never {
     throw new RdsError(
       'this slot is scale.data, which was skipped while reading so that an object '
@@ -451,7 +503,11 @@ export class RdsReader {
    * `DietSeurat(obj, scale.data = FALSE)` does in R, done here so that nobody
    * has to open R to convert their own object.
    */
+  /** Set by `payload` when it deferred; consumed by the case that called it. */
+  private deferredHere: Float64Array | null = null
+
   private payload(n: number, wide: boolean): number {
+    this.deferredHere = null
     if (!this.stream) return this.p
     const keep = this.slotTag !== 'scale.data'
     // A vector that cannot BE a vector.
@@ -462,16 +518,34 @@ export class RdsReader {
     // in a single array however the reading is done. Streaming solved holding
     // the FILE; it cannot solve holding one slot. Said here, where the number
     // is known, rather than as a bare allocation failure from three frames up.
-    if (keep && n * (wide ? 8 : 4) > 2.1e9) {
-      throw new RdsError(
-        `one slot of this object holds ${n.toLocaleString()} values — `
-        + `${(n * (wide ? 8 : 4) / 1e9).toFixed(2)} GB — and a browser caps a single array `
-        + 'at about 2.15 GB, so it cannot be read whole however the file is unpacked. '
-        + 'Split the object in R and convert the pieces:\n\n'
-        + '    for (ct in unique(obj$cell_type)) {\n'
-        + '      saveRDS(subset(obj, cell_type == ct), paste0(ct, ".rds"))\n'
-        + '    }\n\n'
-        + 'The studio opens the pieces together as one collection.')
+    /**
+     * Too big to hold: passed over, and read later in pieces.
+     *
+     * V8 caps one typed array at about 2.15 GB, and the object this was built
+     * for holds 618,618,142 non-zeros in each of two matrices — 2.47 GB of
+     * indices and 4.95 GB of values apiece. No amount of careful unpacking puts
+     * that in one array, so it is not put in one: the offset and length are
+     * recorded, a few thousand values are sampled on the way past so the scan
+     * can still say what KIND of matrix it is, and the payload itself is read
+     * later, straight into the per-shard arrays that the split path wants
+     * anyway. That is how the .h5ad side has always survived an atlas.
+     *
+     * The threshold is well under the cap because the values may be widened:
+     * `floats()` makes a Float32Array and `numbers()` a Float64Array, so an
+     * Int32 payload of 1.2 GB becomes 2.4 GB the moment anybody asks for it as
+     * doubles.
+     */
+    // `p` and `Dim` are never passed over, whatever their size. They are the
+    // structure — the column pointers are what ATTRIBUTES a non-zero to a cell,
+    // so deferring them would make the shard read impossible rather than merely
+    // slow. In practice they are tiny (one int per cell), and the exemption
+    // matters only where the threshold is small, which is a test and a
+    // pathological object.
+    const structural = this.slotTag === 'p' || this.slotTag === 'Dim'
+    if (keep && !structural && n > this.deferAbove) {
+      const sample = this.stream.sample(this.p, n, wide, 20000)
+      this.deferredHere = sample
+      return this.p
     }
     const got = this.stream.take(this.p, n, wide, keep)
     if (!got) return DROPPED
@@ -519,6 +593,7 @@ export class RdsReader {
   /** Materialize a numeric vector. This is where the bytes are finally read. */
   numbers(v: RNum): Float64Array | Int32Array {
     if (v.off === DROPPED) this.refuseDropped()
+    if (v.deferred) this.refuseDeferred(v)
     if (v.off < 0) return this.extra[-1 - v.off]
     if (v.kind === 'double') {
       const out = new Float64Array(v.n)
@@ -533,6 +608,13 @@ export class RdsReader {
   /** One element, without materializing the vector — for sampling a huge slot. */
   at(v: RNum, i: number): number {
     if (v.off === DROPPED) this.refuseDropped()
+    if (v.deferred) {
+      // Mapped into the sample, not clamped to it. `stridedSample` walks
+      // 0..n-1, so clamping returned the last sampled value for every index
+      // past 20 000 — and `classify` would have been judging one number.
+      const sm = v.sample!
+      return sm[Math.min(sm.length - 1, Math.floor((i / Math.max(1, v.n)) * sm.length))]
+    }
     if (v.off < 0) return this.extra[-1 - v.off][i]
     return v.kind === 'double'
       ? this.dv.getFloat64(v.off + i * 8)
@@ -542,6 +624,7 @@ export class RdsReader {
   /** Materialize as float32 — half the memory, and the bundle stores f32 anyway. */
   floats(v: RNum): Float32Array {
     if (v.off === DROPPED) this.refuseDropped()
+    if (v.deferred) this.refuseDeferred(v)
     if (v.off < 0) return Float32Array.from(this.extra[-1 - v.off])
     const out = new Float32Array(v.n)
     this.dv.read(out, v.off, v.n, v.kind === 'double')

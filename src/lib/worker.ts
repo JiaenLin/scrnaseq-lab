@@ -91,12 +91,22 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
          * they are consumed.
          */
         post({ id, event: 'stage', stage: 'Reading the .rds' })
-        const r = new RdsReader(openRds(file, (cz, out) => post({
+        // The same factory twice: once to walk, and again whenever a matrix
+        // too large to hold has to be read into shards. See dgcGroups.
+        const open = () => openRds(file, (cz, out) => post({
           id,
           event: 'stage',
           stage: `Reading the .rds — ${(cz / 1e9).toFixed(1)} of `
             + `${(file.size / 1e9).toFixed(1)} GB in, ${(out / 1e9).toFixed(1)} GB unpacked`,
-        })))
+        }))
+        const first = open()
+        const r = new RdsReader(first, () => {
+          const again = open()
+          if (!(again instanceof GzWindow)) {
+            throw new Error('this .rds is not compressed, so it is already addressable')
+          }
+          return again
+        })
         scan = scanSeurat(r, r.read(), file.name)
       } else if (name.endsWith('.h5ad') || name.endsWith('.h5')) {
         post({ id, event: 'stage', stage: 'Loading the HDF5 reader' })

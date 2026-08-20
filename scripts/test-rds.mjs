@@ -11,6 +11,7 @@ import { RdsReader, RdsError, decompressRds, attrOf, classOf, columnAsStrings,
 import { Bytes } from '../src/lib/bytes.ts'
 import { classify, stridedSample } from '../src/lib/matrix.ts'
 import { GzWindow } from '../src/lib/gzwindow.ts'
+import { scanSeurat } from '../src/lib/seurat.ts'
 import { gzipSync } from 'zlib'
 
 let failed = 0
@@ -517,6 +518,138 @@ console.log('\nTHE DIET: scale.data GOES PAST WITHOUT BEING KEPT')
   const ss = slot(o, 'scale.data')
   check('scale.data is marked dropped rather than wrong', ss.dropped === true, true)
   rejects('and asking for it says why', () => r.numbers(ss), 'scale.data')
+}
+
+
+console.log('\nA MATRIX TOO BIG TO HOLD IS READ IN SHARDS')
+{
+  // The whole point of the .rds streaming path. A dgCMatrix stores cells as
+  // COLUMNS, so the non-zeros already arrive cell by cell: with `p` in hand
+  // every value can be attributed to a cell as it streams and written into the
+  // shard that cell belongs to. Nothing whole is materialised.
+  //
+  // Correctness here is not "it produced arrays" — it is that the shards say
+  // exactly what a whole read says. So both are computed and compared cell by
+  // cell, value by value.
+  const nGenes = 6
+  const nCells = 9
+  // A deterministic sparse matrix, CSC.
+  const cols = []
+  let seed = 3
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff
+  for (let c = 0; c < nCells; c++) {
+    const entries = []
+    for (let g = 0; g < nGenes; g++) if (rnd() < 0.5) entries.push([g, Math.round(rnd() * 90 + 1)])
+    cols.push(entries)
+  }
+  const iArr = [], xArr = [], pArr = [0]
+  for (const col of cols) {
+    for (const [g, v] of col) { iArr.push(g); xArr.push(v) }
+    pArr.push(iArr.length)
+  }
+
+  // Wrapped as a Seurat object, because that is what scanSeurat is handed and
+  // the wiring from a MatrixRef down to the stream is half of what is being
+  // tested here.
+  const dgc = x => x.s4([
+    ['i', y => y.intv(iArr)],
+    ['p', y => y.intv(pArr)],
+    ['Dim', y => y.intv([nGenes, nCells])],
+    ['x', y => y.real(xArr)],
+    ['Dimnames', y => y.list([
+      z => z.str(Array.from({ length: nGenes }, (_v, k) => 'G' + k)),
+      z => z.str(Array.from({ length: nCells }, (_v, k) => 'c' + k)),
+    ])],
+    ['class', y => y.str(['dgCMatrix'])],
+  ])
+  const mk = () => {
+    const w = new W()
+    w.s4([
+      ['assays', x => x.list([
+        y => y.s4([['counts', dgc], ['class', z => z.str(['Assay'])]]),
+      ], [['names', z => z.str(['RNA'])]])],
+      ['active.ident', x => x.intv(
+        Array.from({ length: nCells }, () => 1),
+        [['levels', z => z.str(['all'])], ['class', z => z.str(['factor'])]])],
+      ['class', x => x.str(['Seurat'])],
+    ])
+    return w.done(3)
+  }
+  const bytes = mk()
+  const gz = new Uint8Array(gzipSync(Buffer.from(bytes)))
+  const open = () => new GzWindow(gz.length, (a, b) => gz.subarray(a, b), () => {}, 128)
+
+  const r = new RdsReader(open(), open)
+  const o = r.read()
+
+  // What each cell holds, straight from the fixture — the reference.
+  const want = cols.map(col => col.map(([g, v]) => g + ':' + v).join(','))
+
+  // Two shards that between them cover every cell, in an order that is NOT the
+  // file's, because that is what a split by cell type produces.
+  const groups = [
+    Int32Array.from([0, 3, 6, 8]),
+    Int32Array.from([1, 2, 4, 5, 7]),
+  ]
+  const scan = scanSeurat(r, o, 'fixture.rds')
+  const ref = scan.matrices[0]
+  check('the matrix was scanned', !!ref, true)
+  check('and it offers the two the split path needs',
+    [typeof ref.loadGroups, typeof ref.nnzPerCell], ['function', 'function'])
+  const parts = ref.loadGroups(groups)
+  check('one CellMajor per group', parts.length, 2)
+  check('and the cell counts add up',
+    parts.reduce((n, m) => n + m.nCells, 0), nCells)
+
+  let ok = true
+  let firstBad = null
+  groups.forEach((cells, g) => {
+    const m = parts[g]
+    cells.forEach((c, j) => {
+      const from = m.indptr[j], to = m.indptr[j + 1]
+      const got = []
+      for (let k = from; k < to; k++) got.push(m.indices[k] + ':' + m.data[k])
+      if (got.join(',') !== want[c]) {
+        ok = false
+        if (!firstBad) firstBad = `cell ${c}: got ${got.join(',')} want ${want[c]}`
+      }
+    })
+  })
+  check('every cell in every shard matches a whole read',
+    ok ? true : firstBad, true)
+
+  // And the counts a split is planned from.
+  const nnz = ref.nnzPerCell()
+  check('nnzPerCell matches the column pointers',
+    Array.from(nnz), cols.map(c => c.length))
+
+  // And again with the payloads DEFERRED, which is the path that exists for
+  // the 618-million-nonzero object: nothing is held, `loadGroups` opens the
+  // file a second time and reads straight into the shards. Same fixture, same
+  // expected answer, so any difference is the streaming.
+  // Above every structural slot in the fixture (p has 10, active.ident 9) and
+  // below its non-zero count, so `i` and `x` defer and nothing else does.
+  const r2 = new RdsReader(open(), open, 12)
+  const o2 = r2.read()
+  const x2 = slot(slot(slot(o2, 'assays').v[0], 'counts'), 'x')
+  check('the payload really was passed over', x2.deferred === true, true)
+  check('and a sample was kept for classify', x2.sample.length > 0, true)
+  const scan2 = scanSeurat(r2, o2, 'fixture.rds')
+  const parts2 = scan2.matrices[0].loadGroups(groups)
+  let ok2 = true
+  let bad2 = null
+  groups.forEach((cells, g) => {
+    const m = parts2[g]
+    cells.forEach((c, j) => {
+      const got = []
+      for (let k = m.indptr[j]; k < m.indptr[j + 1]; k++) got.push(m.indices[k] + ':' + m.data[k])
+      if (got.join(',') !== want[c]) { ok2 = false; if (!bad2) bad2 = `cell ${c}: ${got.join(',')} != ${want[c]}` }
+    })
+  })
+  check('streamed shards match a whole read too', ok2 ? true : bad2, true)
+  check('and the two ways agree with each other',
+    parts2.map(m => Array.from(m.data).join(',')).join('|'),
+    parts.map(m => Array.from(m.data).join(',')).join('|'))
 }
 
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll RDS tests passed\n')
