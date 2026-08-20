@@ -8,6 +8,8 @@
 
 import { RdsReader, RdsError, decompressRds, attrOf, classOf, columnAsStrings,
          factorLabels, namesOf, slot, strings } from '../src/lib/rds.ts'
+import { Bytes } from '../src/lib/bytes.ts'
+import { classify, stridedSample } from '../src/lib/matrix.ts'
 
 let failed = 0
 const check = (name, got, want) => {
@@ -293,6 +295,123 @@ console.log('\nUNKNOWN TYPES FAIL LOUDLY')
   rejects('an unhandled R type names its code', () => read(w), 'code 200')
 }
 check('RdsError is the error type', new RdsError('x') instanceof Error, true)
+
+
+console.log('\nTHE SAME BYTES, IN PIECES')
+{
+  // Bytes exists because V8 caps a single ArrayBuffer at 2.15 GB (measured by
+  // bisection in Chrome 151) while holding 6.14 GB fine in 512 MB pieces, so a
+  // 2.95 GB .rds could not be loaded at all. In production the pieces are
+  // 512 MB and no test can afford one. So the piece size is injectable and the
+  // test uses tiny ones: at 3, 5 and 7 bytes every int32, every float64 and
+  // every string in the fixture straddles at least one seam, which is the only
+  // part of this class that can be wrong.
+  const chop = (b, k) => {
+    const out = []
+    for (let i = 0; i < b.length; i += k) out.push(b.subarray(i, Math.min(i + k, b.length)))
+    // Bytes requires every piece but the last to be exactly k. subarray of the
+    // tail is short by construction, which is the shape it wants.
+    return out
+  }
+
+  // A fixture with one of everything the reader materialises.
+  const mk = () => {
+    const w = new W()
+    w.list([
+      x => x.real([1.5, -2.25, 1e300, 0.125, 3]),
+      x => x.intv([1, -1, 2147483647, -2147483648, 0]),
+      x => x.str(['alpha', 'beta', 'a longer symbol name', '']),
+    ])
+    return w.done(3)
+  }
+
+  const bytes = mk()
+  const flat = new RdsReader(bytes)
+  const flatObj = flat.read()
+  const want = {
+    nums: Array.from(flat.numbers(flatObj.v[0])),
+    ints: Array.from(flat.numbers(flatObj.v[1])),
+    names: strings(flatObj.v[2]),
+  }
+  check('the flat reader still reads the fixture', want.nums.length, 5)
+
+  let agree = true
+  let firstBad = null
+  for (const k of [3, 5, 7, 8, 16, 64, 4096]) {
+    const r = new RdsReader(new Bytes(chop(bytes, k), k))
+    const o = r.read()
+    const got = {
+      nums: Array.from(r.numbers(o.v[0])),
+      ints: Array.from(r.numbers(o.v[1])),
+      names: strings(o.v[2]),
+    }
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      agree = false
+      if (!firstBad) firstBad = { k, got }
+    }
+  }
+  check('every piece size gives the identical object',
+    agree ? true : `chunk ${firstBad.k}: ${JSON.stringify(firstBad.got)}`, true)
+
+  // The header itself straddles: version, writer and encoding are read before
+  // anything else and sit in the first twenty bytes, so a piece of 3 puts a
+  // seam inside each of them.
+  const tiny = new RdsReader(new Bytes(chop(bytes, 3), 3))
+  check('the header survives a seam through it', [tiny.version, tiny.writer], [3, '4.6.0'])
+
+  // A single element read at a straddle, which is the `at` path rather than the
+  // bulk `read` path — used when a slot is too big to materialise.
+  const one = new RdsReader(new Bytes(chop(bytes, 5), 5))
+  const oo = one.read()
+  check('one element at a time agrees too',
+    [0, 1, 2, 3, 4].map(i => one.at(oo.v[0], i)), want.nums)
+}
+
+
+console.log('\nWHAT KIND OF MATRIX IT IS SURVIVES THE PIECES')
+{
+  // The lab never trusts a slot name — it classifies a matrix by its VALUES,
+  // sampled with a stride through r.at(). That accessor is the one the chunked
+  // reader had to change, and it is the one every downstream decision hangs
+  // off: whether pseudobulk is offered at all, whether the studio is handed
+  // counts to log-normalize or values already logged, and whether the object is
+  // refused as scaled. If chunking shifted a sample by one element the kind
+  // could flip, and nothing else in the suite would notice.
+  const kinds = {
+    counts: [0, 3, 1, 17, 0, 42, 5, 1, 0, 9, 231, 4],
+    lognorm: [0, 0.693, 1.0986, 2.3026, 0, 1.6094, 0.4055, 3.1781, 0, 0.9163],
+    'log-counts': [0, Math.log1p(3), Math.log1p(17), Math.log1p(1), 0, Math.log1p(42)],
+    scaled: [-1.2, 0.4, 2.9, -0.7, 1.1, -2.2, 0.3],
+    linear: [0, 120.5, 3300.25, 47.75, 0, 918.5, 12000.125],
+  }
+  let allAgree = true
+  const report = []
+  for (const [want, vals] of Object.entries(kinds)) {
+    const w = new W()
+    w.real(vals)
+    const bytes = w.done(3)
+
+    const flat = new RdsReader(bytes)
+    const fo = flat.read()
+    const flatKind = classify(stridedSample(vals.length, 1000, i => flat.at(fo, i)))
+    report.push(`${want}->${flatKind}`)
+    if (flatKind !== want) allAgree = false
+
+    for (const k of [3, 5, 7, 8, 64]) {
+      const chop = []
+      for (let i = 0; i < bytes.length; i += k) {
+        chop.push(bytes.subarray(i, Math.min(i + k, bytes.length)))
+      }
+      const r = new RdsReader(new Bytes(chop, k))
+      const o = r.read()
+      const kind = classify(stridedSample(vals.length, 1000, i => r.at(o, i)))
+      if (kind !== flatKind) { allAgree = false; report.push(`chunk ${k}: ${kind}`) }
+    }
+  }
+  check('every kind is recognised, and identically in pieces',
+    allAgree ? true : report.join(' '), true)
+  check('and the five kinds are distinct', report.length, 5)
+}
 
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll RDS tests passed\n')
 process.exit(failed ? 1 : 0)

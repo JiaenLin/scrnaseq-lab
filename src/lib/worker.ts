@@ -12,13 +12,13 @@
 // descriptions cross back.
 
 import { scanH5adFile } from './h5ad.ts'
-import { decompressRds, RdsReader } from './rds.ts'
+import { rdsCompression, RdsError, RdsReader } from './rds.ts'
+import { Bytes, CHUNK } from './bytes.ts'
 import { scanSeurat } from './seurat.ts'
 import { buildBundle, streamableMatrix } from './build.ts'
 import { shardScan, type Shard } from './shard.ts'
 import type { Choices, Scan, ScanInfo } from './scan.ts'
 import type { CellMajor } from './matrix.ts'
-import { gunzipSync } from 'fflate'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type H5Mod = any
@@ -71,9 +71,28 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
       const file = e.data.file
       const name = file.name.toLowerCase()
       if (name.endsWith('.rds')) {
+        /**
+         * Streamed, in pieces.
+         *
+         * This was `new Uint8Array(await file.arrayBuffer())` followed by
+         * `gunzipSync` — two allocations, the compressed file and the whole
+         * decompressed object, each as ONE buffer. V8 caps a single buffer at
+         * 2.15 GB (measured by bisection in Chrome 151), so a 2.95 GB Seurat
+         * .rds threw `RangeError: Array buffer allocation failed` on the first
+         * line, before a byte was parsed — a file that would not open, with
+         * nothing on the page to say why.
+         *
+         * The cap is per buffer and not a total: 6.14 GB held fine in 512 MB
+         * pieces in the same tab. So the fix is to never ask for one big one.
+         * DecompressionStream gunzips incrementally and the pieces go straight
+         * into a Bytes, which is what RdsReader now walks. The compressed bytes
+         * are never held at all — they are pulled from the File and dropped as
+         * they are consumed.
+         */
         post({ id, event: 'stage', stage: 'Decompressing the .rds' })
-        const bytes = new Uint8Array(await file.arrayBuffer())
-        const raw = decompressRds(bytes, b => gunzipSync(b))
+        const raw = await readRds(file, done => post({
+          id, event: 'stage', stage: `Decompressing the .rds — ${(done / 1e9).toFixed(1)} GB`,
+        }))
         post({ id, event: 'stage', stage: 'Walking the R object' })
         const r = new RdsReader(raw)
         scan = scanSeurat(r, r.read(), file.name)
@@ -164,4 +183,91 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
     const msg = err instanceof Error ? err.message : String(err)
     post({ id, event: 'error', message: msg && msg !== 'undefined' ? msg : 'the reader failed without saying why' })
   }
+}
+
+
+/**
+ * A .rds off disk as Bytes, decompressed on the way through.
+ *
+ * `DecompressionStream('gzip')` rather than fflate's gunzipSync: it is native,
+ * it is incremental, and it never needs the whole compressed input or the whole
+ * output in one place. The pieces it yields are repacked into CHUNK-sized
+ * buffers because Bytes divides rather than searches to find one — see bytes.ts.
+ *
+ * An uncompressed .rds — saveRDS(compress = FALSE) — goes through the same
+ * packer, so both produce the same shape and there is one path to be wrong in.
+ */
+async function readRds(file: File, onProgress: (bytes: number) => void): Promise<Bytes> {
+  const head = new Uint8Array(await file.slice(0, 2).arrayBuffer())
+  // Two bytes, not three gigabytes, before refusing a format we cannot read.
+  const how = rdsCompression(head[0], head[1])
+
+  const parts: Uint8Array[] = []
+  let cur = new Uint8Array(CHUNK)
+  let at = 0
+  let total = 0
+  let told = 0
+  const take = (b: Uint8Array) => {
+    let off = 0
+    while (off < b.length) {
+      const n = Math.min(CHUNK - at, b.length - off)
+      cur.set(b.subarray(off, off + n), at)
+      at += n
+      off += n
+      if (at === CHUNK) {
+        parts.push(cur)
+        try {
+          cur = new Uint8Array(CHUNK)
+        } catch {
+          /**
+           * Out of room, and this is the ONE place that knows how much of the
+           * object had arrived — so it is the only place that can say something
+           * true about why.
+           *
+           * The old message was the raw "Array buffer allocation failed", which
+           * is what a reader saw for a 2.95 GB .rds and says nothing about the
+           * file, the size, or what to do instead. The number below is measured
+           * rather than guessed: it is exactly how many bytes were decompressed
+           * before the tab ran out.
+           *
+           * Seurat objects reach this size mostly through `scale.data`, which
+           * is DENSE — genes x cells with no zeros omitted — and which no view
+           * in the studio can use. Dropping it in R is usually the whole fix
+           * and costs nothing anybody wanted.
+           */
+          const gb = (total / 1e9).toFixed(1)
+          throw new RdsError(
+            `this .rds is larger than the browser can hold. ${gb} GB of it had been `
+            + 'decompressed when the tab ran out of memory, and an .rds has to be '
+            + 'unpacked before it can be read — unlike an .h5ad, which is read in place '
+            + 'a slice at a time however large it is.\n\n'
+            + 'Most of a Seurat object this size is usually scale.data, which is dense '
+            + 'and which the studio cannot use. In R:\n\n'
+            + '    obj <- DietSeurat(obj, scale.data = FALSE, dimreducs = c("pca", "umap"))\n'
+            + '    saveRDS(obj, "smaller.rds")\n\n'
+            + 'Or convert to .h5ad instead, which has no size limit here:\n\n'
+            + '    SeuratDisk::SaveH5Seurat(obj, "obj.h5Seurat")\n'
+            + '    SeuratDisk::Convert("obj.h5Seurat", dest = "h5ad")')
+        }
+        at = 0
+      }
+    }
+    total += b.length
+    // Every 50 MB, not every chunk: a 512 MB piece is tens of seconds on a slow
+    // disk and the stage line would sit still through all of it.
+    if (total - told > 50e6) { told = total; onProgress(total) }
+  }
+
+  const src = how === 'gzip'
+    ? file.stream().pipeThrough(new DecompressionStream('gzip'))
+    : file.stream()
+  const reader = src.getReader()
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value) take(value)
+  }
+  // Bytes requires every piece but the last to be exactly CHUNK.
+  if (at) parts.push(cur.subarray(0, at))
+  return new Bytes(parts)
 }

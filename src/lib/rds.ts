@@ -12,6 +12,8 @@
 // so numeric payloads are recorded as (offset, length) and skipped. Only the
 // slots the caller actually pulls are ever turned into arrays.
 
+import { Bytes, oneChunk } from './bytes.ts'
+
 /** SEXP type codes, from R's Rinternals.h. Only the ones that appear here. */
 const NILSXP = 0, SYMSXP = 1, LISTSXP = 2, CLOSXP = 3, ENVSXP = 4, PROMSXP = 5,
   LANGSXP = 6, CHARSXP = 9, LGLSXP = 10, INTSXP = 13, REALSXP = 14, CPLXSXP = 15,
@@ -52,6 +54,25 @@ export type RAttr = Record<string, RValue>
 export class RdsError extends Error {}
 
 /** Strip the gzip/bzip2/xz wrapper, or say plainly which one we cannot strip. */
+/**
+ * What a .rds is compressed with, from its first two bytes.
+ *
+ * Split out of decompressRds so the streaming path can refuse bzip2 and xz with
+ * the same sentence, having read two bytes rather than three gigabytes.
+ */
+export function rdsCompression(b0: number, b1: number): 'gzip' | 'none' | never {
+  if (b0 === 0x1f && b1 === 0x8b) return 'gzip'
+  if (b0 === 0x42 && b1 === 0x5a) {
+    throw new RdsError(
+      'this .rds is bzip2-compressed. Re-save it with saveRDS(obj, "out.rds", compress = "gzip") — gzip is R\'s default, so this file was saved with compress = "bzip2" on purpose.')
+  }
+  if (b0 === 0xfd && b1 === 0x37) {
+    throw new RdsError(
+      'this .rds is xz-compressed. Re-save it with saveRDS(obj, "out.rds", compress = "gzip").')
+  }
+  return 'none'
+}
+
 export function decompressRds(
   bytes: Uint8Array, gunzip: (b: Uint8Array) => Uint8Array,
 ): Uint8Array {
@@ -68,19 +89,28 @@ export function decompressRds(
 }
 
 export class RdsReader {
-  readonly buf: Uint8Array
-  private readonly dv: DataView
+  readonly buf: Bytes
+  private readonly dv: Bytes
   private p = 0
   /** Symbols and environments, referenced later by index. Order matters. */
   private refs: RValue[] = []
   readonly version: number
   readonly writer: string
 
-  constructor(raw: Uint8Array) {
-    this.buf = raw
-    this.dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength)
+  constructor(raw: Uint8Array | Bytes) {
+    // A Uint8Array is still accepted and is still the common case — oneChunk
+    // wraps it with no copy. Bytes exists for the files that cannot BE a
+    // Uint8Array: V8 caps a single buffer at 2.15 GB on this machine, and a
+    // 2.95 GB .rds threw on the allocation before it was ever parsed. See
+    // lib/bytes.ts.
+    this.buf = raw instanceof Uint8Array ? oneChunk(raw) : raw
+    this.dv = this.buf
 
-    const fmt = String.fromCharCode(raw[0], raw[1])
+    // this.buf, not `raw`: a Bytes is a class and has no numeric indexer, so
+    // `raw[0]` on one is undefined and every file large enough to need chunking
+    // was rejected here as "does not look like an .rds file" — the one error
+    // message guaranteed to send the reader looking in the wrong place.
+    const fmt = String.fromCharCode(this.buf.byte(0), this.buf.byte(1))
     if (fmt === 'A\n' || fmt === 'B\n') {
       throw new RdsError(
         `this .rds uses the ${fmt[0] === 'A' ? 'ASCII' : 'native binary'} format. Re-save it with saveRDS(obj, "out.rds") — the default XDR format is what every other tool writes.`)
@@ -102,7 +132,7 @@ export class RdsReader {
   }
 
   private int(): number {
-    const v = this.dv.getInt32(this.p, false)
+    const v = this.dv.getInt32(this.p)
     this.p += 4
     return v
   }
@@ -406,11 +436,11 @@ export class RdsReader {
     if (v.off < 0) return this.extra[-1 - v.off]
     if (v.kind === 'double') {
       const out = new Float64Array(v.n)
-      for (let i = 0; i < v.n; i++) out[i] = this.dv.getFloat64(v.off + i * 8, false)
+      this.dv.read(out, v.off, v.n, true)
       return out
     }
     const out = new Int32Array(v.n)
-    for (let i = 0; i < v.n; i++) out[i] = this.dv.getInt32(v.off + i * 4, false)
+    this.dv.read(out, v.off, v.n, false)
     return out
   }
 
@@ -418,19 +448,15 @@ export class RdsReader {
   at(v: RNum, i: number): number {
     if (v.off < 0) return this.extra[-1 - v.off][i]
     return v.kind === 'double'
-      ? this.dv.getFloat64(v.off + i * 8, false)
-      : this.dv.getInt32(v.off + i * 4, false)
+      ? this.dv.getFloat64(v.off + i * 8)
+      : this.dv.getInt32(v.off + i * 4)
   }
 
   /** Materialize as float32 — half the memory, and the bundle stores f32 anyway. */
   floats(v: RNum): Float32Array {
     if (v.off < 0) return Float32Array.from(this.extra[-1 - v.off])
     const out = new Float32Array(v.n)
-    if (v.kind === 'double') {
-      for (let i = 0; i < v.n; i++) out[i] = this.dv.getFloat64(v.off + i * 8, false)
-    } else {
-      for (let i = 0; i < v.n; i++) out[i] = this.dv.getInt32(v.off + i * 4, false)
-    }
+    this.dv.read(out, v.off, v.n, v.kind === 'double')
     return out
   }
 }

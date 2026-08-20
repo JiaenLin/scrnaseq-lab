@@ -77,7 +77,12 @@ export default function Landing({ onFile, error, busy, stage }: {
 
         {busy && stage && <div className="note note-info mt-3"><b>{stage}</b></div>}
         {error && (
-          <div className="note mt-3"><b>That file did not open.</b> {error}</div>
+          // whiteSpace, because a message may carry the R that fixes it. Two
+          // lines of DietSeurat collapse into one run of prose without it, and
+          // a command a reader is meant to copy has to look like a command.
+          <div className="note mt-3" style={{ whiteSpace: 'pre-wrap' }}>
+            <b>That file did not open.</b> {error}
+          </div>
         )}
 
         <p className="mt-3 text-center text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
