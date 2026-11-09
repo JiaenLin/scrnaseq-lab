@@ -30,7 +30,7 @@ send it to.
 
 | Format | Layouts | Read by |
 |---|---|---|
-| `.h5ad` | modern AnnData (obs/var as groups) and legacy (< 0.7, compound datasets, `uns/<col>_categories`) | [h5wasm](https://github.com/usnistgov/h5wasm) in a worker, over a block-cached reader — **no size limit** |
+| `.h5ad` | modern AnnData (obs/var as groups, including the nullable strings anndata writes by default on pandas ≥ 3) and legacy (< 0.7, compound datasets, `uns/<col>_categories`) | [h5wasm](https://github.com/usnistgov/h5wasm) in a worker, over a block-cached reader — **no size limit** |
 | `.rds` | Seurat v3/v4 (`@counts`, `@data`) and v5 (`@layers`), gzip or uncompressed | `src/lib/rds.ts` — a direct reader for R's serialization format |
 
 The `.rds` path parses R's format itself rather than shipping webR. webR is a ~30 MB download
@@ -161,6 +161,74 @@ almost always are.
 This is the third independent writer of it, so `scripts/test-build.mjs` reads a built bundle
 back and compares it against a dense reference rather than trusting the writer.
 
+## From a shell: `scrnaseq-lab convert`
+
+The same conversion as a command, for a workstation or a pipeline. It runs the app's own
+modules, so for the same choices it writes the file the app writes. The app itself is
+unchanged: it converts in the browser and uploads nothing.
+
+```bash
+git clone https://github.com/JiaenLin/scrnaseq-lab && cd scrnaseq-lab
+npm ci && npm link            # puts scrnaseq-lab on PATH; Node 22.18 or later
+
+scrnaseq-lab convert final.h5ad final.zip \
+  --cluster cell_type --sample sample \
+  --condition factor_a --extra factor_b --interaction factor_a,factor_b \
+  --embedding X_umap --sentinel EXCLUDED --sentinel UNRESOLVED --label my-object
+```
+
+Inside the clone, `npx scrnaseq-lab …` or `node bin/scrnaseq-lab.mjs …` work without
+linking. The command runs the TypeScript sources directly, which Node does not do from inside
+`node_modules`, so install it from a clone and not as a dependency. It reads `.h5ad`; convert
+a Seurat `.rds` in the app.
+
+| Flag | Role | When absent, the guess |
+|---|---|---|
+| `--cluster COL` | the cell annotation | the app's own pick: a named annotation, else the finest grouping |
+| `--sample COL` | the sample column | a column named like a sample |
+| `--condition COL` | the design factor the studio groups by first | a design factor, one named like a condition first |
+| `--extra COL` (repeatable) | another column, carried under its own name | every other design factor |
+| `--interaction A,B` (repeatable) | the interaction as a column `A:B`, levels `a1:b1` | the two carried factors' interaction, when they cross |
+| `--embedding KEY` | the embedding that opens first | a UMAP, then t-SNE, a force layout, PCA |
+| `--sentinel LEVEL` (repeatable) | a `--cluster` level that is not a cell type | `EXCLUDED` and `UNRESOLVED`, where present |
+| `--label TEXT` | the dataset's name | the file name |
+
+**A flag given is used as given, and a flag absent is guessed out loud.** Each guess is printed
+on stderr as the flag that would produce it (`guessed --condition factor_a  (…)`). Pasting the
+guesses back gives the same bytes. `none` opts out of `--sample`, `--condition`, `--extra`,
+`--interaction` and `--sentinel`. A flag that names something the object lacks is refused with
+the list of what it has.
+
+**Design factors are found by what they are, not what they are called.** A design factor is a
+grouping that takes one value in every sample. Cell types vary inside a sample; a genotype, a
+diet or an age does not. By default every factor travels: one as the condition and the rest as
+extras, plus the interaction of a crossed pair. The studio offers each of them as the Group.
+A factor that a flag leaves out is named in `meta.notes`, never dropped silently.
+
+**Sentinels** stay in `clusters`, because the cells are real and are drawn. They are also
+listed in `sentinels`, in `collection.json` and in each part, with a note counting their cells,
+so a reader can leave them out of composition and tests.
+
+**The same input gives the same bytes**, in any time zone and at any time. Zip entries carry a
+fixed date, and nothing in the file records when it was made. stdout carries one JSON summary
+with the file's `sha256`, and `collection.json` lists a `sha256` for each part. So
+`shasum -a 256 final.zip` checks the whole file, and each part can be checked without
+trusting the others.
+
+stderr gets the guesses, the notes and the progress. The output is written beside its target
+and renamed into place, so a failed conversion leaves no file behind. For a large object,
+raise Node's heap: `NODE_OPTIONS=--max-old-space-size=8192 scrnaseq-lab convert …`.
+
+| Exit | Meaning |
+|---|---|
+| 0 | converted |
+| 1 | an internal error, or a Node that cannot run the command |
+| 2 | usage: an unknown option, a missing value, a stray path |
+| 3 | input: missing, not HDF5, or not an `.h5ad` this reader understands |
+| 4 | roles: a flag names a column or embedding the object lacks or cannot use |
+| 5 | the object cannot become a bundle (scaled data only, no embedding, no annotation) |
+| 6 | output: the file could not be written |
+
 ## The family — one job each
 
 | App | Takes | Produces |
@@ -176,12 +244,19 @@ back and compares it against a dense reference rather than trusting the writer.
 ```bash
 npm install
 npm run dev
-npm test        # RDS reader, bundle builder, detection — no fixtures required
+npm test        # RDS reader, bundle builder, detection, and the command run for real
 npm run build
 ```
 
 The tests write R's serialization format themselves and read it back, so the reader is checked
 against an independent implementation of the same spec rather than against a recorded file.
+
+The command's tests (`scripts/test-cli.mjs`) convert small synthetic objects in
+`scripts/fixtures/`. The main one is shaped like the single-cell family's final object: two
+crossed factors, the integration stage's `uns` record, and the annotator's sentinels. A copy of
+it is written in anndata's default string encoding. `scripts/make-family-fixture.py` writes them from
+made-up names, and Python is needed only to regenerate them:
+`uv run --no-project --with anndata==0.13.2 --with pandas==3.0.5 python scripts/make-family-fixture.py`.
 
 ## Known limits
 

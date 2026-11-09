@@ -65,6 +65,7 @@ const FIX = {
   classic: here('./fixtures/family-2x2.h5ad'),
   dflt: here('./fixtures/family-2x2-default.h5ad'),
   mask: here('./fixtures/nullable-mask.h5ad'),
+  scaled: here('./fixtures/scaled-only.h5ad'),
 }
 const BIN = here('../bin/scrnaseq-lab.mjs')
 const tmp = mkdtempSync(join(tmpdir(), 'lab-cli-test-'))
@@ -400,6 +401,9 @@ matches('and the message names it and lists what there is', rMissing.err, /no_su
 check('an interaction of a column the object lacks: 4 (roles)',
   code('convert', FIX.classic, join(tmp, 'x.zip'), '--interaction', 'factor_a,nope'), 4)
 check('an embedding the object lacks: 4 (roles)', code('convert', FIX.classic, join(tmp, 'x.zip'), '--embedding', 'X_nope'), 4)
+const rScaled = cli(['convert', FIX.scaled, join(tmp, 'x.zip')])
+check('an object whose only matrix is scaled: 5 (cannot convert)', rScaled.code, 5)
+matches('and the message says why', rScaled.err, /scaled/)
 check('an output directory that does not exist: 6 (output)',
   code('convert', FIX.classic, join(tmp, 'no', 'such', 'dir', 'x.zip'), ...EXPLICIT), 6)
 report('a failed conversion leaves no file behind',

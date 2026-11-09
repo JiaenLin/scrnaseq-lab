@@ -20,7 +20,7 @@
 # plus the annotator's two sentinel labels, EXCLUDED and UNRESOLVED, among the
 # cell types, because a real final object has them.
 #
-# Three files:
+# Four files:
 #
 #   family-2x2.h5ad          two crossed factors, 2 samples per arm, written the
 #                            way the family's emitters write (classic strings)
@@ -33,6 +33,9 @@
 #                            nullable-string-arrays WITH missing values, so the
 #                            mask itself is exercised (anndata only writes those
 #                            when string-to-categorical conversion is off).
+#   scaled-only.h5ad         a tiny object whose only matrix is z-scored, which
+#                            no bundle can be built from: the command's "cannot
+#                            convert" exit.
 #
 # Pinned to what the family runs: anndata 0.13.2, pandas 3.0.5. With uv:
 #
@@ -165,3 +168,12 @@ T = ad.AnnData(X=sp.csr_matrix(rng.poisson(2.0, size=(m, 4)).astype(np.float32))
                obs=tiny_obs, var=tiny_var)
 T.obsm["X_umap"] = rng.normal(size=(m, 2)).astype(np.float32)
 write(T, out_dir / "nullable-mask.h5ad", classic=False, convert_strings_to_categoricals=False)
+
+# ---- nothing to build from: the only matrix is scaled -----------------------
+z = rng.normal(size=(m, 4)).astype(np.float32)
+z -= z.mean(axis=0)
+S = ad.AnnData(X=z, obs=pd.DataFrame({"cell_type": pd.Categorical(["TypeA", "TypeB"] * (m // 2))},
+                                     index=[f"c{i}" for i in range(m)]),
+               var=pd.DataFrame(index=[f"Gene{j + 1:03d}" for j in range(4)]))
+S.obsm["X_umap"] = rng.normal(size=(m, 2)).astype(np.float32)
+write(S, out_dir / "scaled-only.h5ad", classic=True)
