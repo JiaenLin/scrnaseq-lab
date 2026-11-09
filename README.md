@@ -153,20 +153,25 @@ Some things are named in place, with a note, rather than copied:
 - **What JSON has no form for:** float16, an HDF5 reference, opaque bytes, a dataframe or a
   sparse matrix. The rest of the record is still copied.
 - **Anything nested more than 16 groups below its record.**
+- **An HDF5 object reached a second time** through another link, such as a hard link back to
+  an ancestor. It is copied once, and each other link to it is named.
+- **Anything past 10,000 groups and datasets read for one record.**
 - **A record too large to copy into every part.** The section goes into every part of a split
   object, and `meta.json` is indented, so sizes are counted as written, in bytes. A record over
   262,144 bytes is named with its size.
 
-The records together may take 1,048,576 bytes. They are fitted in a fixed order, so nothing
-earlier in `uns` can push out a tool's own record:
+The records together may take 1,048,576 bytes. They are fitted kind by kind:
 
 1. the harness's run record;
 2. each `provenance`;
 3. each `*_provenance`;
 4. the records known by their schema.
 
-Within each kind the smaller go first. Once the next record does not fit, it and all after it
-are left out, counted in one entry, `run.leftOut`, and in one note. An `uns` entry that cannot
+Within a kind, records are taken in `uns` order. One that does not fit is left out, and the
+next is still tried. A record is never pushed out by a later kind. Within one kind, records
+earlier in `uns` can still fill the section before a tool's own. The records left out are
+therefore named largest first, so a tool's record, which is rarely the smallest, is among
+those named. One entry, `run.leftOut`, and one note count them all. An `uns` entry that cannot
 even be inspected (an attribute the reader cannot read) is named in a note and never stops
 the conversion.
 
