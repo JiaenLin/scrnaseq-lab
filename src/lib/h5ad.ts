@@ -69,6 +69,55 @@ const toStrings = (v: unknown): string[] =>
 export class H5adError extends Error {}
 
 /**
+ * A string column in anndata's nullable encoding: a group of `values` + `mask`.
+ *
+ * This is what anndata (0.11 on) writes for pandas' own string dtype, and on
+ * pandas 3 that dtype is the default — so an object written with default
+ * settings stores its obs and var names this way, and every string column it
+ * did not turn into a categorical. The family's writers opt out of it; anything
+ * written with the defaults does not, and the reader used to fail on the first
+ * one with a property read on undefined. A masked entry is missing: its slot in
+ * `values` is a placeholder, never the value.
+ *
+ * Null for anything else, so callers fall through to the encodings they knew.
+ */
+function nullableStrings(o: H5): { values: string[]; mask: Uint8Array } | null {
+  if (!isGroup(o) || text(attr(o, 'encoding-type') ?? '') !== 'nullable-string-array') return null
+  const v = o.get('values')
+  if (!isDataset(v)) return null
+  const values = toStrings(v.value)
+  const mask = new Uint8Array(values.length)
+  const m = o.get('mask')
+  if (isDataset(m)) {
+    const raw = m.value as ArrayLike<number | bigint | boolean>
+    for (let i = 0; i < mask.length; i++) mask[i] = raw[i] ? 1 : 0
+  }
+  return { values, mask }
+}
+
+/** Masked entries as empty strings — where every caller treats an empty name as no name. */
+const unmasked = (s: { values: string[]; mask: Uint8Array }): string[] =>
+  s.values.map((v, i) => (s.mask[i] ? '' : v))
+
+/** A nullable string column as a grouping: masked cells are NA, never a level of their own. */
+function maskedColumn(name: string, s: { values: string[]; mask: Uint8Array }): Column {
+  const index = new Map<string, number>()
+  const levels: string[] = []
+  const codes = new Int32Array(s.values.length)
+  for (let i = 0; i < s.values.length; i++) {
+    if (s.mask[i]) { codes[i] = -1; continue }
+    let at = index.get(s.values[i])
+    if (at === undefined) {
+      at = levels.length
+      levels.push(s.values[i])
+      index.set(s.values[i], at)
+    }
+    codes[i] = at
+  }
+  return fromFactor(name, codes, levels)
+}
+
+/**
  * The largest .h5ad the in-tab reader can accept.
  *
  * 2^31 - 1: h5wasm's emulated filesystem stores lengths as signed 32-bit.
@@ -132,6 +181,15 @@ function readObs(obs: H5, uns: H5, nCells: number, note: (s: string) => void): C
     if (!o) continue
     try {
       if (isGroup(o)) {
+        const strings = nullableStrings(o)
+        if (strings) {
+          if (strings.values.length !== nCells) {
+            note(`obs/${key} has ${strings.values.length} values for ${nCells} cells; skipped`)
+          } else {
+            out.push(maskedColumn(key, strings))
+          }
+          continue
+        }
         // A modern categorical: categories + codes, with -1 for NA.
         const cats = o.get('categories')
         const codes = o.get('codes')
@@ -169,7 +227,12 @@ function readVar(v: H5, label: string): string[] {
   if (isGroup(v)) {
     const name = text(attr(v, '_index') ?? '_index')
     const ds = v.get(name) ?? v.get('_index') ?? v.get('index')
-    if (ds) return toStrings(ds.value)
+    const strings = nullableStrings(ds)
+    if (strings) return unmasked(strings)
+    if (isDataset(ds)) return toStrings(ds.value)
+    if (ds) {
+      throw new H5adError(`${label}/${name} is stored as "${text(attr(ds, 'encoding-type') ?? 'an unnamed group')}", which this reader cannot read as gene names`)
+    }
   }
   throw new H5adError(`${label} has no gene names`)
 }
@@ -206,6 +269,11 @@ function readVarStringColumns(v: H5, nGenes: number, note: (s: string) => void):
     try {
       const o = v.get(key)
       if (!o) continue
+      const strings = nullableStrings(o)
+      if (strings) {
+        if (strings.values.length === nGenes) out.push({ name: key, values: unmasked(strings) })
+        continue
+      }
       if (isGroup(o)) {
         const cats = o.get('categories')
         const codes = o.get('codes')
