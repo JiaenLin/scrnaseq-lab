@@ -575,20 +575,30 @@ export const RUN_MAX_DEPTH = 16
  */
 export const RUN_MAX_NODES = 10_000
 
-/** Records read in full before the section is filled; beyond this, a record is read again if it is kept. */
-const RUN_HOLD = 8 * RUN_SECTION_BUDGET
+/**
+ * The most groups and datasets read for the whole run section. The per-record
+ * budget alone bounds nothing when many records reach the same large group:
+ * 400 records linked to one group of 9,990 datasets read it 400 times. Records
+ * reached after this is spent are left out, unread.
+ */
+export const RUN_SECTION_NODES = 50_000
 
 /**
- * One record's walk: the HDF5 objects reached so far, by identity, and how
- * many groups and datasets have been read. An object reached again — a hard
- * link back to an ancestor, or a second link to one already read — is named
- * in place, never read again.
+ * One record's walk through the run section's single walk: the HDF5 objects
+ * reached so far by any record, by identity, and how many groups and datasets
+ * this record and the whole section have read. An object reached again — a
+ * hard link back to an ancestor, a second link, or a link from another record
+ * to an object already read — is named in place, never read again.
  */
 interface Walk {
   /** The record's own path, for the notes. */
   record: string
+  /** Shared by every record of the section: identity → the path that first reached it. */
   seen: Map<string, string>
+  /** Groups and datasets read for this record. */
   visited: number
+  /** Shared by every record of the section. */
+  section: { visited: number }
   relinked: Set<string>
   crowded: Set<string>
 }
@@ -697,22 +707,31 @@ function plainDataset(d: H5, path: string): unknown {
   return nest(Array.from(v as ArrayLike<unknown>, one), shape)
 }
 
+/** Where the walk has run out of reading, as the end of a sentence; null while it has not. */
+function spent(walk: Walk): string | null {
+  if (walk.visited >= RUN_MAX_NODES) return `the ${RUN_MAX_NODES.toLocaleString('en-US')} groups and datasets read for one record`
+  if (walk.section.visited >= RUN_SECTION_NODES) return `the ${RUN_SECTION_NODES.toLocaleString('en-US')} groups and datasets read for the run section`
+  return null
+}
+
 /**
  * An uns entry as JSON: a dict as an object, in the order the file lists it.
  *
- * Three things bound the read, each naming what it stops in place: `depth`
+ * Four things bound the read, each naming what it stops in place: `depth`
  * counts groups below the record's own entry (past RUN_MAX_DEPTH a group is
- * not read); the walk counts the groups and datasets read (past
- * RUN_MAX_NODES the rest are not); and an object already reached by another
- * link is not read again.
+ * not read); the walk counts the groups and datasets read, for the record
+ * (RUN_MAX_NODES) and for the whole section (RUN_SECTION_NODES); and an object
+ * already reached, by this record or any other, is not read again.
  */
 function plain(o: H5, path: string, walk: Walk, depth = 0): unknown {
   if (!isDataset(o) && !isGroup(o)) return null
-  if (walk.visited >= RUN_MAX_NODES) {
+  const stop = spent(walk)
+  if (stop) {
     walk.crowded.add(walk.record)
-    return `(not copied: ${path} lies past the ${RUN_MAX_NODES.toLocaleString('en-US')} groups and datasets read for one record)`
+    return `(not copied: ${path} lies past ${stop})`
   }
   walk.visited++
+  walk.section.visited++
   const id = identity(o)
   if (id !== null) {
     const first = walk.seen.get(id)
@@ -734,10 +753,11 @@ function plain(o: H5, path: string, walk: Walk, depth = 0): unknown {
   const out: Record<string, unknown> = {}
   const keys = o.keys() as string[]
   for (let i = 0; i < keys.length; i++) {
-    if (walk.visited >= RUN_MAX_NODES) {
+    const stop = spent(walk)
+    if (stop) {
       // One sentence for the rest of this group, not one per entry.
       walk.crowded.add(walk.record)
-      out['(not copied)'] = `${(keys.length - i).toLocaleString('en-US')} more entries of ${path}, past the ${RUN_MAX_NODES.toLocaleString('en-US')} groups and datasets read for one record`
+      out['(not copied)'] = `${(keys.length - i).toLocaleString('en-US')} more entries of ${path}, past ${stop}`
       break
     }
     out[keys[i]] = plain(o.get(keys[i]), `${path}/${keys[i]}`, walk, depth + 1)
@@ -822,23 +842,28 @@ function schemaSaysProvenance(o: H5): boolean {
  * Every record of the run the object carries.
  *
  * Found in uns order, then read, measured as meta.json will hold it, and
- * written in uns order. What is written is decided kind by kind: the harness's
- * run record first, then each `provenance`, then each `*_provenance`, then the
- * records known by their schema. Within a kind the records are taken in uns
- * order, first fit: one that does not fit in what is left of
+ * decided one at a time, in the order the section is filled: kind by kind —
+ * the harness's run record first, then each `provenance`, then each
+ * `*_provenance`, then the records known by their schema — and within a kind
+ * in uns order, first fit: one that does not fit in what is left of
  * RUN_SECTION_BUDGET is left out, and the next is still tried. So a record of
  * an earlier kind is never pushed out by a later kind; within one kind,
  * earlier records in uns can still fill the section before a tool's own
  * record, and then that record is left out and named first, because the
- * records left out are named largest first. A record over RUN_RECORD_BUDGET is
- * written as a sentence naming its size. One entry, `leftOut`, and one note
- * cover every record left out.
+ * records left out are named largest first. Written records keep uns order.
+ *
+ * All records are read in one walk: an object one record has read is named,
+ * not read again, wherever else it is reached, and the section reads at most
+ * RUN_SECTION_NODES groups and datasets; records it reaches after that are
+ * left out, unread. A record over RUN_RECORD_BUDGET is written as a sentence
+ * naming its size. One entry, `leftOut`, and one note cover every record left
+ * out.
  *
  * Nothing found here can stop the conversion. An uns entry that cannot even be
  * inspected, a record that cannot be read, and a value JSON cannot hold are
  * each said in one note, never thrown.
  */
-function readRun(uns: H5, note: (s: string) => void): RunSection {
+export function readRun(uns: H5, note: (s: string) => void): RunSection {
   const records: RunRecord[] = []
   if (!isGroup(uns)) return { searched: RUN_SEARCHED, records }
   const named = (k: string) => k === 'provenance' || k.endsWith('_provenance')
@@ -846,7 +871,9 @@ function readRun(uns: H5, note: (s: string) => void): RunSection {
   const n = (x: number) => x.toLocaleString('en-US')
   const relinked = new Set<string>()
   const crowded = new Set<string>()
-  const walkOf = (record: string): Walk => ({ record, seen: new Map(), visited: 0, relinked, crowded })
+  const seen = new Map<string, string>()
+  const section = { visited: 0 }
+  const walkOf = (record: string): Walk => ({ record, seen, visited: 0, section, relinked, crowded })
 
   // ---- found, in uns order; each entry inspected on its own -------------
   type Found = { path: string; kind: number; read: (say: (s: string) => void) => unknown }
@@ -889,55 +916,48 @@ function readRun(uns: H5, note: (s: string) => void): RunSection {
     }
   }
 
-  // ---- read and measured ---------------------------------------------------
-  type Read = { at: number; size: number; record?: unknown; failed?: string }
-  const read: Read[] = []
-  let held = 0
-  found.forEach((f, at) => {
-    try {
-      const record = f.read(note) ?? null
-      const size = writtenSize(record, 4)
-      // Held for the filling below while it stays small; a record not held is
-      // read again if it is written.
-      const hold = size <= RUN_RECORD_BUDGET && held + size <= RUN_HOLD
-      if (hold) held += size
-      read.push({ at, size, ...(hold ? { record } : {}) })
-    } catch (e) {
-      read.push({ at, size: 0, failed: (e as Error).message })
-    }
-  })
-
-  // ---- filled: kind by kind, first fit in uns order --------------------------
-  const order = [...read].sort((a, b) => found[a.at].kind - found[b.at].kind || a.at - b.at)
+  // ---- read, measured and decided, in the order the section fills ------------
+  const order = found.map((f, at) => ({ f, at })).sort((a, b) => a.f.kind - b.f.kind || a.at - b.at)
   const written = new Map<number, unknown>()
   const failed: string[] = []
   const tooBig: string[] = []
-  const leftOut: Read[] = []
-  let spent = 0
-  for (const r of order) {
-    const path = found[r.at].path
-    const over = r.failed === undefined && r.size > RUN_RECORD_BUDGET
-    const sentence = `(not copied: ${n(r.size)} bytes as written, over the ${n(RUN_RECORD_BUDGET)}-byte budget for one record)`
-    const cost = entryBytes(path, r.failed !== undefined ? 4 : over ? stringBytes(sentence) : r.size)
-    if (spent + cost > RUN_SECTION_BUDGET) { leftOut.push(r); continue }
-    let record: unknown = null
-    if (over) record = sentence
-    else if (r.failed === undefined) {
-      try {
-        record = 'record' in r ? r.record : (found[r.at].read(() => {}) ?? null)
-      } catch (e) {
-        r.failed = (e as Error).message
-      }
+  // size -1: never read, because the section had read all it may.
+  const leftOut: { at: number; path: string; size: number }[] = []
+  let unread = 0
+  let used = 0
+  for (const { f, at } of order) {
+    if (section.visited >= RUN_SECTION_NODES) {
+      leftOut.push({ at, path: f.path, size: -1 })
+      unread++
+      continue
     }
-    spent += cost
-    written.set(r.at, record)
-    if (r.failed !== undefined) failed.push(path)
-    else if (over) tooBig.push(path)
+    let record: unknown = null
+    let size = 4
+    let bad = false
+    try {
+      record = f.read(note) ?? null
+      size = writtenSize(record, 4)
+    } catch {
+      bad = true
+      record = null
+      size = 4
+    }
+    const over = !bad && size > RUN_RECORD_BUDGET
+    if (over) record = `(not copied: ${n(size)} bytes as written, over the ${n(RUN_RECORD_BUDGET)}-byte budget for one record)`
+    const cost = entryBytes(f.path, over ? stringBytes(record as string) : size)
+    if (used + cost > RUN_SECTION_BUDGET) {
+      leftOut.push({ at, path: f.path, size })
+      continue
+    }
+    used += cost
+    written.set(at, record)
+    if (bad) failed.push(f.path)
+    else if (over) tooBig.push(f.path)
   }
-  for (const r of read) if (written.has(r.at)) records.push({ path: found[r.at].path, record: written.get(r.at) })
+  for (const at of [...written.keys()].sort((a, b) => a - b)) records.push({ path: found[at].path, record: written.get(at) })
   // Largest first, so that a tool's own record, which is rarely the smallest,
-  // is named among the first few whenever it is left out.
-  const outPaths = [...leftOut].sort((a, b) => b.size - a.size || a.at - b.at).map(r => found[r.at].path)
+  // is named among the first few whenever it is left out; the unread last.
+  const outPaths = [...leftOut].sort((a, b) => b.size - a.size || a.at - b.at).map(x => x.path)
 
   // ---- said, once each -------------------------------------------------------
   if (uninspected.length) {
@@ -947,7 +967,7 @@ function readRun(uns: H5, note: (s: string) => void): RunSection {
     note(`${some([...relinked])} ${relinked.size > 1 ? 'reach' : 'reaches'} an HDF5 object by more than one link; the object is copied once, and each other link to it is named in place`)
   }
   if (crowded.size) {
-    note(`${some([...crowded])} ${crowded.size > 1 ? 'hold' : 'holds'} more than ${n(RUN_MAX_NODES)} groups and datasets; past that, the rest is named in place, unread`)
+    note(`${some([...crowded])} ${crowded.size > 1 ? 'were' : 'was'} read only to the ${n(RUN_MAX_NODES)} groups and datasets one record may take, or the ${n(RUN_SECTION_NODES)} the run section may; past that, the rest is named in place, unread`)
   }
   if (failed.length) {
     note(`${some(failed)} could not be read; run lists ${failed.length > 1 ? 'them' : 'it'} with no content`)
@@ -956,7 +976,7 @@ function readRun(uns: H5, note: (s: string) => void): RunSection {
     note(`${some(tooBig)} ${tooBig.length > 1 ? 'are' : 'is'} over the ${n(RUN_RECORD_BUDGET)}-byte budget for one record as meta.json writes it, so run names ${tooBig.length > 1 ? 'each' : 'it'} with its size instead of copying it into every part`)
   }
   if (leftOut.length) {
-    note(`${n(leftOut.length)} record${leftOut.length > 1 ? 's were' : ' was'} left out of run, largest first: ${some(outPaths)}. The section had reached its ${n(RUN_SECTION_BUDGET)}-byte budget, filled kind by kind (the harness's run record, then each provenance, then *_provenance, then records known by their schema), each kind in uns order`)
+    note(`${n(leftOut.length)} record${leftOut.length > 1 ? 's were' : ' was'} left out of run, largest first: ${some(outPaths)}. The section is filled kind by kind (the harness's run record, then each provenance, then *_provenance, then records known by their schema), each kind in uns order, to ${n(RUN_SECTION_BUDGET)} bytes${unread ? `; ${n(unread)} of them ${unread > 1 ? 'were' : 'was'} not read, because the section had read the ${n(RUN_SECTION_NODES)} groups and datasets it may` : ''}`)
   }
   return {
     searched: RUN_SEARCHED, records,

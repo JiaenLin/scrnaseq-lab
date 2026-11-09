@@ -576,7 +576,48 @@ console.log('\nHARD LINKS CANNOT MAKE A SMALL RECORD AN ENDLESS READ')
       const r = w.o.parts[0].meta.run.records.find(x => x.path === 'uns/wide_provenance').record
       return [Object.keys(r).length, /^51 more entries of uns\/wide_provenance, past the 10,000 groups and datasets/.test(r['(not copied)'])]
     }, [10_000, true])
-  attempt('and a note says so', () => w.o.parts[0].meta.notes.filter(s => /uns\/wide_provenance/.test(s) && /more than 10,000 groups and datasets/.test(s)).length, 1)
+  attempt('and a note says so', () => w.o.parts[0].meta.notes.filter(s => /uns\/wide_provenance/.test(s) && /read only to the 10,000 groups and datasets one record may take/.test(s)).length, 1)
+}
+
+console.log('\nTHE RUN SECTION IS READ IN ONE WALK: AN OBJECT IS READ ONCE, WHATEVER REACHES IT')
+{
+  // 400 records, half hard links and half soft links to one group of 9,990
+  // datasets. Read record by record, every link read the whole group again,
+  // about two seconds each; the old reader is killed at 60 s.
+  const shared = copyWith(FIX.classic, 'shared.h5ad', f => {
+    const g = dict(f, 'shared')
+    for (let i = 0; i < 9_990; i++) g.create_dataset({ name: `k${String(i).padStart(5, '0')}`, data: 'v' })
+    const uns = f.get('uns')
+    for (let i = 0; i < 400; i++) {
+      const name = `r${String(i).padStart(4, '0')}_provenance`
+      if (i % 2) uns.create_soft_link('/shared', name)
+      else uns.create_hard_link('/shared', name)
+    }
+  })
+  const s = convert(shared, 'shared.zip', ['--label', 'shared'], 60_000)
+  attempt('400 records linked to one large group convert, in seconds', () => [s.r.code, s.r.seconds < 30], [0, true])
+  attempt('the group is copied once, under the first record, and every other record names it',
+    () => {
+      const recs = s.o.parts[0].meta.run.records.filter(x => /^uns\/r\d{4}_provenance$/.test(x.path))
+      return [recs.length, Object.keys(recs[0].record).length,
+        recs.slice(1).every(x => String(x.record).startsWith(`(not copied: ${x.path} is uns/r0000_provenance again`))]
+    }, [400, 9_990, true])
+
+  // The section's own budget, on groups shaped like h5wasm's: 60 records of
+  // 1,000 datasets each, every one its own object. After 50,000 groups and
+  // datasets, the records not yet read are left out, unread.
+  let id = 0
+  const ref = () => { const k = ++id; return () => ({ ref_data: Uint8Array.from([k & 255, (k >> 8) & 255, (k >> 16) & 255]) }) }
+  const ds = () => ({ shape: [], value: 'v', metadata: { type: 3, size: 1 }, attrs: {}, create_reference: ref() })
+  const grp = (children) => ({ attrs: {}, keys: () => Object.keys(children), get: (k) => children[k] ?? null, create_reference: ref() })
+  const uns = grp(Object.fromEntries(Array.from({ length: 60 }, (_v, r) =>
+    [`r${String(r).padStart(2, '0')}_provenance`, grp(Object.fromEntries(Array.from({ length: 1_000 }, (_w, i) => [`d${String(i).padStart(3, '0')}`, ds()])))])))
+  const h5 = await tryImport('../src/lib/h5ad.ts')
+  const said = []
+  attempt('after 50,000 groups and datasets for the section, the records not yet reached are left out, unread',
+    () => { const run = h5.readRun(uns, s => said.push(s)); return [run.records.length, run.leftOut.count, run.leftOut.paths[0]] },
+    [50, 10, 'uns/r50_provenance'])
+  attempt('and the note says how many were not read', () => said.filter(s => /left out of run/.test(s) && /10 of them were not read/.test(s)).length, 1)
 }
 
 console.log("\nWITHIN A KIND, FIRST FIT IN uns ORDER; WHAT IS LEFT OUT IS NAMED LARGEST FIRST")
