@@ -118,10 +118,35 @@ that copy *smaller* than the flat one — −49.5% on real atlas data. One gene 
 
 ## What it carries that the object had
 
-**Every 2D embedding, not the one you picked.** An object usually holds a UMAP and a t-SNE
-of the same cells; which to look at is the reader's question, not the converter's. The one
-you choose opens first and is still `embed.f32`, so nothing that reads bundles has to
-change; the rest travel beside it at 8 bytes a cell.
+**Every two-column embedding, each once, not only the one you picked.** An object usually
+holds a UMAP and a t-SNE of the same cells; which to look at is the reader's question, not
+the converter's. The one you choose opens first and is still `embed.f32`, so nothing that
+reads bundles has to change; every other two-column embedding travels beside it at 8 bytes a
+cell. Two kinds do not, and `meta.notes` names each one left out:
+
+- **A latent space.** A PCA, a corrected PCA (`X_harmony`), or anything else wider than two
+  columns: its first two columns are not a picture of the cells. You can still choose one
+  to open first. It is then drawn by its first two columns, and the notes flag it.
+- **A byte copy** of an embedding already offered. An integration stage writes its chosen
+  method's UMAP twice, as `X_umap` and `X_umap_<method>`. It is offered once, under the name
+  that opens first, or else the first in the object's order. Copies are compared on the
+  whole object, so every part of a split object offers the same ones.
+
+**The run's own record.** What the object's `uns` says about the run that made it travels
+in `meta.run`, copied rather than summarised. The lab names no tool. A record is anything
+that calls itself provenance:
+
+- an entry named `provenance` or `*_provenance`, at the top of `uns` or one level down (an
+  integration stage's `uns/<tool>/provenance`, an annotator's `uns/<column>_provenance`);
+- a group directly under `uns` whose own `schema` string names provenance;
+- the harness's run record, `uns/harness_run`, read as JSON (kept as its text, with a note,
+  if it is not JSON).
+
+Each record keeps the tool's own field names and values. An integration stage's, for
+example, carries its version, commit, job and arguments. When the object carries none,
+`run.records` is empty and a note says so; `run.searched` says where the lab looked. A
+Seurat object has no `uns`, so its bundle has no `run`. Readers that do not know the field
+ignore it.
 
 **Both namings of the genes.** `genes.txt` is whatever the matrix rows are indexed by —
 `ENSMUSG00000038751` as often as `Sox2` — and `meta.geneIdKind` says which, judged from the
@@ -152,6 +177,20 @@ The lab also refuses to let one column play two roles: a column chosen as the ce
 is withdrawn from the condition and sample questions — as is any column that turns out to be
 the *same partition under different labels*, which `seurat_clusters` and `seurat_annotations`
 almost always are.
+
+**Every cell keeps its own condition.** The bundle records a condition per sample, not per
+cell. Some samples hold cells of two conditions: a hashed lane carrying two treatments, or a
+donor sampled before and after. Each such sample is split into one sample per condition,
+named `sample|condition`, as the studio's own `tools/export_h5ad.py` does.
+
+- Only those samples are renamed. A new name that another sample already has gets `#2`.
+- The app says so before converting, and `meta.notes` names the samples that were split.
+- With no sample column, the cells of each condition are one sample.
+- The decision is made on the whole object before any split into parts, so a sample has one
+  name in every part.
+
+The lab used to give every cell its sample's first condition. That put whole groups of cells
+in the wrong condition, with nothing on screen to show it.
 
 ## Output
 
@@ -268,6 +307,10 @@ crossed factors, the integration stage's `uns` record, and the annotator's senti
 it is written in anndata's default string encoding. `scripts/make-family-fixture.py` writes them from
 made-up names, and Python is needed only to regenerate them:
 `uv run --no-project --with anndata==0.13.2 --with pandas==3.0.5 python scripts/make-family-fixture.py`.
+`scripts/test-integrity.mjs` converts copies of them that it edits itself through h5wasm. It
+checks that every cell keeps its condition, that the run's record travels, and that only
+two-column embeddings are offered. It also checks that nothing else in the fixture's bundle
+moved.
 
 ## Known limits
 
