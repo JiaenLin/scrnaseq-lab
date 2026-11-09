@@ -152,9 +152,23 @@ Some things are named in place, with a note, rather than copied:
 
 - **What JSON has no form for:** float16, an HDF5 reference, opaque bytes, a dataframe or a
   sparse matrix. The rest of the record is still copied.
-- **A record too large to copy into every part:** the section goes into every part of a
-  split object. A record over 262,144 characters of JSON is named with its size, and so is
-  any record that would take the whole section past 1,048,576.
+- **Anything nested more than 16 groups below its record.**
+- **A record too large to copy into every part.** The section goes into every part of a split
+  object, and `meta.json` is indented, so sizes are counted as written, in bytes. A record over
+  262,144 bytes is named with its size.
+
+The records together may take 1,048,576 bytes. They are fitted in a fixed order, so nothing
+earlier in `uns` can push out a tool's own record:
+
+1. the harness's run record;
+2. each `provenance`;
+3. each `*_provenance`;
+4. the records known by their schema.
+
+Within each kind the smaller go first. Once the next record does not fit, it and all after it
+are left out, counted in one entry, `run.leftOut`, and in one note. An `uns` entry that cannot
+even be inspected (an attribute the reader cannot read) is named in a note and never stops
+the conversion.
 
 **Both namings of the genes.** `genes.txt` is whatever the matrix rows are indexed by —
 `ENSMUSG00000038751` as often as `Sox2` — and `meta.geneIdKind` says which, judged from the
@@ -319,7 +333,8 @@ made-up names, and Python is needed only to regenerate them:
 checks that every cell keeps its condition, that the run's record travels, and that only
 two-column embeddings are offered. It also checks that nothing else in the fixture's bundle
 moved. `uns-records.h5ad` holds the run records h5wasm cannot write: a structured array with
-an int64 field, float16, and an HDF5 reference.
+an int64 field, float16, and an HDF5 reference. `uns-unreadable.h5ad` holds an `uns` entry
+whose `encoding-type` attribute is float16, which anndata itself refuses to read.
 
 ## Known limits
 
