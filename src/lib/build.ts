@@ -100,6 +100,16 @@ export interface BundleMeta {
   nGenes: number
   nnz: number
   clusters: string[]
+  /**
+   * Cluster levels that are not cell types: an annotator's labels for cells it
+   * excluded or could not resolve. They stay in `clusters` — the cells are
+   * real and are drawn — and are named here so a reader can leave them out of
+   * composition, markers and tests.
+   *
+   * Written by the command-line converter, which always says (an empty list is
+   * "none"); absent in bundles from the app and from before it existed.
+   */
+  sentinels?: string[]
   samples: { id: string; condition: string }[]
   conditions: string[]
   /**
@@ -570,6 +580,8 @@ export function buildBundle(
     nGenes: genes.length,
     nnz: csc.data.length,
     clusters: cluster.levels,
+    // Only the ones this part has cells for, like `clusters` itself.
+    ...(choices.sentinels ? { sentinels: choices.sentinels.filter(s => cluster.levels.includes(s)) } : {}),
     samples: sample.levels.map((id, i) => ({ id, condition: sampleCond[i] })),
     conditions,
     extras,

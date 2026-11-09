@@ -147,6 +147,12 @@ export interface Choices {
    * format has always written.
    */
   extras?: string[]
+  /**
+   * Cluster levels that are an annotator's sentinels rather than cell types.
+   * Given only by the command-line converter; the app leaves it unset, and
+   * then the bundle has no `sentinels` field at all.
+   */
+  sentinels?: string[]
 }
 
 // ---------------------------------------------------------------------------
@@ -363,10 +369,24 @@ export function guessCluster(scan: ScanInfo): string | null {
   return (named ?? cands[0]).name
 }
 
-export function guessRole(scan: ScanInfo, role: 'sample' | 'condition'): string | null {
+/**
+ * The column named like a sample or a condition, if any.
+ *
+ * `exclude` withdraws columns already given another role, as the app's
+ * questions do once the cell annotation is chosen.
+ */
+export function guessRole(
+  scan: ScanInfo, role: 'sample' | 'condition', exclude: (string | null)[] = [],
+): string | null {
   const names = role === 'sample' ? SAMPLE_NAMES : CONDITION_NAMES
-  const hit = candidates(scan, role).find(c => rank(c.name, names) < 1000)
+  const hit = candidates(scan, role, exclude).find(c => rank(c.name, names) < 1000)
   return hit?.name ?? null
+}
+
+/** Is this column named like one of the role's conventional names? */
+export function namedLike(name: string, role: 'cluster' | 'sample' | 'condition'): boolean {
+  const names = role === 'cluster' ? CLUSTER_NAMES : role === 'sample' ? SAMPLE_NAMES : CONDITION_NAMES
+  return rank(name, names) < 1000
 }
 
 const EMBED_ORDER = ['umap', 'tsne', 'draw_graph', 'pca']

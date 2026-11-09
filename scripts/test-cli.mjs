@@ -159,10 +159,10 @@ const EXPLICIT = [
 ]
 
 await h5wasm.ready
-/** Scan, use, close. The scan's matrices read lazily, so `use` runs while the file is open. */
-function withScan(path, use) {
+/** Scan, run `fn`, close. The scan's matrices read lazily, so `fn` runs while the file is open. */
+function withScan(path, fn) {
   const f = new h5wasm.File(path, 'r')
-  try { return use(scanOpenH5ad(f, path.split(/[\\/]/).pop())) } finally { f.close() }
+  try { return fn(scanOpenH5ad(f, path.split(/[\\/]/).pop())) } finally { f.close() }
 }
 const scanFile = (path) => withScan(path, s => s)
 
