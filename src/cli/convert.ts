@@ -2,11 +2,12 @@
 //
 // scan → roles → chooseSplit → buildBundle → collectionPieces, exactly as the
 // worker runs them, driven from a shell instead of a page. Nothing here
-// reimplements the format; if this and the app ever disagree about a byte,
-// this is wrong. What it adds is what a shell needs and a page does not: every
-// role settable by a flag, every guess said aloud, a sha256 for the file and
-// for each part, an exit status per kind of failure, and an output that either
-// appears whole or not at all.
+// reimplements the format: every part comes out of the app's buildBundle and
+// the file out of its collectionPieces. What it adds is what a shell needs and
+// a page does not: every role settable by a flag, every guess said aloud, an
+// exit status per kind of failure, an output that either appears whole or not
+// at all, and three fields readers that do not know them ignore — `sentinels`
+// in each part and in collection.json, and a sha256 for each part there.
 //
 // Parts are parked on disk as they are written rather than held. The app must
 // hold them — a browser has nowhere else to put them — but on an atlas that is
@@ -16,7 +17,7 @@
 import h5wasm from 'h5wasm/node'
 import { createHash } from 'node:crypto'
 import {
-  closeSync, existsSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync,
+  closeSync, existsSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync,
   statSync, writeFileSync, writeSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -89,10 +90,37 @@ function writeAll(fd: number, b: Uint8Array): void {
   while (at < b.length) at += writeSync(fd, b, at, b.length - at)
 }
 
+/**
+ * Is `p` the input file, however it is reached?
+ *
+ * The same path spelled another way, a symlink to it, a path through a
+ * symlinked directory and a hard link all share the input's device and inode,
+ * so that is what is compared; where a file system reports no inode, the real
+ * paths are. A path that does not exist is no file at all.
+ */
+function isInput(p: string, input: string): boolean {
+  try {
+    const a = statSync(p, { bigint: true })
+    const b = statSync(input, { bigint: true })
+    if (a.ino !== 0n && b.ino !== 0n) return a.dev === b.dev && a.ino === b.ino
+    return realpathSync.native(p) === realpathSync.native(input)
+  } catch {
+    return false
+  }
+}
+
 /** Input and output checked before any work: an hour's conversion should not end in a typo. */
 function checkPaths(a: ConvertArgs): void {
   if (!existsSync(a.input)) throw new CliError(`${a.input}: no such file`, EXIT.input)
   if (statSync(a.input).isDirectory()) throw new CliError(`${a.input} is a directory, not an .h5ad`, EXIT.input)
+  // The zip is written to OUT.partial and renamed onto OUT. If either is the
+  // input, the object is replaced by its own conversion, and that is the one
+  // mistake the command cannot undo.
+  for (const target of [a.output, `${a.output}.partial`]) {
+    if (isInput(target, a.input)) {
+      throw new CliError(`${target} is the input file ${a.input}${target === a.output ? '' : ' (the command writes OUT.partial first, then renames it)'}: converting onto it would replace the object with its own zip. Name another output`, EXIT.usage)
+    }
+  }
   if (/\.rds$/i.test(a.input)) {
     throw new CliError(`${a.input}: the command reads .h5ad. Convert a Seurat .rds in the app, which reads it in the browser, or save the object as .h5ad`, EXIT.input)
   }

@@ -164,8 +164,11 @@ back and compares it against a dense reference rather than trusting the writer.
 ## From a shell: `scrnaseq-lab convert`
 
 The same conversion as a command, for a workstation or a pipeline. It runs the app's own
-modules, so for the same choices it writes the file the app writes. The app itself is
-unchanged: it converts in the browser and uploads nothing.
+modules, so each part is the bundle the app's builder writes, with two additions in its
+`meta.json`: `sentinels`, and the command's own notes (a design factor left out, the sentinels'
+cell counts). `collection.json` holds the app's fields plus `sentinels` and a `sha256` for each
+part. Readers that do not know a field ignore it. The app itself is unchanged: it converts in
+the browser and uploads nothing.
 
 ```bash
 git clone https://github.com/JiaenLin/scrnaseq-lab && cd scrnaseq-lab
@@ -196,8 +199,10 @@ a Seurat `.rds` in the app.
 **A flag given is used as given, and a flag absent is guessed out loud.** Each guess is printed
 on stderr as the flag that would produce it (`guessed --condition factor_a  (…)`). Pasting the
 guesses back gives the same bytes. `none` opts out of `--sample`, `--condition`, `--extra`,
-`--interaction` and `--sentinel`. A flag that names something the object lacks is refused with
-the list of what it has.
+`--interaction` and `--sentinel`. A flag that names something the object lacks (a column, an
+embedding, or a `--sentinel` level that no cell carries) is refused with exit 4 and the list of
+what the object has. Nothing is skipped quietly. A `--sentinel` typo that only printed a warning
+would leave the real sentinel counted as a cell type.
 
 **Design factors are found by what they are, not what they are called.** A design factor is a
 grouping that takes one value in every sample. Cell types vary inside a sample; a genotype, a
@@ -207,7 +212,13 @@ A factor that a flag leaves out is named in `meta.notes`, never dropped silently
 
 **Sentinels** stay in `clusters`, because the cells are real and are drawn. They are also
 listed in `sentinels`, in `collection.json` and in each part, with a note counting their cells,
-so a reader can leave them out of composition and tests.
+so a reader can leave them out of composition and tests. Without `--sentinel`, the guess marks
+`EXCLUDED` and `UNRESOLVED` where cells carry them. With it, every level named must be carried
+by some cell.
+
+**The output is never the input.** The command refuses (exit 2) an output that is the input
+file, however it is reached: the same path, a symlink to it, a path through a symlinked
+directory, or a hard link. It also refuses an output whose `.partial` is the input.
 
 **The same input gives the same bytes**, in any time zone and at any time. Zip entries carry a
 fixed date, and nothing in the file records when it was made. stdout carries one JSON summary
@@ -223,9 +234,9 @@ raise Node's heap: `NODE_OPTIONS=--max-old-space-size=8192 scrnaseq-lab convert 
 |---|---|
 | 0 | converted |
 | 1 | an internal error, or a Node that cannot run the command |
-| 2 | usage: an unknown option, a missing value, a stray path |
+| 2 | usage: an unknown option, a missing value, a stray path, an output that is the input |
 | 3 | input: missing, not HDF5, or not an `.h5ad` this reader understands |
-| 4 | roles: a flag names a column or embedding the object lacks or cannot use |
+| 4 | roles: a flag names a column or embedding the object lacks or cannot use, or a `--sentinel` level no cell carries |
 | 5 | the object cannot become a bundle (scaled data only, no embedding, no annotation) |
 | 6 | output: the file could not be written |
 

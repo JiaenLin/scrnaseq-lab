@@ -20,6 +20,9 @@
 // `none` is a value for --sample, --condition, --extra, --interaction and
 // --sentinel: "there is none, do not guess". A column that really is called
 // "none" wins over the keyword.
+//
+// A given flag that names what the object lacks — a column, an embedding, a
+// --sentinel level no cell carries — is refused (exit 4), never skipped.
 
 import {
   candidates, crossCheck, guessCluster, guessEmbedding, guessRole, namedLike, unusable,
@@ -203,14 +206,24 @@ export function resolveRoles(scan: Scan, a: ConvertArgs): Resolved {
   }
 
   // ---- sentinels ------------------------------------------------------------
+  // Levels some cell carries. A declared category that no cell holds is not in
+  // the bundle either, so there is nothing to mark.
   const clusterCol = col(cluster)!
-  const present = new Set(clusterCol.levels)
+  const held = new Set<number>()
+  for (const c of clusterCol.codes) if (c >= 0) held.add(c)
+  const carriedLevels = clusterCol.levels.filter((_l, i) => held.has(i))
+  const present = new Set(carriedLevels)
   let sentinels: string[]
   if (a.sentinels !== undefined) {
     const wanted = a.sentinels.length === 1 && a.sentinels[0] === 'none' && !present.has('none') ? [] : [...new Set(a.sentinels)]
     const absent = wanted.filter(s => !present.has(s))
-    if (absent.length) info.push(`--sentinel ${absent.join(', ')}: no cell of ${cluster} is labelled so; nothing to mark`)
-    sentinels = wanted.filter(s => present.has(s))
+    // Refused, like every other name the object lacks. Skipped, a typo
+    // (--sentinel EXCLUDE) exited 0 and left the real sentinel counted as a
+    // cell type, with only a line on stderr to say so.
+    if (absent.length) {
+      throw new CliError(`--sentinel ${absent.join(', ')}: no cell of ${cluster} is labelled ${absent.map(s => `"${s}"`).join(' or ')}. The levels its cells carry are: ${carriedLevels.join(', ')}`, EXIT.roles)
+    }
+    sentinels = wanted
   } else {
     sentinels = PROFILE_SENTINELS.filter(s => present.has(s))
     say('sentinel', sentinels, sentinels.length ? "the annotator's labels for cells it excluded or could not resolve" : `no level of ${cluster} is one of ${PROFILE_SENTINELS.join(', ')}`)

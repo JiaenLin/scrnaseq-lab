@@ -9,8 +9,10 @@ const USAGE = 'usage: scrnaseq-lab convert IN.h5ad OUT.zip [options]   (scrnaseq
 
 const HELP = `scrnaseq-lab convert IN.h5ad OUT.zip [options]
 
-Turns an annotated AnnData object into the one .zip scRNA-seq Studio opens:
-the file the Lab app writes in the browser, from the same modules.
+Turns an annotated AnnData object into the one .zip scRNA-seq Studio opens.
+Each part is the bundle the Lab app's own builder writes, plus "sentinels" and
+the command's notes in its meta.json; collection.json holds the app's fields
+plus "sentinels" and a sha256 for each part.
 
 Roles. A flag that is given is used as given. A flag that is not given is
 guessed, and the guess is printed on stderr as the flag that would give it:
@@ -40,9 +42,11 @@ stdout: one JSON summary. stderr: the guesses, the notes and the progress.
 Exit status:
   0  converted
   1  internal error, or a Node that cannot run the command
-  2  usage: an unknown option, a missing value, a stray path
+  2  usage: an unknown option, a missing value, a stray path, or an output
+     that is the input file (by path, symlink or hard link)
   3  input: missing, not HDF5, or not an .h5ad this reader understands
-  4  roles: a flag names a column or embedding the object lacks or cannot use
+  4  roles: a flag names a column or embedding the object lacks or cannot use,
+     or a --sentinel level that no cell carries
   5  the object cannot become a bundle (scaled data only, no embedding, ...)
   6  output: the file could not be written
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // scrnaseq-lab: the Lab's converter, from a shell or a pipeline.
 //
-// The app's own modules run by Node instead of a browser tab, so a file
-// converted here is the file the app writes for the same choices. The app is
-// unchanged by this: it still converts in the browser and uploads nothing.
+// The app's own modules run by Node instead of a browser tab: each part is the
+// bundle the app's builder writes, and what the command adds (sentinels, its
+// notes, a sha256 per part) is listed in the README. The app is unchanged by
+// this: it still converts in the browser and uploads nothing.
 // See src/cli/main.ts, or run `scrnaseq-lab --help`.
 //
 // This file is plain JavaScript on purpose. The modules it runs are TypeScript,
