@@ -70,14 +70,15 @@ const scanMod = await tryImport('../src/lib/scan.ts')
 const shard = await tryImport('../src/lib/shard.ts')
 const { categorical, fromFactor } = scanMod
 
-/** Run the real command. */
-function cli(args, env = {}) {
+/** Run the real command; a `timeout` (ms) kills it, and then `code` is null. */
+function cli(args, env = {}, timeout = undefined) {
+  const t0 = Date.now()
   const r = spawnSync(process.execPath, [BIN, ...args], {
-    encoding: 'utf8', env: { ...process.env, ...env }, maxBuffer: 64 << 20,
+    encoding: 'utf8', env: { ...process.env, ...env }, maxBuffer: 64 << 20, timeout,
   })
   let summary = null
   try { summary = JSON.parse(r.stdout) } catch { /* not a summary */ }
-  return { code: r.status, out: r.stdout ?? '', err: r.stderr ?? '', summary }
+  return { code: r.status, out: r.stdout ?? '', err: r.stderr ?? '', summary, seconds: (Date.now() - t0) / 1000 }
 }
 
 /** A finished file, unzipped: the index, and each part's entries and meta. */
@@ -94,9 +95,9 @@ function openOutput(path) {
 const tryOpen = (path) => { try { return openOutput(path) } catch { return null } }
 
 /** Convert, and open what was written. */
-function convert(input, name, args) {
+function convert(input, name, args, timeout = undefined) {
   const out = join(tmp, name)
-  const r = cli(['convert', input, out, ...args])
+  const r = cli(['convert', input, out, ...args], {}, timeout)
   if (r.code !== 0) console.log(`        (${name}: exit ${r.code})\n${r.err.split('\n').slice(-8).join('\n')}`)
   return { r, o: r.code === 0 ? tryOpen(out) : null, out }
 }
@@ -527,6 +528,88 @@ console.log('\nTHE BUDGETS COUNT WHAT meta.json WRITES, AND THE SECTION FILLS FA
   attempt("a tool's own provenance is written before *_provenance records that come earlier in uns",
     () => { const run = o.o.parts[0].meta.run; return [run.records.find(x => x.path === 'uns/scintegrate/provenance')?.record?.tool, run.leftOut] },
     ['scintegrate', { count: 1, paths: ['uns/a5_provenance'] }])
+}
+
+console.log('\nHARD LINKS CANNOT MAKE A SMALL RECORD AN ENDLESS READ')
+{
+  // Eighteen groups, each holding two hard links to the next: 2^17 paths in a
+  // small file, which read for minutes without finishing. 30 s is many times
+  // what the fixed reader needs; the old one is killed there.
+  const dag = copyWith(FIX.classic, 'dag.h5ad', f => {
+    const store = f.create_group('dagstore')
+    const levels = Array.from({ length: 18 }, (_v, i) => dict(store, `L${i}`))
+    str(levels[17], 'leaf', 'x')
+    for (let i = 0; i < 17; i++) for (const c of ['c0', 'c1']) levels[i].create_hard_link(`/dagstore/L${i + 1}`, c)
+    f.get('uns').create_hard_link('/dagstore/L0', 'dag_provenance')
+  })
+  const g = convert(dag, 'dag.zip', ['--label', 'dag'], 30_000)
+  attempt('a record whose groups are reached by many hard links converts, in seconds', () => [g.r.code, g.r.seconds < 30], [0, true])
+  const rec = () => g.o.parts[0].meta.run.records.find(x => x.path === 'uns/dag_provenance').record
+  attempt('each group is copied once; another link to it is named in place, not read again',
+    () => [typeof rec().c0, /^\(not copied: uns\/dag_provenance\/c1 is uns\/dag_provenance\/c0 again, reached by another link/.test(rec().c1)],
+    ['object', true])
+  attempt('and a note says so', () => g.o.parts[0].meta.notes.filter(s => /uns\/dag_provenance/.test(s) && /more than one link/.test(s)).length, 1)
+
+  // A group holding three hard links to itself.
+  const loop = copyWith(FIX.classic, 'loop.h5ad', f => {
+    const p = dict(f.get('uns'), 'loop_provenance')
+    str(p, 'tool', 'synthetic-tool')
+    for (const c of ['self0', 'self1', 'self2']) p.create_hard_link('/uns/loop_provenance', c)
+  })
+  const l = convert(loop, 'loop.zip', ['--label', 'loop'], 30_000)
+  attempt('a group that links to itself converts, in seconds', () => [l.r.code, l.r.seconds < 30], [0, true])
+  attempt('each link back to it is named in place, and the rest of the record copied',
+    () => {
+      const r = l.o.parts[0].meta.run.records.find(x => x.path === 'uns/loop_provenance').record
+      return [r.tool, ...['self0', 'self1', 'self2'].map(k => String(r[k]).startsWith(`(not copied: uns/loop_provenance/${k} is uns/loop_provenance again`))]
+    }, ['synthetic-tool', true, true, true])
+
+  // 10,050 datasets in one record: read to 10,000 groups and datasets, the
+  // rest named in one sentence.
+  const wide = copyWith(FIX.classic, 'wide.h5ad', f => {
+    const p = dict(f.get('uns'), 'wide_provenance')
+    for (let i = 0; i < 10_050; i++) p.create_dataset({ name: `d${String(i).padStart(5, '0')}`, data: 'x' })
+  })
+  const w = convert(wide, 'wide.zip', ['--label', 'wide'], 60_000)
+  attempt('a record is read to 10,000 groups and datasets, and the rest of it is named in one sentence',
+    () => {
+      const r = w.o.parts[0].meta.run.records.find(x => x.path === 'uns/wide_provenance').record
+      return [Object.keys(r).length, /^51 more entries of uns\/wide_provenance, past the 10,000 groups and datasets/.test(r['(not copied)'])]
+    }, [10_000, true])
+  attempt('and a note says so', () => w.o.parts[0].meta.notes.filter(s => /uns\/wide_provenance/.test(s) && /more than 10,000 groups and datasets/.test(s)).length, 1)
+}
+
+console.log("\nWITHIN A KIND, FIRST FIT IN uns ORDER; WHAT IS LEFT OUT IS NAMED LARGEST FIRST")
+{
+  // The annotator's record (250,000 bytes) comes before four 200,000-byte
+  // *_provenance records in uns. Filled smaller first, the four took the
+  // section and the annotator's record was left out.
+  const smaller = copyWith(FIX.classic, 'smaller.h5ad', f => {
+    const uns = f.get('uns')
+    for (let i = 0; i < 4; i++) str(uns, `z${i}_provenance`, 'x'.repeat(200_000))
+    const a = dict(uns, 'cell_type_provenance')
+    str(a, 'tool', 'annotator')
+    str(a, 'version', '1.0')
+    str(a, 'detail', 'y'.repeat(250_000))
+  })
+  const s = convert(smaller, 'smaller.zip', ['--label', 'smaller'])
+  attempt('a larger record earlier in uns is not left out for smaller ones after it',
+    () => { const run = s.o.parts[0].meta.run; return [run.records.find(x => x.path === 'uns/cell_type_provenance')?.record?.tool, run.leftOut] },
+    ['annotator', { count: 1, paths: ['uns/z3_provenance'] }])
+
+  // A hundred 12,000-byte `provenance` records earlier in uns than the
+  // integration stage's own, made 50,000 bytes here: they fill the section, the
+  // tool's record is left out, and it must be named. Listed in fill order,
+  // the first ten left out were all the small ones.
+  const flood = copyWith(FIX.classic, 'flood.h5ad', f => {
+    const uns = f.get('uns')
+    for (let i = 0; i < 100; i++) str(dict(uns, `g${String(i).padStart(3, '0')}`), 'provenance', 'x'.repeat(12_000))
+    str(f.get('uns/scintegrate/provenance'), 'notes', 'n'.repeat(50_000))
+  })
+  const fl = convert(flood, 'flood.zip', ['--label', 'flood'])
+  attempt("a tool's own record left out is named first among those left out",
+    () => { const lo = fl.o.parts[0].meta.run.leftOut; return [lo.count, lo.paths[0]] }, [15, 'uns/scintegrate/provenance'])
+  attempt('and the note names it first', () => fl.o.parts[0].meta.notes.some(n => /left out of run, largest first: uns\/scintegrate\/provenance,/.test(n)), true)
 }
 
 console.log('\nAN UNS ENTRY THAT CANNOT BE INSPECTED IS SAID, NOT FATAL')
