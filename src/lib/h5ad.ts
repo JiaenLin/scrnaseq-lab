@@ -539,19 +539,36 @@ export const RUN_SEARCHED = 'uns/harness_run; every entry of uns, and every chil
 const RUN_ARRAY_CAP = 10_000
 
 /**
- * The most JSON one record may take, in characters; past it the record is
- * named in place with its size, not copied.
+ * The most one record may take in meta.json, in bytes as written; past it the
+ * record is named in place with its size, not copied.
  *
  * The run section is written into every part of a split object, so a record
- * is paid for once per part. A tool's provenance is a few hundred characters
- * to a few tens of thousands (an annotator's per-label counts on an atlas);
- * a quarter of a million holds those with room to spare, and stops a record
+ * is paid for once per part. A tool's provenance is a few hundred bytes to a
+ * few tens of thousands (an annotator's per-label counts on an atlas); a
+ * quarter of a megabyte holds those with room to spare, and stops a record
  * that is really a result (a log, a table) from being copied forty times.
+ *
+ * Bytes as written, not compact JSON: meta.json is indented, one space a
+ * level, and an array of numbers written one per line takes several times
+ * its compact size.
  */
 export const RUN_RECORD_BUDGET = 262_144
 
-/** The most the whole run section may take, in characters of JSON; later records are named. */
+/**
+ * The most all the written records may take together, in bytes as written.
+ * Records that do not fit are left out, and one entry, `leftOut`, counts them.
+ */
 export const RUN_SECTION_BUDGET = 1_048_576
+
+/**
+ * Groups deeper than this below their record's own entry are named in place.
+ * Reading a chain of groups costs more at every level (800 levels took a
+ * minute and a half, 2,000 did not finish), and a run record is not that deep.
+ */
+export const RUN_MAX_DEPTH = 16
+
+/** Records read in full before the section is filled; beyond this, a record is read again if it is kept. */
+const RUN_HOLD = 8 * RUN_SECTION_BUDGET
 
 /**
  * HDF5 type classes JSON has no form for, named in place rather than copied:
@@ -643,10 +660,15 @@ function plainDataset(d: H5, path: string): unknown {
   return nest(Array.from(v as ArrayLike<unknown>, one), shape)
 }
 
-/** An uns entry as JSON: a dict as an object, in the order the file lists it. */
-function plain(o: H5, path: string): unknown {
+/**
+ * An uns entry as JSON: a dict as an object, in the order the file lists it.
+ * `depth` counts groups below the record's own entry; past RUN_MAX_DEPTH a
+ * group is named in place, unread.
+ */
+function plain(o: H5, path: string, depth = 0): unknown {
   if (isDataset(o)) return plainDataset(o, path)
   if (!isGroup(o)) return null
+  if (depth > RUN_MAX_DEPTH) return `(not copied: ${path} is nested more than ${RUN_MAX_DEPTH} groups below its record)`
   const strings = nullableStrings(o)
   if (strings) {
     return strings.values.length > RUN_ARRAY_CAP
@@ -655,8 +677,67 @@ function plain(o: H5, path: string): unknown {
   }
   if (!isDict(o)) return `(not copied: ${path} is a ${text(attr(o, 'encoding-type'))})`
   const out: Record<string, unknown> = {}
-  for (const k of o.keys() as string[]) out[k] = plain(o.get(k), `${path}/${k}`)
+  for (const k of o.keys() as string[]) out[k] = plain(o.get(k), `${path}/${k}`, depth + 1)
   return out
+}
+
+/**
+ * The bytes a string takes in meta.json: UTF-8, quoted, escaped as
+ * JSON.stringify escapes it (a lone surrogate as \uXXXX).
+ */
+function stringBytes(s: string): number {
+  let b = 2
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c === 0x22 || c === 0x5c) b += 2
+    else if (c < 0x20) b += c === 8 || c === 9 || c === 10 || c === 12 || c === 13 ? 2 : 6
+    else if (c < 0x80) b += 1
+    else if (c < 0x800) b += 2
+    else if (c >= 0xd800 && c <= 0xdbff) {
+      const d = s.charCodeAt(i + 1)
+      if (d >= 0xdc00 && d <= 0xdfff) { b += 4; i++ } else b += 6
+    } else if (c >= 0xdc00 && c <= 0xdfff) b += 6
+    else b += 3
+  }
+  return b
+}
+
+/**
+ * The bytes a value takes in meta.json, which the builder writes as
+ * JSON.stringify(meta, null, 1): at nesting `depth`, each member on its own
+ * line indented depth + 1 spaces, the closing bracket on a line indented
+ * `depth`. Counted, not written out, so a 50 MB record is measured without a
+ * second 50 MB string. A record sits at depth 4 (meta, run, records, entry).
+ */
+function writtenSize(v: unknown, depth: number): number {
+  if (Array.isArray(v)) {
+    if (!v.length) return 2
+    let s = v.length * (depth + 3) + depth + 2
+    for (const x of v) s += writtenSize(x, depth + 1)
+    return s
+  }
+  if (v !== null && typeof v === 'object') {
+    const keys = Object.keys(v).filter(k => (v as Record<string, unknown>)[k] !== undefined)
+    if (!keys.length) return 2
+    let s = keys.length * (depth + 5) + depth + 2
+    for (const k of keys) s += stringBytes(k) + writtenSize((v as Record<string, unknown>)[k], depth + 1)
+    return s
+  }
+  if (typeof v === 'string') return stringBytes(v)
+  // Numbers, booleans and null are ASCII; anything else JSON cannot hold
+  // throws here, which fails its record and never the conversion.
+  const json = JSON.stringify(v ?? null)
+  if (json === undefined) throw new Error(`a ${typeof v} has no JSON form`)
+  return json.length
+}
+
+/** What one entry of run.records adds to meta.json: the record at depth 4, its path, the punctuation. */
+const entryBytes = (path: string, record: unknown) => 40 + stringBytes(path) + writtenSize(record, 4)
+
+/** Paths for a sentence: the first ten, then a count. */
+function some(paths: string[]): string {
+  const shown = paths.slice(0, 10).join(', ')
+  return paths.length > 10 ? `${shown} and ${(paths.length - 10).toLocaleString('en-US')} more` : shown
 }
 
 /** Does this group name provenance in its own `schema` string? */
@@ -671,70 +752,133 @@ function schemaSaysProvenance(o: H5): boolean {
 }
 
 /**
- * Every record of the run the object carries, in uns order.
+ * Every record of the run the object carries.
  *
- * A record that cannot be read is listed with a null record and a note, never
- * dropped: an absent entry would read as "this object has no such record". A
- * record past RUN_RECORD_BUDGET, or one that would take the section past
- * RUN_SECTION_BUDGET, is listed as a sentence naming its size.
+ * Found in uns order, then read, measured as meta.json will hold it, and
+ * written in uns order. What is written is decided in a fair order, so that
+ * nothing earlier in uns can push out a tool's own record: the harness's run
+ * record first, then each `provenance`, then each `*_provenance`, then the
+ * records known by their schema; within each kind the smaller first, uns order
+ * breaking ties. A record over RUN_RECORD_BUDGET is written as a sentence
+ * naming its size. Once the next record would take the section past
+ * RUN_SECTION_BUDGET, it and every record after it are left out, and one
+ * entry, `leftOut`, and one note cover them all.
+ *
+ * Nothing found here can stop the conversion. An uns entry that cannot even be
+ * inspected, a record that cannot be read, and a value JSON cannot hold are
+ * each said in one note, never thrown.
  */
 function readRun(uns: H5, note: (s: string) => void): RunSection {
   const records: RunRecord[] = []
   if (!isGroup(uns)) return { searched: RUN_SEARCHED, records }
   const named = (k: string) => k === 'provenance' || k.endsWith('_provenance')
+  const kindOf = (k: string) => (k === 'provenance' ? 1 : 2)
   const n = (x: number) => x.toLocaleString('en-US')
-  let spent = 0
-  const take = (path: string, read: () => unknown) => {
-    let record: unknown
-    let size: number
-    try {
-      record = read() ?? null
-      // Serialised here, inside the try, because the bundle's meta.json is
-      // written by JSON.stringify too: anything JSON cannot hold must fail
-      // this record, never the conversion.
-      size = JSON.stringify(record).length
-    } catch (e) {
-      note(`${path} could not be read (${(e as Error).message}); run lists it without its content`)
-      records.push({ path, record: null })
-      return
-    }
-    if (size > RUN_RECORD_BUDGET) {
-      record = `(not copied: ${n(size)} characters of JSON, over the ${n(RUN_RECORD_BUDGET)} one record may take)`
-      note(`${path} is ${n(size)} characters of JSON, over the ${n(RUN_RECORD_BUDGET)} budget for one record, so run names it with its size instead of copying it into every part`)
-    } else if (spent + size > RUN_SECTION_BUDGET) {
-      record = `(not copied: ${n(size)} characters of JSON; the run section had reached its ${n(RUN_SECTION_BUDGET)} budget)`
-      note(`${path} (${n(size)} characters of JSON) would take the run section past its ${n(RUN_SECTION_BUDGET)} budget, so run names it with its size instead of copying it`)
-    }
-    spent += JSON.stringify(record).length
-    records.push({ path, record })
-  }
+
+  // ---- found, in uns order; each entry inspected on its own -------------
+  type Found = { path: string; kind: number; read: (say: (s: string) => void) => unknown }
+  const found: Found[] = []
+  const uninspected: string[] = []
+  let why = ''
   for (const k of uns.keys() as string[]) {
     const path = `uns/${k}`
-    let o: H5
-    try { o = uns.get(k) } catch { continue }
-    if (!o) continue
-    if (k === 'harness_run') {
-      // The harness's record is one JSON string. Parsed, so that it reads as
-      // the structure it is; kept as its text when it does not parse.
-      take(path, () => {
-        const v = plain(o, path)
-        if (typeof v !== 'string') return v
-        try {
-          return JSON.parse(v)
-        } catch {
-          note(`${path} is not JSON, so it travels in run as its text`)
-          return v
+    try {
+      const o = uns.get(k)
+      if (!o) continue
+      if (k === 'harness_run') {
+        // The harness's record is one JSON string. Parsed, so that it reads
+        // as the structure it is; kept as its text when it does not parse.
+        found.push({ path, kind: 0, read: say => {
+          const v = plain(o, path)
+          if (typeof v !== 'string') return v
+          try {
+            return JSON.parse(v)
+          } catch {
+            say(`${path} is not JSON, so it travels in run as its text`)
+            return v
+          }
+        } })
+      } else if (named(k)) {
+        found.push({ path, kind: kindOf(k), read: () => plain(o, path) })
+      } else if (schemaSaysProvenance(o)) {
+        found.push({ path, kind: 3, read: () => plain(o, path) })
+      } else if (isDict(o)) {
+        for (const c of o.keys() as string[]) {
+          if (named(c)) found.push({ path: `${path}/${c}`, kind: kindOf(c), read: () => plain(o.get(c), `${path}/${c}`) })
         }
-      })
-    } else if (named(k) || schemaSaysProvenance(o)) {
-      take(path, () => plain(o, path))
-    } else if (isDict(o)) {
-      for (const c of o.keys() as string[]) {
-        if (named(c)) take(`${path}/${c}`, () => plain(o.get(c), `${path}/${c}`))
       }
+    } catch (e) {
+      // An attribute h5wasm cannot read (float16), a broken link: this entry
+      // cannot be classified, and the conversion goes on without it.
+      uninspected.push(path)
+      why ||= (e as Error).message
     }
   }
-  return { searched: RUN_SEARCHED, records }
+
+  // ---- read and measured ---------------------------------------------------
+  type Read = { at: number; size: number; record?: unknown; failed?: string }
+  const read: Read[] = []
+  let held = 0
+  found.forEach((f, at) => {
+    try {
+      const record = f.read(note) ?? null
+      const size = writtenSize(record, 4)
+      // Held for the filling below while it stays small; a record not held is
+      // read again if it is written.
+      const hold = size <= RUN_RECORD_BUDGET && held + size <= RUN_HOLD
+      if (hold) held += size
+      read.push({ at, size, ...(hold ? { record } : {}) })
+    } catch (e) {
+      read.push({ at, size: 0, failed: (e as Error).message })
+    }
+  })
+
+  // ---- filled, in the fair order -------------------------------------------
+  const order = [...read].sort((a, b) => found[a.at].kind - found[b.at].kind || a.size - b.size || a.at - b.at)
+  const written = new Map<number, unknown>()
+  const failed: string[] = []
+  const tooBig: string[] = []
+  const leftOut: string[] = []
+  let spent = 0
+  for (const r of order) {
+    const path = found[r.at].path
+    if (leftOut.length) { leftOut.push(path); continue }
+    let record: unknown = null
+    if (r.failed === undefined && r.size > RUN_RECORD_BUDGET) {
+      record = `(not copied: ${n(r.size)} bytes as written, over the ${n(RUN_RECORD_BUDGET)}-byte budget for one record)`
+    } else if (r.failed === undefined) {
+      try {
+        record = 'record' in r ? r.record : (found[r.at].read(() => {}) ?? null)
+      } catch (e) {
+        r.failed = (e as Error).message
+      }
+    }
+    const cost = entryBytes(path, record)
+    if (spent + cost > RUN_SECTION_BUDGET) { leftOut.push(path); continue }
+    spent += cost
+    written.set(r.at, record)
+    if (r.failed !== undefined) failed.push(path)
+    else if (r.size > RUN_RECORD_BUDGET) tooBig.push(path)
+  }
+  for (const r of read) if (written.has(r.at)) records.push({ path: found[r.at].path, record: written.get(r.at) })
+
+  // ---- said, once each -------------------------------------------------------
+  if (uninspected.length) {
+    note(`${some(uninspected)} could not be inspected (${why}), so the run section cannot tell whether ${uninspected.length > 1 ? 'they hold records' : 'it holds a record'}`)
+  }
+  if (failed.length) {
+    note(`${some(failed)} could not be read; run lists ${failed.length > 1 ? 'them' : 'it'} with no content`)
+  }
+  if (tooBig.length) {
+    note(`${some(tooBig)} ${tooBig.length > 1 ? 'are' : 'is'} over the ${n(RUN_RECORD_BUDGET)}-byte budget for one record as meta.json writes it, so run names ${tooBig.length > 1 ? 'each' : 'it'} with its size instead of copying it into every part`)
+  }
+  if (leftOut.length) {
+    note(`${n(leftOut.length)} record${leftOut.length > 1 ? 's were' : ' was'} left out of run (${some(leftOut)}): the section had reached its ${n(RUN_SECTION_BUDGET)}-byte budget, filled with the harness's run record first, then each provenance, then *_provenance, then records known by their schema, the smaller first`)
+  }
+  return {
+    searched: RUN_SEARCHED, records,
+    ...(leftOut.length ? { leftOut: { count: leftOut.length, paths: leftOut.slice(0, 10) } } : {}),
+  }
 }
 
 export interface H5Module {

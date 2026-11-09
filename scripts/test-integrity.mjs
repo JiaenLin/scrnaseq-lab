@@ -59,6 +59,7 @@ const FIX = {
   dflt: here('./fixtures/family-2x2-default.h5ad'),
   mask: here('./fixtures/nullable-mask.h5ad'),
   records: here('./fixtures/uns-records.h5ad'),
+  unreadable: here('./fixtures/uns-unreadable.h5ad'),
 }
 const BIN = here('../bin/scrnaseq-lab.mjs')
 const tmp = mkdtempSync(join(tmpdir(), 'lab-integrity-test-'))
@@ -435,8 +436,8 @@ console.log('\nA RECORD IS COPIED AS FAR AS JSON CAN HOLD IT, AND THE REST IS NA
 console.log('\nA RECORD PAST ITS BUDGET IS NAMED WITH ITS SIZE, NOT COPIED INTO EVERY PART')
 {
   // The run section is written into every part of a split object, so what one
-  // record and the whole section may take is bounded: 262,144 characters of
-  // JSON for a record, 1,048,576 for the section.
+  // record and the whole section may take is bounded, in bytes as meta.json
+  // writes them: 262,144 for a record, 1,048,576 for the section.
   const big = copyWith(FIX.classic, 'big-record.h5ad', f => {
     const p = dict(f.get('uns'), 'log_provenance')
     str(p, 'log', 'x'.repeat(400_000))
@@ -444,8 +445,8 @@ console.log('\nA RECORD PAST ITS BUDGET IS NAMED WITH ITS SIZE, NOT COPIED INTO 
   })
   const b = convert(big, 'big-record.zip', ['--label', 'big'])
   const run = b.o?.parts[0].meta.run
-  attempt('a record over 262,144 characters of JSON is named in place, with its size',
-    () => { const r = run.records.find(x => x.path === 'uns/log_provenance').record; return [typeof r, /400,0\d\d characters/.test(r), /262,144/.test(r)] },
+  attempt('a record over 262,144 bytes as written is named in place, with its size',
+    () => { const r = run.records.find(x => x.path === 'uns/log_provenance').record; return [typeof r, /400,0\d\d bytes as written/.test(r), /262,144/.test(r)] },
     ['string', true, true])
   attempt('the record under the budget is still copied',
     () => run.records.find(x => x.path === 'uns/scintegrate/provenance').record.tool, 'scintegrate')
@@ -453,19 +454,92 @@ console.log('\nA RECORD PAST ITS BUDGET IS NAMED WITH ITS SIZE, NOT COPIED INTO 
     () => b.o.parts[0].meta.notes.filter(s => s.includes('uns/log_provenance') && /budget/.test(s)).length, 1)
   attempt('so meta.json stays small', () => b.o.parts[0].files['meta.json'].length < 20_000, true)
 
-  // Six records of 200,010 characters each, every one under the record budget:
+  // Six records of about 200,000 bytes each, every one under the record budget:
   // after the fixture's own record and five of them, the sixth would pass the
-  // section's budget.
+  // section's budget, and is left out.
   const many = copyWith(FIX.classic, 'many-records.h5ad', f => {
     const uns = f.get('uns')
     for (let i = 1; i <= 6; i++) str(dict(uns, `z${i}_provenance`), 'log', 'y'.repeat(200_000))
   })
   const m = convert(many, 'many-records.zip', ['--label', 'many'])
-  attempt('records are copied until the section would pass 1,048,576 characters; the rest are named',
-    () => m.o.parts[0].meta.run.records.map(x => `${x.path}:${typeof x.record === 'string' ? 'named' : 'copied'}`),
-    ['uns/scintegrate/provenance:copied', 'uns/z1_provenance:copied', 'uns/z2_provenance:copied',
-      'uns/z3_provenance:copied', 'uns/z4_provenance:copied', 'uns/z5_provenance:copied', 'uns/z6_provenance:named'])
+  attempt('records are copied until the section would pass 1,048,576 bytes; the rest are left out, in one entry',
+    () => { const r = m.o.parts[0].meta.run; return [r.records.map(x => `${x.path}:${typeof x.record === 'string' ? 'named' : 'copied'}`), r.leftOut] },
+    [['uns/scintegrate/provenance:copied', 'uns/z1_provenance:copied', 'uns/z2_provenance:copied',
+      'uns/z3_provenance:copied', 'uns/z4_provenance:copied', 'uns/z5_provenance:copied'], { count: 1, paths: ['uns/z6_provenance'] }])
   attempt('so meta.json stays under the section budget and a little more', () => m.o.parts[0].files['meta.json'].length < 1_100_000, true)
+}
+
+console.log('\nTHE BUDGETS COUNT WHAT meta.json WRITES, AND THE SECTION FILLS FAIRLY')
+{
+  /** int8 arrays of zeros, in anndata's array encoding. */
+  const zeros = (g, name) => enc(g.create_dataset({ name, data: new Int8Array(10_000) }), 'array', '0.2.0')
+
+  // Four records of 13 x 10,000 zeros: about 260,000 characters of compact
+  // JSON each, under the budget, but meta.json writes one number a line, and
+  // the four of them came to 4.7 MB.
+  const flat = copyWith(FIX.classic, 'written.h5ad', f => {
+    for (let r = 1; r <= 4; r++) {
+      const p = dict(f.get('uns'), `w${r}_provenance`)
+      for (let i = 0; i < 13; i++) zeros(p, `z${String(i).padStart(2, '0')}`)
+    }
+  })
+  const w = convert(flat, 'written.zip', ['--label', 'written'])
+  attempt('a record under the budget as compact JSON but over it as written is named with its written size',
+    () => w.o.parts[0].meta.run.records.filter(x => /^w\d/.test(x.path.slice(4)))
+      .map(x => /^\(not copied: [\d,]+ bytes as written, over the 262,144-byte budget/.test(x.record)),
+    [true, true, true, true])
+  attempt('so meta.json stays small', () => w.o.parts[0].files['meta.json'].length < 20_000, true)
+
+  // A record forty groups deep: read to sixteen, named below that.
+  const deep = copyWith(FIX.classic, 'deep.h5ad', f => {
+    let g = dict(f.get('uns'), 'deep_provenance')
+    for (let i = 0; i < 40; i++) g = dict(g, 'a')
+    str(g, 'leaf', 'x')
+  })
+  const d = convert(deep, 'deep.zip', ['--label', 'deep'])
+  attempt('a record is read sixteen groups deep, and what lies deeper is named in place',
+    () => {
+      let at = d.o.parts[0].meta.run.records.find(x => x.path === 'uns/deep_provenance').record
+      for (let i = 0; i < 16; i++) at = at.a
+      return [typeof at, /^\(not copied: .*nested more than 16 groups below its record/.test(at.a)]
+    }, ['object', true])
+
+  // 400 records of 3,000 bytes: about a sixth do not fit.
+  const crowd = copyWith(FIX.classic, 'crowd.h5ad', f => {
+    const uns = f.get('uns')
+    for (let i = 0; i < 400; i++) str(uns, `r${String(i).padStart(3, '0')}_provenance`, 'x'.repeat(3_000))
+  })
+  const c = convert(crowd, 'crowd.zip', ['--label', 'crowd'])
+  attempt('once the section is full, one entry counts every record left out, and no record is written as "not copied"',
+    () => {
+      const run = c.o.parts[0].meta.run
+      return [run.records.length - 1 + run.leftOut.count, run.leftOut.paths.length,
+        run.records.filter(x => typeof x.record === 'string' && x.record.startsWith('(not copied')).length]
+    }, [400, 10, 0])
+  attempt('and one note says so', () => c.o.parts[0].meta.notes.filter(s => /left out of run/.test(s)).length, 1)
+
+  // Five records of 250,002 bytes, each under the record budget, all before
+  // the tool's own record in uns order: filled in uns order, they pushed it out.
+  const first = copyWith(FIX.classic, 'first.h5ad', f => {
+    for (let i = 1; i <= 5; i++) str(f.get('uns'), `a${i}_provenance`, 'q'.repeat(250_000))
+  })
+  const o = convert(first, 'first.zip', ['--label', 'first'])
+  attempt("a tool's own provenance is written before *_provenance records that come earlier in uns",
+    () => { const run = o.o.parts[0].meta.run; return [run.records.find(x => x.path === 'uns/scintegrate/provenance')?.record?.tool, run.leftOut] },
+    ['scintegrate', { count: 1, paths: ['uns/a5_provenance'] }])
+}
+
+console.log('\nAN UNS ENTRY THAT CANNOT BE INSPECTED IS SAID, NOT FATAL')
+{
+  // scripts/fixtures/uns-unreadable.h5ad: a group whose encoding-type
+  // attribute is float16, which h5wasm cannot read. Classifying it stopped the
+  // conversion with exit 1.
+  const u = convert(FIX.unreadable, 'unreadable.zip', ['--label', 'unreadable'])
+  check('it converts', u.r.code, 0)
+  attempt('a note names the entry and why it could not be inspected',
+    () => u.o.parts[0].meta.notes.filter(s => s.includes('uns/plain_group') && /could not be inspected/.test(s) && /Float16/.test(s)).length, 1)
+  attempt('and the record beside it is still copied',
+    () => u.o.parts[0].meta.run.records.map(x => [x.path, x.record?.tool]), [['uns/x_provenance', 'synthetic-tool']])
 }
 
 // ===========================================================================

@@ -92,8 +92,14 @@ export interface RunRecord {
 export interface RunSection {
   /** Where the reader looked, so that an empty list can be read exactly. */
   searched: string
-  /** Every record found, in uns order. Empty: the object carries none. */
+  /** The records written, in uns order. Empty: the object carries none. */
   records: RunRecord[]
+  /**
+   * The records found but not written, because the section had reached its
+   * budget: how many, and the first few paths. One entry for all of them.
+   * Absent when every record found is in `records`.
+   */
+  leftOut?: { count: number; paths: string[] }
 }
 
 /** What a list of gene names is made of, judged by the names themselves. */

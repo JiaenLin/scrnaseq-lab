@@ -20,7 +20,7 @@
 # plus the annotator's two sentinel labels, EXCLUDED and UNRESOLVED, among the
 # cell types, because a real final object has them.
 #
-# Five files:
+# Six files:
 #
 #   family-2x2.h5ad          two crossed factors, 2 samples per arm, written the
 #                            way the family's emitters write (classic strings)
@@ -44,6 +44,10 @@
 #                            reference, uint64 past 2**53, NaN and infinities,
 #                            a dataframe). h5wasm writes none of these, so the
 #                            test cannot make them itself.
+#   uns-unreadable.h5ad      a tiny object with an uns entry h5wasm cannot even
+#                            inspect: a group whose encoding-type attribute is
+#                            float16. Classifying it once stopped the conversion;
+#                            anndata itself refuses to read the file.
 #
 # Pinned to what the family runs: anndata 0.13.2, pandas 3.0.5. With uv:
 #
@@ -214,3 +218,18 @@ write(R, out_dir / "uns-records.h5ad", classic=True)
 with h5py.File(out_dir / "uns-records.h5ad", "r+") as f:
     f["uns/odd_provenance"].create_dataset("ref", data=f["uns"].ref, dtype=h5py.ref_dtype, track_times=False)
 print(f"added uns/odd_provenance/ref: uns-records.h5ad is {(out_dir / 'uns-records.h5ad').stat().st_size} bytes")
+
+# ---- an uns entry that cannot be inspected ----------------------------------
+# Written last, so the five files above keep their bytes.
+U = ad.AnnData(X=sp.csr_matrix(rng.poisson(2.0, size=(m, 4)).astype(np.float32)),
+               obs=pd.DataFrame({"cell_type": pd.Categorical(["TypeA", "TypeB"] * (m // 2))},
+                                index=[f"c{i}" for i in range(m)]),
+               var=pd.DataFrame(index=[f"Gene{j + 1:03d}" for j in range(4)]))
+U.obsm["X_umap"] = rng.normal(size=(m, 2)).astype(np.float32)
+U.uns["x_provenance"] = {"tool": "synthetic-tool", "version": "0.0.0+fixture"}
+write(U, out_dir / "uns-unreadable.h5ad", classic=True)
+# anndata writes no float16 attribute; h5py adds a group carrying one.
+with h5py.File(out_dir / "uns-unreadable.h5ad", "r+") as f:
+    g = f["uns"].create_group("plain_group", track_order=False)
+    g.attrs["encoding-type"] = np.arange(3, dtype=np.float16)
+print(f"added uns/plain_group: uns-unreadable.h5ad is {(out_dir / 'uns-unreadable.h5ad').stat().st_size} bytes")
