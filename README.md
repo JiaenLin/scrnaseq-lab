@@ -143,10 +143,18 @@ that calls itself provenance:
   if it is not JSON).
 
 Each record keeps the tool's own field names and values. An integration stage's, for
-example, carries its version, commit, job and arguments. When the object carries none,
-`run.records` is empty and a note says so; `run.searched` says where the lab looked. A
-Seurat object has no `uns`, so its bundle has no `run`. Readers that do not know the field
-ignore it.
+example, carries its version, commit, job and arguments. A structured array is copied row
+by row, under its field names. When the object carries none, `run.records` is empty and a
+note says so; `run.searched` says where the lab looked. A Seurat object has no `uns`, so its
+bundle has no `run`. Readers that do not know the field ignore it.
+
+Some things are named in place, with a note, rather than copied:
+
+- **What JSON has no form for:** float16, an HDF5 reference, opaque bytes, a dataframe or a
+  sparse matrix. The rest of the record is still copied.
+- **A record too large to copy into every part:** the section goes into every part of a
+  split object. A record over 262,144 characters of JSON is named with its size, and so is
+  any record that would take the whole section past 1,048,576.
 
 **Both namings of the genes.** `genes.txt` is whatever the matrix rows are indexed by —
 `ENSMUSG00000038751` as often as `Sox2` — and `meta.geneIdKind` says which, judged from the
@@ -310,7 +318,8 @@ made-up names, and Python is needed only to regenerate them:
 `scripts/test-integrity.mjs` converts copies of them that it edits itself through h5wasm. It
 checks that every cell keeps its condition, that the run's record travels, and that only
 two-column embeddings are offered. It also checks that nothing else in the fixture's bundle
-moved.
+moved. `uns-records.h5ad` holds the run records h5wasm cannot write: a structured array with
+an int64 field, float16, and an HDF5 reference.
 
 ## Known limits
 
