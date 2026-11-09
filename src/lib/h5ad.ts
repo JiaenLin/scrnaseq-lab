@@ -12,7 +12,7 @@
 
 import {
   categorical, fromFactor, internGeneSet, maybeDiscrete, numeric, pickGeneAlias,
-  type Column, type EmbeddingRef, type GeneAlias, type MatrixRef, type Scan,
+  type Column, type EmbeddingRef, type GeneAlias, type MatrixRef, type RunRecord, type RunSection, type Scan,
 } from './scan.ts'
 import { classify, dropZeros, stridedSample, type CellMajor } from './matrix.ts'
 
@@ -519,6 +519,146 @@ function sampleMatrix(m: H5, want = 20000): Float64Array {
   return vals.length ? Float64Array.from(vals) : stridedSample(n, want, i => Number(d.slice([[i, i + 1]])[0]))
 }
 
+// ---------------------------------------------------------------------------
+// The run's own record.
+//
+// An object says in uns what made it, and every tool says it in its own place:
+// the integration stage under uns/<tool>/provenance, the annotator as
+// uns/<column>_provenance, the QC stage as a group whose schema names
+// provenance, and the harness's run record (when there is one) as a JSON
+// string in uns/harness_run. The reader cannot know every tool, so it names
+// none: a record is what calls itself provenance, by its key or by its own
+// schema, at the top of uns or one level down. Deeper than that is inside some
+// other record, not a record of the run. What it finds is copied, not
+// summarised — a summary would decide which of a tool's fields matter.
+
+/** Where the reader looks for the run's record. Written into the bundle beside what it found. */
+export const RUN_SEARCHED = 'uns/harness_run; every entry of uns, and every child of a dict directly under uns, named provenance or *_provenance; every dict directly under uns whose own schema names provenance'
+
+/** Arrays longer than this are named in a record rather than copied into it. */
+const RUN_ARRAY_CAP = 10_000
+
+/**
+ * A dict in anndata's layout, or a plain group from a writer that names no encoding.
+ *
+ * (Tailwind reads this directory for class names, so a variable here is never
+ * called `t` and negated: the app has a `t` class, and the scan took the
+ * negation for its important variant and shipped it as CSS.)
+ */
+const isDict = (g: H5): boolean => {
+  const encoding = text(attr(g, 'encoding-type') ?? '')
+  return isGroup(g) && (encoding === '' || encoding === 'dict')
+}
+
+/** One stored value as JSON can hold it: int64 as a number, NaN as "NaN". */
+function jsonValue(v: unknown): unknown {
+  if (typeof v === 'bigint') {
+    return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v.toString()
+  }
+  if (typeof v === 'number') return Number.isFinite(v) ? v : String(v)
+  if (v instanceof Uint8Array) return new TextDecoder().decode(v)
+  return v ?? null
+}
+
+/** A flat list back into the dataset's shape, row-major. */
+function nest(flat: unknown[], shape: number[]): unknown[] {
+  if (shape.length <= 1) return flat
+  const step = shape.slice(1).reduce((a, b) => a * b, 1)
+  const out: unknown[] = []
+  for (let i = 0; i < flat.length; i += step) out.push(nest(flat.slice(i, i + step), shape.slice(1)))
+  return out
+}
+
+/** A dataset as JSON: a scalar as itself, an array as a list (nested by shape). */
+function plainDataset(d: H5, path: string): unknown {
+  const shape = (d.shape as number[] | undefined) ?? []
+  const size = shape.reduce((a, b) => a * b, 1)
+  if (size > RUN_ARRAY_CAP) return `(not copied: ${path} holds ${size.toLocaleString('en-US')} values)`
+  const v = d.value
+  if (v == null) return `(not copied: ${path} is of a type this reader cannot read)`
+  // h5py stores a numpy bool as an HDF5 enum of FALSE and TRUE, and h5wasm
+  // hands back the integer. It was a boolean when it was written.
+  const members = d.metadata?.enum_type?.members as Record<string, number> | undefined
+  const bool = !!members && Object.keys(members).length === 2 && 'TRUE' in members && 'FALSE' in members
+  const one = (x: unknown) => (bool ? Number(x) === members!.TRUE : jsonValue(x))
+  if (!shape.length) return one(typeof v === 'object' && v !== null && 'length' in v ? (v as ArrayLike<unknown>)[0] : v)
+  return nest(Array.from(v as ArrayLike<unknown>, one), shape)
+}
+
+/** An uns entry as JSON: a dict as an object, in the order the file lists it. */
+function plain(o: H5, path: string): unknown {
+  if (isDataset(o)) return plainDataset(o, path)
+  if (!isGroup(o)) return null
+  const strings = nullableStrings(o)
+  if (strings) {
+    return strings.values.length > RUN_ARRAY_CAP
+      ? `(not copied: ${path} holds ${strings.values.length.toLocaleString('en-US')} values)`
+      : strings.values.map((s, i) => (strings.mask[i] ? null : s))
+  }
+  if (!isDict(o)) return `(not copied: ${path} is a ${text(attr(o, 'encoding-type'))})`
+  const out: Record<string, unknown> = {}
+  for (const k of o.keys() as string[]) out[k] = plain(o.get(k), `${path}/${k}`)
+  return out
+}
+
+/** Does this group name provenance in its own `schema` string? */
+function schemaSaysProvenance(o: H5): boolean {
+  if (!isDict(o)) return false
+  try {
+    const s = o.get('schema')
+    return isDataset(s) && /provenance/i.test(text(s.value))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Every record of the run the object carries, in uns order.
+ *
+ * A record that cannot be read is listed with a null record and a note, never
+ * dropped: an absent entry would read as "this object has no such record".
+ */
+function readRun(uns: H5, note: (s: string) => void): RunSection {
+  const records: RunRecord[] = []
+  if (!isGroup(uns)) return { searched: RUN_SEARCHED, records }
+  const named = (k: string) => k === 'provenance' || k.endsWith('_provenance')
+  const take = (path: string, read: () => unknown) => {
+    try {
+      records.push({ path, record: read() })
+    } catch (e) {
+      note(`${path} could not be read (${(e as Error).message}); run lists it without its content`)
+      records.push({ path, record: null })
+    }
+  }
+  for (const k of uns.keys() as string[]) {
+    const path = `uns/${k}`
+    let o: H5
+    try { o = uns.get(k) } catch { continue }
+    if (!o) continue
+    if (k === 'harness_run') {
+      // The harness's record is one JSON string. Parsed, so that it reads as
+      // the structure it is; kept as its text when it does not parse.
+      take(path, () => {
+        const v = plain(o, path)
+        if (typeof v !== 'string') return v
+        try {
+          return JSON.parse(v)
+        } catch {
+          note(`${path} is not JSON, so it travels in run as its text`)
+          return v
+        }
+      })
+    } else if (named(k) || schemaSaysProvenance(o)) {
+      take(path, () => plain(o, path))
+    } else if (isDict(o)) {
+      for (const c of o.keys() as string[]) {
+        if (named(c)) take(`${path}/${c}`, () => plain(o.get(c), `${path}/${c}`))
+      }
+    }
+  }
+  return { searched: RUN_SEARCHED, records }
+}
+
 export interface H5Module {
   ready: Promise<{ FS: H5 }>
   File: new (name: string, mode: string) => H5
@@ -659,10 +799,11 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
     doublets: obsNames.find(n => /doublet|scrublet/i.test(n)) ?? null,
     ambient: unsKeys.find(k => /soupx|cellbender|decontx/i.test(k)) ?? null,
   }
+  const run = readRun(uns, note)
 
   return {
     format: 'h5ad', source: filename, nCells, columns, matrices, embeddings,
-    geneSets, geneAliases, provenance, notes,
+    geneSets, geneAliases, provenance, run, notes,
   }
 }
 

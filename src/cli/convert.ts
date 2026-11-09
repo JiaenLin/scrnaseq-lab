@@ -22,7 +22,9 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
-import { BuildError, buildBundle, streamableMatrix, type BundleMeta, type BuildResult } from '../lib/build.ts'
+import {
+  BuildError, buildBundle, oneConditionPerSample, streamableMatrix, type BundleMeta, type BuildResult,
+} from '../lib/build.ts'
 import { COLLECTION_SCHEMA, collectionPieces, type CollectionMeta, type PartInfo } from '../lib/collection.ts'
 import { H5adError, scanOpenH5ad } from '../lib/h5ad.ts'
 import type { CellMajor } from '../lib/matrix.ts'
@@ -176,6 +178,13 @@ export async function convert(a: ConvertArgs, say: (line: string) => void): Prom
     const split = chooseSplit(scan.columns, measurable?.nnzPerCell ? measurable.nnzPerCell() : null, scan.nCells)
     scan.columns.push(...r.added)
     scan.notes.push(...r.notes)
+
+    // A sample whose cells hold more than one condition becomes one sample per
+    // condition, decided here on the whole object so that every part of a
+    // split names it the same way. Said on the terminal as well as in the notes.
+    const said = scan.notes.length
+    scan = oneConditionPerSample(scan, choices)
+    for (const line of scan.notes.slice(said)) say(`note: ${line}`)
 
     const parked: { file: string; tmp: string }[] = []
     const partInfo: Index['parts'] = []

@@ -469,7 +469,7 @@ console.log('\nCOPIES ARE FOUND ON THE WHOLE OBJECT')
     return [[0, 1, 2, 3], [4, 5, 6, 7]].map((cells, k) =>
       openBuilt(build.buildBundle(partOf(parent, `p${k}`, cells), { ...CHOICES, condition: null })).meta.embeddings.map(e => e.key))
   }
-  attempt('two embeddings equal in one part\'s cells but not the whole object\'s are both kept, in every part (guard)',
+  attempt('two embeddings equal in one part\'s cells but not the whole object\'s are both kept, in every part',
     () => decide(near), [['umap', 'tsne_a', 'tsne_b'], ['umap', 'tsne_a', 'tsne_b']])
   attempt('a copy over the whole object is dropped from every part',
     () => decide(b), [['umap', 'tsne_a'], ['umap', 'tsne_a']])
@@ -509,7 +509,7 @@ console.log('\nNOTHING ELSE IN THE FIXTURE\'S BUNDLE CHANGED (against 51a00fa)')
     () => sha256(JSON.stringify(g.meta.notes.filter(s => !/embedding/i.test(s) && !/\buns\b/.test(s)))),
     '669678f83b4aefc8cf3835f130fe3e22aee382e190f9d084df9f515d586f892f')
   attempt('collection.json is the same but for embeddings, notes and the part\'s bytes and sha256 (guard)', () => {
-    const ix = { ...G.o.index, parts: G.o.index.parts.map(({ bytes, sha256: _s, ...q }) => q) }
+    const ix = { ...G.o.index, parts: G.o.index.parts.map(({ bytes: _b, sha256: _s, ...q }) => q) }
     delete ix.embeddings; delete ix.notes
     return sha256(JSON.stringify(ix))
   }, 'a9985a264cf4021d54153cc03fa2bb5ba1d901804355295cfac697d2f3380cc4')

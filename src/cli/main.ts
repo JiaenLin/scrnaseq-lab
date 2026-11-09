@@ -33,6 +33,12 @@ guessed, and the guess is printed on stderr as the flag that would give it:
 A design factor is a column that takes one value in every sample. Every one is
 carried unless a flag leaves it out, and one left out is named in the notes.
 
+A sample whose cells hold more than one level of --condition is split into one
+sample per level (sample|level), so every cell keeps its own; with no sample
+column, the cells of each level are one sample. Beside the embedding that opens
+first, only two-column embeddings travel, each set of coordinates once. The
+run's provenance records in uns travel as "run". The notes name all three.
+
 Output: one .zip holding collection.json and parts/*.zip, each part a complete
 scrnaseq-studio/bundle@1. The same input and flags give the same bytes. The
 file's sha256 is in the summary, and collection.json lists each part's.

@@ -179,6 +179,11 @@ export function subsetColumn(col: Column, cells: Int32Array): Column {
  *
  * The matrix is already in hand — read by the streaming pass — so `load` just
  * hands it over. Everything else is the parent scan with its cells subset.
+ *
+ * Decisions about the whole object are made on the parent before this is
+ * called, never per shard: which samples hold more than one condition
+ * (oneConditionPerSample in build.ts) and which embeddings copy one another
+ * (`whole`, below). Made per shard, two parts could name one sample two ways.
  */
 export function shardScan(
   parent: Scan, shard: Shard, matrices: Map<string, CellMajor>, sourceLabel: string,
@@ -196,18 +201,27 @@ export function shardScan(
         nGenes: m.nGenes, nCells: cells.length,
         load: () => matrices.get(m.key)!,
       })),
-    embeddings: parent.embeddings.map((e): EmbeddingRef => ({
-      key: e.key, nDims: e.nDims,
-      load: () => {
-        const all = e.load()
-        const xy = new Float32Array(cells.length * 2)
-        for (let i = 0; i < cells.length; i++) {
-          xy[2 * i] = all[2 * cells[i]]
-          xy[2 * i + 1] = all[2 * cells[i] + 1]
-        }
-        return xy
-      },
-    })),
+    embeddings: parent.embeddings.map((e): EmbeddingRef => {
+      // The parent's coordinates, read once for this part however many times
+      // they are asked for: a Seurat reduction is re-read on every load.
+      let all: Float32Array | null = null
+      const whole = () => (all ??= (e.whole ?? e.load)())
+      return {
+        key: e.key, nDims: e.nDims,
+        // Which embeddings are copies of one another is decided on these, so
+        // that every part of the split makes the same decision.
+        whole,
+        load: () => {
+          const from = whole()
+          const xy = new Float32Array(cells.length * 2)
+          for (let i = 0; i < cells.length; i++) {
+            xy[2 * i] = from[2 * cells[i]]
+            xy[2 * i + 1] = from[2 * cells[i] + 1]
+          }
+          return xy
+        },
+      }
+    }),
   }
 }
 

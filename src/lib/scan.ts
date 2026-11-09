@@ -64,6 +64,36 @@ export interface EmbeddingRef {
   nDims: number
   /** Interleaved x,y — the first two dimensions. */
   load: () => Float32Array
+  /**
+   * The whole object's coordinates, when `load` gives only some of its cells.
+   *
+   * Set on a part of a split object. Whether two embeddings are copies of one
+   * another is a fact about the object, and every part has to reach the same
+   * answer: two views that agree on one part's cells and differ elsewhere are
+   * two views. Absent everywhere else, where `load` is already the whole object.
+   */
+  whole?: () => Float32Array
+}
+
+/**
+ * One record of the run that made the object, as its uns holds it.
+ *
+ * Copied, not interpreted: `record` is the entry converted to JSON, with the
+ * tool's own field names. What a record is, is decided in h5ad.ts by name.
+ */
+export interface RunRecord {
+  /** Where the object holds it, e.g. `uns/scintegrate/provenance`. */
+  path: string
+  /** The entry as JSON: groups as objects, scalars and lists as themselves. */
+  record: unknown
+}
+
+/** What the object says about the run that made it. */
+export interface RunSection {
+  /** Where the reader looked, so that an empty list can be read exactly. */
+  searched: string
+  /** Every record found, in uns order. Empty: the object carries none. */
+  records: RunRecord[]
 }
 
 /** What a list of gene names is made of, judged by the names themselves. */
@@ -122,6 +152,11 @@ export interface Scan {
   /** The other naming of a gene set's rows, keyed the same way as `geneSets`. */
   geneAliases: Record<string, GeneAlias>
   provenance: Record<string, string | null>
+  /**
+   * The run's own record, read from uns. Set by the .h5ad reader, which always
+   * looks; absent from a Seurat scan, which has no uns to look in.
+   */
+  run?: RunSection
   /** Everything the reader had to decide, in the order it decided it. */
   notes: string[]
 }
@@ -547,25 +582,37 @@ function distinctFraction(values: string[]): number {
 }
 
 /**
- * Does each sample sit in exactly one condition?
+ * Does each sample sit in exactly one condition, and if not, what happens?
  *
- * If not, the pairing is not a design — it is two independent labels, and the
- * bundle's one-condition-per-sample model would keep whichever came first.
+ * The bundle records one condition per sample. A sample whose cells hold two
+ * is split by the builder into one sample per condition (see
+ * oneConditionPerSample in build.ts), so every cell keeps its own group. This
+ * says so before the conversion, naming the first such sample.
  */
 export function crossCheck(
   sample: Column | undefined, condition: Column | undefined,
 ): string | null {
   if (!sample || !condition) return null
-  const seen = new Map<number, number>()
+  const level = (col: Column, c: number) => (c < 0 ? 'NA' : col.levels[c])
+  const first = new Map<number, number>()
+  const spanning = new Map<number, Set<number>>()
   for (let i = 0; i < sample.codes.length; i++) {
     const s = sample.codes[i], c = condition.codes[i]
-    const prev = seen.get(s)
-    if (prev === undefined) seen.set(s, c)
+    const prev = first.get(s)
+    if (prev === undefined) first.set(s, c)
     else if (prev !== c) {
-      return `sample "${sample.levels[s]}" appears in both "${condition.levels[prev]}" and "${condition.levels[c]}". Each sample must belong to one group, so pick a different pair — or the bundle will record only the first.`
+      const held = spanning.get(s) ?? new Set([prev])
+      held.add(c)
+      spanning.set(s, held)
     }
   }
-  return null
+  if (!spanning.size) return null
+  const [s, held] = spanning.entries().next().value as [number, Set<number>]
+  const [a, b] = [...held]
+  const name = level(sample, s)
+  const more = spanning.size - 1
+  const parts = [...held].sort((x, y) => x - y).map(c => `"${name}|${level(condition, c)}"`)
+  return `sample "${name}" appears in both "${level(condition, a)}" and "${level(condition, b)}"${more ? `, and ${more} more sample${more > 1 ? 's hold' : ' holds'} more than one group` : ''}. The bundle records one group per sample, so each such sample is split into one sample per group (here ${parts.join(', ')}), and every cell keeps its own group.`
 }
 
 /** Replicates per condition — what decides whether pseudobulk is offered. */

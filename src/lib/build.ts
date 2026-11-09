@@ -14,7 +14,7 @@ import {
 } from './matrix.ts'
 import {
   column, geneNameKind,
-  type Choices, type Column, type GeneIdKind, type MatrixRef, type Scan,
+  type Choices, type Column, type EmbeddingRef, type GeneIdKind, type MatrixRef, type RunSection, type Scan,
 } from './scan.ts'
 
 export const SCHEMA = 'scrnaseq-studio/bundle@1'
@@ -121,10 +121,16 @@ export interface BundleMeta {
   /** The default embedding's key — `embeddings[0].key`. */
   embedding: string
   /**
-   * Every 2D embedding the object had, the default first.
+   * The embeddings a reader can switch between, the default first.
    *
-   * Absent in bundles written before today; a reader without it has exactly one
-   * embedding, `embed.f32`, named by `embedding`.
+   * Besides the default, only two-column embeddings, and each set of
+   * coordinates once: a latent space (a PCA, a corrected PCA) cut to its first
+   * two columns is not a picture of the cells, and a byte copy of another
+   * embedding is the same picture under a second name. The notes name what
+   * was left out and why.
+   *
+   * Absent in bundles written before more than one was carried; a reader
+   * without it has exactly one embedding, `embed.f32`, named by `embedding`.
    */
   embeddings?: EmbeddingEntry[]
   /** What `genes.txt` holds. Absent in older bundles, where it is unknown. */
@@ -141,6 +147,16 @@ export interface BundleMeta {
    */
   chunkGenes: number
   provenance: Record<string, string | null>
+  /**
+   * The run's own record, as the object's uns holds it: each tool's provenance
+   * (the tool, its version and commit, the job, ...) and the harness's run
+   * record, copied rather than summarised. `records: []` means the converter
+   * looked and the object carries none.
+   *
+   * Absent in bundles from a Seurat object, which has no uns, and in bundles
+   * written before it existed. bundle@1 readers ignore it.
+   */
+  run?: RunSection
   notes: string[]
 }
 
@@ -324,6 +340,143 @@ function grouping(col: Column | undefined, fallback: string, nCells: number): {
   return { codes, levels }
 }
 
+/** Codes and the level names they index, every code a level a cell holds. */
+type Grouping = { codes: Int32Array; levels: string[] }
+
+/** "a", "a and b", "a, b and c" — at most ten named, then a count. */
+function list(names: string[], max = 10): string {
+  const shown = names.length > max ? [...names.slice(0, max), `${names.length - max} more`] : names
+  return shown.length < 2 ? shown.join('') : `${shown.slice(0, -1).join(', ')} and ${shown[shown.length - 1]}`
+}
+
+/**
+ * Split each sample that holds more than one condition into one sample per
+ * condition, named `sample|condition`.
+ *
+ * Only a split sample is renamed, so one animal in two groups does not rename
+ * every other. New names come in the sample's level order, then the
+ * condition's. A name some other sample already has gets `#2`, `#3`, … rather
+ * than merging two samples. With `everyOne`, every sample is split by
+ * condition whether it spans or not: that is the no-sample-column case, where
+ * the one sample is the whole object and a part of a split object may hold
+ * only one condition, yet must name its cells as every other part does.
+ *
+ * Null when nothing is split.
+ */
+function splitByCondition(sample: Grouping, cond: Grouping, everyOne = false): (Grouping & {
+  /** The samples that were split, by their old names. */
+  split: string[]
+  /** The names they became. */
+  made: string[]
+}) | null {
+  const n = sample.codes.length
+  const nS = sample.levels.length
+  const first = new Int32Array(nS).fill(-1)
+  const spans = new Uint8Array(nS)
+  for (let i = 0; i < n; i++) {
+    const s = sample.codes[i], c = cond.codes[i]
+    if (first[s] < 0) first[s] = c
+    else if (first[s] !== c) spans[s] = 1
+  }
+  if (everyOne) for (let s = 0; s < nS; s++) if (first[s] >= 0) spans[s] = 1
+  if (!spans.some(x => x)) return null
+
+  // The conditions each split sample holds, in the condition's level order.
+  const held = new Map<number, Uint8Array>()
+  for (let i = 0; i < n; i++) {
+    const s = sample.codes[i]
+    if (!spans[s]) continue
+    let h = held.get(s)
+    if (!h) held.set(s, h = new Uint8Array(cond.levels.length))
+    h[cond.codes[i]] = 1
+  }
+  const taken = new Set(sample.levels.filter((_l, s) => !spans[s]))
+  const levels: string[] = []
+  const keptAt = new Int32Array(nS).fill(-1)
+  const splitAt = new Map<number, Int32Array>()
+  const split: string[] = []
+  const made: string[] = []
+  for (let s = 0; s < nS; s++) {
+    if (!spans[s]) {
+      keptAt[s] = levels.length
+      levels.push(sample.levels[s])
+      continue
+    }
+    split.push(sample.levels[s])
+    const at = new Int32Array(cond.levels.length).fill(-1)
+    const h = held.get(s)!
+    for (let c = 0; c < cond.levels.length; c++) {
+      if (!h[c]) continue
+      const base = `${sample.levels[s]}|${cond.levels[c]}`
+      let id = base
+      for (let k = 2; taken.has(id); k++) id = `${base}#${k}`
+      taken.add(id)
+      at[c] = levels.length
+      levels.push(id)
+      made.push(id)
+    }
+    splitAt.set(s, at)
+  }
+  const codes = new Int32Array(n)
+  for (let i = 0; i < n; i++) {
+    const s = sample.codes[i]
+    codes[i] = spans[s] ? splitAt.get(s)![cond.codes[i]] : keptAt[s]
+  }
+  return { codes, levels, split, made }
+}
+
+/**
+ * One condition per sample, which is what the bundle records.
+ *
+ * The bundle stores a condition per SAMPLE, not per cell. A sample whose cells
+ * sit in two conditions — a hashed lane carrying two treatments, a donor
+ * sampled before and after — used to have every cell given its first cell's
+ * condition: per-group totals that still looked plausible, and nothing to say
+ * so. Such a sample is two samples. Splitting it keeps every cell's condition,
+ * needs no change to the format, and is the rule the studio's own exporter
+ * applies (tools/export_h5ad.py), so the writers of bundle@1 agree.
+ *
+ * Decided on the WHOLE object. The studio merges the parts of a split object
+ * by sample id, and a part that held only one condition of a sample would, on
+ * its own, leave it unsplit: "s1" in one part, "s1|ctrl" in the next, one
+ * animal counted as two replicates. So the split paths call this on the parent
+ * before cutting it into parts, and the parts inherit the result. buildBundle
+ * calls it too, which costs nothing on a scan already resolved and covers every
+ * caller that converts a whole object at once.
+ *
+ * The sample column is replaced under its own name, so `provenance.sample`
+ * still names the column the samples came from. Returns the same Scan when
+ * every sample already sits in one condition.
+ */
+export function oneConditionPerSample(scan: Scan, choices: Choices): Scan {
+  const sampleCol = column(scan, choices.sample)
+  const condCol = column(scan, choices.condition)
+  if (sampleCol?.kind !== 'categorical' || condCol?.kind !== 'categorical') return scan
+  const sample = grouping(sampleCol, 'all cells', scan.nCells)
+  const cond = grouping(condCol, 'all cells', scan.nCells)
+  const s = splitByCondition(sample, cond)
+  if (!s) return scan
+  const replaced: Column = {
+    name: sampleCol.name, kind: 'categorical', levels: s.levels, codes: s.codes,
+    values: new Float32Array(0), missing: 0,
+  }
+  return {
+    ...scan,
+    columns: scan.columns.map(c => (c === sampleCol ? replaced : c)),
+    notes: [...scan.notes,
+      `${list(s.split)} ${s.split.length > 1 ? 'hold' : 'holds'} cells in more than one level of ${condCol.name}, so each was split into one sample per level (${list(s.made)}): ${sample.levels.length} samples became ${s.levels.length}. The bundle records one condition per sample, and giving those cells their sample's first condition would have put them in the wrong group with no visible sign`],
+  }
+}
+
+/** The same float32 values, bit for bit — what the bundle would store twice. */
+function sameCoordinates(a: Float32Array, b: Float32Array): boolean {
+  if (a.length !== b.length) return false
+  const x = new Uint32Array(a.buffer, a.byteOffset, a.length)
+  const y = new Uint32Array(b.buffer, b.byteOffset, b.length)
+  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false
+  return true
+}
+
 /** An entry name that survives a zip and a file system. */
 const safeEntry = (s: string) =>
   (s || 'x').replace(/[^\w.-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'x'
@@ -369,8 +522,10 @@ function qcColumn(scan: Scan, names: string[]): Float32Array | null {
 }
 
 export function buildBundle(
-  scan: Scan, choices: Choices, onProgress: Progress = () => {},
+  given: Scan, choices: Choices, onProgress: Progress = () => {},
 ): BuildResult {
+  // A no-op on a part whose parent was already resolved; see the function.
+  const scan = oneConditionPerSample(given, choices)
   const notes = [...scan.notes]
   const note = (s: string) => notes.push(s)
   const n = scan.nCells
@@ -395,18 +550,28 @@ export function buildBundle(
   const cluster = grouping(clusterCol, 'all cells', n)
   const sampleCol = column(scan, choices.sample)
   const condCol = column(scan, choices.condition)
-  const sample = grouping(sampleCol, 'all cells', n)
+  const cond = condCol?.kind === 'categorical' ? grouping(condCol, 'all cells', n) : null
+  let sample: Grouping = grouping(sampleCol, 'all cells', n)
 
-  if (!sampleCol) {
+  if (sampleCol?.kind !== 'categorical' && cond) {
+    // With no sample column the one sample is the whole object, and it holds
+    // every condition: as one sample, every cell used to be given the first
+    // cell's condition and the other groups came out empty. So the cells of
+    // each condition are one sample. Every one is split, not only when it
+    // spans, because a part of a split object can hold a single condition and
+    // must still name its cells as the other parts do.
+    sample = splitByCondition(sample, cond, true) ?? sample
+    note(`no sample column — the cells of each condition are treated as one sample (${list(sample.levels)}). Composition cannot show between-animal spread, and pseudobulk needs several samples per group, so only the per-cell test will be available`)
+  } else if (!sampleCol) {
     note('no sample column — every cell is treated as one sample. Composition cannot show between-animal spread, and pseudobulk needs several samples per group, so only the per-cell test will be available')
   }
 
   // One condition per sample: the bundle's model, so it is resolved here rather
-  // than left for the studio to discover.
+  // than left for the studio to discover. Every sample now sits in one
+  // condition, so its first cell speaks for all of them.
   let conditions: string[]
   let sampleCond: string[]
-  if (condCol && condCol.kind === 'categorical') {
-    const cond = grouping(condCol, 'all cells', n)
+  if (cond) {
     conditions = cond.levels
     sampleCond = sample.levels.map((_id, si) => {
       for (let i = 0; i < n; i++) if (sample.codes[i] === si) return conditions[cond.codes[i]]
@@ -457,25 +622,44 @@ export function buildBundle(
   const xy = emb.load()
   if (/pca/i.test(emb.key)) {
     note('using the first two principal components, which is a much coarser picture than a UMAP')
+  } else if (emb.nDims > 2) {
+    note(`${emb.key} has ${emb.nDims} columns and only its first two are drawn: the first two dimensions of a latent space, a much coarser picture than a UMAP`)
   }
 
-  // Every other 2D embedding as well. An object routinely holds a UMAP and a
-  // t-SNE of the same cells, and until now the lab kept one and threw the rest
-  // away — 8 bytes a cell to carry, against a matrix that costs 8 bytes a
-  // *stored value*. The chosen one stays first and stays in `embed.f32`, so a
-  // reader that knows nothing about this sees no change at all.
-  const others = scan.embeddings.filter(e => e.key !== emb.key && e.nDims >= 2)
+  // The other embeddings a reader can switch to. An object routinely holds a
+  // UMAP and a t-SNE of the same cells, and the lab once kept one and threw
+  // the rest away — 8 bytes a cell to carry, against a matrix that costs 8
+  // bytes a *stored value*. Two kinds are left out, and named. A latent space
+  // (a PCA, a corrected PCA, anything wider than two columns) cut to its first
+  // two columns is not a picture of the cells, whatever it is called. And a
+  // byte copy of an embedding already offered is the same picture under a
+  // second name: an integration stage writes its chosen method's UMAP twice,
+  // as X_umap and X_umap_<method>. Copies are found on the whole object's
+  // coordinates, so every part of a split decides the same way. The chosen one
+  // stays first and stays in `embed.f32`, so a reader that knows nothing about
+  // this sees no change at all.
   const embedFiles: EmbeddingEntry[] = [{ key: emb.key, file: 'embed.f32' }]
   const extraXY: { file: string; xy: Float32Array }[] = []
   const usedNames = new Set(['embed.f32'])
-  for (const e of others) {
-    let file = `embed.${safeEntry(e.key)}.f32`
-    for (let i = 2; usedNames.has(file); i++) file = `embed.${safeEntry(e.key)}-${i}.f32`
-    usedNames.add(file)
+  const offered: { key: string; at: Float32Array }[] = []
+  const wholeOf = (e: EmbeddingRef) => (e.whole ? e.whole() : e.load())
+  try {
+    offered.push({ key: emb.key, at: wholeOf(emb) })
+  } catch { /* then nothing is compared against the default */ }
+  const latent: string[] = []
+  const copies: string[] = []
+  for (const e of scan.embeddings) {
+    if (e.key === emb.key || e.nDims < 2) continue
+    if (e.nDims > 2) {
+      latent.push(`${e.key} (${e.nDims} columns)`)
+      continue
+    }
     onProgress(`Reading the ${e.key} embedding`)
     let coords: Float32Array
+    let at: Float32Array
     try {
       coords = e.load()
+      at = e.whole ? e.whole() : coords
     } catch (err) {
       // One unreadable extra embedding must not lose the conversion: the
       // default one is already in hand and is what the studio opens with.
@@ -486,11 +670,36 @@ export function buildBundle(
       note(`${e.key} has ${coords.length / 2} points for ${n} cells; it is not in the bundle`)
       continue
     }
+    const twin = offered.find(o => sameCoordinates(o.at, at))
+    if (twin) {
+      copies.push(`${e.key} (the same coordinates as ${twin.key})`)
+      continue
+    }
+    offered.push({ key: e.key, at })
+    let file = `embed.${safeEntry(e.key)}.f32`
+    for (let i = 2; usedNames.has(file); i++) file = `embed.${safeEntry(e.key)}-${i}.f32`
+    usedNames.add(file)
     extraXY.push({ file, xy: coords })
     embedFiles.push({ key: e.key, file })
   }
   if (extraXY.length) {
     note(`${embedFiles.length} embeddings carried (${embedFiles.map(e => e.key).join(', ')}); ${emb.key} opens by default`)
+  }
+  if (latent.length || copies.length) {
+    const why = [
+      latent.length ? `${list(latent)}, ${latent.length > 1 ? 'latent spaces' : 'a latent space'}: the first two columns of one are not a picture of the cells` : '',
+      copies.length ? `${list(copies)}, ${copies.length > 1 ? 'copies' : 'a copy'} offered once` : '',
+    ].filter(Boolean).join('; ')
+    note(`not offered as embeddings: ${why}.${latent.length ? ' A latent space can still be chosen as the one that opens first, and is then drawn by its first two columns' : ''}`)
+  }
+
+  // The run's own record, copied from uns by the reader. Said in the notes
+  // too, because the notes are what the studio shows.
+  if (scan.run) {
+    const paths = scan.run.records.map(r => r.path)
+    note(paths.length
+      ? `the run's own record travels with the bundle, in run: ${list(paths, 20)}`
+      : "the object's uns holds no run record (nothing named provenance, no harness_run), so this bundle cannot say which run made it")
   }
 
   // ---- QC ---------------------------------------------------------------
@@ -603,6 +812,7 @@ export function buildBundle(
       condition: condCol?.kind === 'categorical' ? condCol.name : null,
       sample: sampleCol?.kind === 'categorical' ? sampleCol.name : null,
     },
+    ...(scan.run ? { run: scan.run } : {}),
     notes,
   }
 

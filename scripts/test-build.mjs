@@ -385,10 +385,12 @@ console.log(String.fromCharCode(10) + 'A MATRIX OVER A CORNER OF THE GENE LIST I
     res.meta.notes.some(n => n.includes('expression computed here as log1p(CP10K) from the counts')), true)
 }
 
-console.log(String.fromCharCode(10) + 'EVERY 2D EMBEDDING IS CARRIED, NOT JUST THE CHOSEN ONE')
+console.log(String.fromCharCode(10) + 'EVERY TWO-COLUMN EMBEDDING IS CARRIED, NOT JUST THE CHOSEN ONE')
 // An object routinely holds a UMAP and a t-SNE of the same cells. The lab used
 // to keep one and discard the rest, which is a decision the user never made and
-// could not undo without converting again.
+// could not undo without converting again. A 50-column PCA is not one of them:
+// its first two columns were once cut out and offered as a third view, and a
+// latent space's first two columns are not a picture of the cells.
 {
   const umap = Float32Array.from([0,0, 1,1, 2,2, 3,3, 4,4, 5,5])
   const tsne = Float32Array.from([9,9, 8,8, 7,7, 6,6, 5,5, 4,4])
@@ -401,15 +403,15 @@ console.log(String.fromCharCode(10) + 'EVERY 2D EMBEDDING IS CARRIED, NOT JUST T
   const b = open(res)
   check('the chosen one is still embed.f32, byte for byte', Array.from(b.embed), Array.from(umap))
   check('meta names it as the default', b.meta.embedding, 'X_umap')
-  check('and lists them all, the default first', b.meta.embeddings, [
+  check('and lists every two-column one, the default first', b.meta.embeddings, [
     { key: 'X_umap', file: 'embed.f32' },
     { key: 'X_tSNE', file: 'embed.X_tSNE.f32' },
-    { key: 'X_pca', file: 'embed.X_pca.f32' },
   ])
   const f = unzipSync(res.zip)
   const read = name => Array.from(new Float32Array(f[name].slice().buffer))
   check('the t-SNE is really in the file', read('embed.X_tSNE.f32'), Array.from(tsne))
-  check('and so is the PCA', read('embed.X_pca.f32'), Array.from(pca))
+  check('the 50-column PCA is not cut to two and written beside them', f['embed.X_pca.f32'] === undefined, true)
+  check('and the notes say so, with its width', b.meta.notes.some(n => n.includes('X_pca (50 columns)')), true)
 
   // Choosing a different default must move the bytes, not just the label: a
   // reader that knows nothing of meta.embeddings reads embed.f32 alone.

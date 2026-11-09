@@ -16,7 +16,7 @@ import { rdsCompression, RdsReader } from './rds.ts'
 import { Bytes, CHUNK } from './bytes.ts'
 import { GzWindow } from './gzwindow.ts'
 import { scanSeurat } from './seurat.ts'
-import { buildBundle, streamableMatrix } from './build.ts'
+import { buildBundle, oneConditionPerSample, streamableMatrix } from './build.ts'
 import { shardScan, type Shard } from './shard.ts'
 import type { Choices, Scan, ScanInfo } from './scan.ts'
 import type { CellMajor } from './matrix.ts'
@@ -129,7 +129,10 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
     if (e.data.cmd === 'convert') {
       if (!scan) throw new Error('no file is open')
       const { choices, shards, passes } = e.data
-      const parent = scan
+      // A sample in more than one condition becomes one sample per condition,
+      // decided here on the whole object, before any part is cut from it, so
+      // that every part names it the same way.
+      const parent = oneConditionPerSample(scan, choices)
 
       // Whole object, one part. Still a part: the container is written the same
       // way either way, so the studio has one shape to understand.

@@ -25,7 +25,7 @@
 // --sentinel level no cell carries — is refused (exit 4), never skipped.
 
 import {
-  candidates, crossCheck, guessCluster, guessEmbedding, guessRole, namedLike, unusable,
+  candidates, guessCluster, guessEmbedding, guessRole, namedLike, unusable,
   type Choices, type Column, type Role, type Scan,
 } from '../lib/scan.ts'
 import { crossed, designFactors, interactionColumn } from '../lib/design.ts'
@@ -186,9 +186,9 @@ export function resolveRoles(scan: Scan, a: ConvertArgs): Resolved {
   }
   const others = scan.columns.filter(c => c.kind === 'categorical' && !carried.has(c.name) && !isFactor.has(c.name) && !unusable(c, 'extra', n))
   if (others.length) info.push(`also in the object, not carried: ${others.map(c => c.name).join(', ')} (each can be added with --extra)`)
-
-  const crossing = crossCheck(sampleCol, col(condition))
-  if (crossing) notes.push(crossing)
+  // A --condition that varies inside a sample is not refused: the builder
+  // splits each such sample into one sample per condition and names it in the
+  // notes (oneConditionPerSample in build.ts), so every cell keeps its own.
 
   // ---- the embedding --------------------------------------------------------
   let embedding: string

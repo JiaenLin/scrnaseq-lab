@@ -274,10 +274,12 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
       {clash && <div className="note mt-4"><b>These two do not nest.</b> {clash}</div>}
 
       <Card eyebrow="Step 4" title="Embedding and label">
-        {/* Every 2D embedding goes into the bundle now, so this is no longer a
-            choice between them — only which one the studio opens on. Saying so
-            stops it reading as "the others are discarded", which it used to be. */}
-        <Field label="Embedding" hint="Which one the studio opens on. All of them travel in the file.">
+        {/* Every two-column embedding goes into the bundle, so this is not a
+            choice between them, only which one the studio opens on. Wider ones
+            (a PCA, a corrected PCA) and byte copies are not offered beside it,
+            and the notes say which; choosing one here draws its first two
+            columns. */}
+        <Field label="Embedding" hint="Which one the studio opens on. The other two-column ones travel in the file too, each once.">
           <div className="seg">
             {scan.embeddings.map(e => (
               <button key={e.key} className={e.key === choices.embedding ? 'sel' : ''}
