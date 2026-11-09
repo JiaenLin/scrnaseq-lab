@@ -26,7 +26,9 @@
 
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import {
+  copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -410,6 +412,58 @@ report('a failed conversion leaves no file behind',
   r1.code === 0 && !existsSync(join(tmp, 'x.zip')) && !existsSync(join(tmp, 'x.zip.partial')),
   'x.zip or x.zip.partial exists, or the command never ran')
 check('--help: 0', code('--help'), 0)
+
+// ---------------------------------------------------------------------------
+console.log('\nTHE INPUT IS NEVER OVERWRITTEN, HOWEVER THE OUTPUT REACHES IT')
+{
+  // The output is renamed into place, so an output that IS the input — by the
+  // same path, or through a link — would replace the object with its own zip.
+  // Each case converts its own copy, so one case's damage cannot decide another's.
+  const before = sha256(readFileSync(FIX.classic))
+  const self = join(tmp, 'self.h5ad')
+  copyFileSync(FIX.classic, self)
+  const rs = cli(['convert', self, self, ...EXPLICIT])
+  check('converting a copy onto itself: 2 (usage), and the copy is untouched',
+    [rs.code, sha256(readFileSync(self))], [2, before])
+  check('the refusal names the file',
+    [rs.code, /^scrnaseq-lab: .*self\.h5ad/m.test(rs.err)], [2, true])
+
+  const linked = join(tmp, 'linked.h5ad')
+  copyFileSync(FIX.classic, linked)
+  const link = join(tmp, 'link.zip')
+  symlinkSync(linked, link)
+  const rl = cli(['convert', linked, link, ...EXPLICIT])
+  check('onto a symlink to it: 2, the copy untouched and the link still a link',
+    [rl.code, sha256(readFileSync(linked)), lstatSync(link).isSymbolicLink()], [2, before, true])
+
+  const real = join(tmp, 'real')
+  mkdirSync(real)
+  const inReal = join(real, 'obj.h5ad')
+  copyFileSync(FIX.classic, inReal)
+  symlinkSync(real, join(tmp, 'alias'))
+  const rd = cli(['convert', inReal, join(tmp, 'alias', 'obj.h5ad'), ...EXPLICIT])
+  check('onto itself through a symlinked directory: 2, and untouched',
+    [rd.code, sha256(readFileSync(inReal))], [2, before])
+
+  const partial = join(tmp, 'q.zip.partial')
+  copyFileSync(FIX.classic, partial)
+  const rp = cli(['convert', partial, join(tmp, 'q.zip'), ...EXPLICIT])
+  check("an input that is the output's .partial: 2, and untouched",
+    [rp.code, existsSync(partial) && sha256(readFileSync(partial))], [2, before])
+}
+
+// ---------------------------------------------------------------------------
+console.log('\nA --sentinel LEVEL THAT NO CELL CARRIES IS REFUSED, NOT SKIPPED')
+{
+  // Skipped, a typo left the real sentinel counted as a cell type and exited 0.
+  const out = join(tmp, 'typo.zip')
+  const rt = cli(['convert', FIX.classic, out, ...EXPLICIT, '--sentinel', 'NOPE', '--sentinel', 'TYPO'])
+  check('a --sentinel no cell carries: 4 (roles), and every such level is named',
+    [rt.code, /NOPE/.test(rt.err) && /TYPO/.test(rt.err)], [4, true])
+  check('the message lists the levels that cells do carry',
+    [rt.code, /TypeA[\s\S]*EXCLUDED[\s\S]*UNRESOLVED/.test(rt.err)], [4, true])
+  report('and nothing is written', rt.code === 4 && !existsSync(out), `exit ${rt.code}; ${out} ${existsSync(out) ? 'exists' : 'absent'}`)
+}
 
 rmSync(tmp, { recursive: true, force: true })
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll command-line tests passed\n')
