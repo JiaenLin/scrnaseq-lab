@@ -20,7 +20,7 @@
 # plus the annotator's two sentinel labels, EXCLUDED and UNRESOLVED, among the
 # cell types, because a real final object has them.
 #
-# Four files:
+# Five files:
 #
 #   family-2x2.h5ad          two crossed factors, 2 samples per arm, written the
 #                            way the family's emitters write (classic strings)
@@ -36,6 +36,14 @@
 #   scaled-only.h5ad         a tiny object whose only matrix is z-scored, which
 #                            no bundle can be built from: the command's "cannot
 #                            convert" exit.
+#   uns-records.h5ad         a tiny object whose run records hold what a JSON
+#                            copy has to take care over: a structured array with
+#                            an int64 field (anndata's rec-array), which once
+#                            crashed the conversion, and leaves a JSON copy
+#                            cannot hold as they are (float16, an HDF5
+#                            reference, uint64 past 2**53, NaN and infinities,
+#                            a dataframe). h5wasm writes none of these, so the
+#                            test cannot make them itself.
 #
 # Pinned to what the family runs: anndata 0.13.2, pandas 3.0.5. With uv:
 #
@@ -49,6 +57,7 @@ import warnings
 from pathlib import Path
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
@@ -177,3 +186,31 @@ S = ad.AnnData(X=z, obs=pd.DataFrame({"cell_type": pd.Categorical(["TypeA", "Typ
                var=pd.DataFrame(index=[f"Gene{j + 1:03d}" for j in range(4)]))
 S.obsm["X_umap"] = rng.normal(size=(m, 2)).astype(np.float32)
 write(S, out_dir / "scaled-only.h5ad", classic=True)
+
+# ---- run records holding what a JSON copy has to take care over --------------
+# Written last, so the four files above keep their bytes.
+R = ad.AnnData(X=sp.csr_matrix(rng.poisson(2.0, size=(m, 4)).astype(np.float32)),
+               obs=pd.DataFrame({"cell_type": pd.Categorical(["TypeA", "TypeB"] * (m // 2))},
+                                index=[f"c{i}" for i in range(m)]),
+               var=pd.DataFrame(index=[f"Gene{j + 1:03d}" for j in range(4)]))
+R.obsm["X_umap"] = rng.normal(size=(m, 2)).astype(np.float32)
+R.uns["scintegrate"] = {"provenance": {
+    "tool": "synthetic-tool", "version": "0.0.0+fixture",
+    # anndata writes a structured array as a rec-array: one HDF5 compound
+    # dataset, read back as rows whose int64 field is a BigInt.
+    "ranked": np.array([(b"harmony", 3, 0.6), (b"none", 1, 0.5)],
+                       dtype=[("method", "S8"), ("rank", "<i8"), ("score", "<f8")]),
+}}
+R.uns["odd_provenance"] = {
+    "tool": "synthetic-tool",
+    "half": np.arange(4, dtype=np.float16),
+    "big": np.uint64(2**63 + 5),
+    "special": np.array([np.nan, np.inf, -np.inf, 1.0]),
+    "flag": np.bool_(False),
+    "frame": pd.DataFrame({"a": [1, 2]}, index=["r1", "r2"]),
+}
+write(R, out_dir / "uns-records.h5ad", classic=True)
+# anndata writes no HDF5 references; h5py adds one, to uns itself.
+with h5py.File(out_dir / "uns-records.h5ad", "r+") as f:
+    f["uns/odd_provenance"].create_dataset("ref", data=f["uns"].ref, dtype=h5py.ref_dtype, track_times=False)
+print(f"added uns/odd_provenance/ref: uns-records.h5ad is {(out_dir / 'uns-records.h5ad').stat().st_size} bytes")

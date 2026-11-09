@@ -58,6 +58,7 @@ const FIX = {
   classic: here('./fixtures/family-2x2.h5ad'),
   dflt: here('./fixtures/family-2x2-default.h5ad'),
   mask: here('./fixtures/nullable-mask.h5ad'),
+  records: here('./fixtures/uns-records.h5ad'),
 }
 const BIN = here('../bin/scrnaseq-lab.mjs')
 const tmp = mkdtempSync(join(tmpdir(), 'lab-integrity-test-'))
@@ -405,6 +406,66 @@ console.log('\nTHE RUN\'S RECORD TRAVELS WITH THE BUNDLE')
     () => badRun.records.find(x => x.path === 'uns/harness_run')?.record, 'not json {')
   attempt('and a note says it is not JSON',
     () => br.o.parts[0].meta.notes.filter(s => /harness_run/.test(s) && /not JSON/i.test(s)).length, 1)
+}
+
+console.log('\nA RECORD IS COPIED AS FAR AS JSON CAN HOLD IT, AND THE REST IS NAMED IN PLACE')
+{
+  // scripts/fixtures/uns-records.h5ad, written by anndata and h5py (see
+  // make-family-fixture.py): its integration record holds a structured array
+  // with an int64 field, which crashed the whole conversion once ("Do not know
+  // how to serialize a BigInt", exit 1, no file); its other record holds
+  // leaves a JSON copy cannot hold as they are.
+  const u = convert(FIX.records, 'uns-records.zip', ['--label', 'records'])
+  check('an object whose provenance holds an int64 rec-array converts', u.r.code, 0)
+  const rec = (p) => u.o?.parts[0].meta.run.records.find(x => x.path === p)?.record
+  attempt('the rec-array is copied row by row, under its field names, int64 as a number',
+    () => rec('uns/scintegrate/provenance').ranked,
+    [{ method: 'harmony', rank: 3, score: 0.6 }, { method: 'none', rank: 1, score: 0.5 }])
+  attempt('a float16 leaf is named in place, and the rest of its record is still copied',
+    () => { const o = rec('uns/odd_provenance'); return [/^\(not copied: .*float16/.test(o.half), o.tool, o.flag] },
+    [true, 'synthetic-tool', false])
+  attempt('an HDF5 reference is named in place, not copied as bytes',
+    () => /^\(not copied: .*HDF5 reference/.test(rec('uns/odd_provenance').ref), true)
+  attempt('uint64 past 2**53 is its exact digits, and NaN and the infinities are words',
+    () => { const o = rec('uns/odd_provenance'); return [o.big, o.special] },
+    ['9223372036854775813', ['NaN', 'Infinity', '-Infinity', 1]])
+  attempt('a dataframe is named in place', () => /^\(not copied: .*dataframe/.test(rec('uns/odd_provenance').frame), true)
+}
+
+console.log('\nA RECORD PAST ITS BUDGET IS NAMED WITH ITS SIZE, NOT COPIED INTO EVERY PART')
+{
+  // The run section is written into every part of a split object, so what one
+  // record and the whole section may take is bounded: 262,144 characters of
+  // JSON for a record, 1,048,576 for the section.
+  const big = copyWith(FIX.classic, 'big-record.h5ad', f => {
+    const p = dict(f.get('uns'), 'log_provenance')
+    str(p, 'log', 'x'.repeat(400_000))
+    str(p, 'tool', 'synthetic-tool')
+  })
+  const b = convert(big, 'big-record.zip', ['--label', 'big'])
+  const run = b.o?.parts[0].meta.run
+  attempt('a record over 262,144 characters of JSON is named in place, with its size',
+    () => { const r = run.records.find(x => x.path === 'uns/log_provenance').record; return [typeof r, /400,0\d\d characters/.test(r), /262,144/.test(r)] },
+    ['string', true, true])
+  attempt('the record under the budget is still copied',
+    () => run.records.find(x => x.path === 'uns/scintegrate/provenance').record.tool, 'scintegrate')
+  attempt('a note names the record left out, and why',
+    () => b.o.parts[0].meta.notes.filter(s => s.includes('uns/log_provenance') && /budget/.test(s)).length, 1)
+  attempt('so meta.json stays small', () => b.o.parts[0].files['meta.json'].length < 20_000, true)
+
+  // Six records of 200,010 characters each, every one under the record budget:
+  // after the fixture's own record and five of them, the sixth would pass the
+  // section's budget.
+  const many = copyWith(FIX.classic, 'many-records.h5ad', f => {
+    const uns = f.get('uns')
+    for (let i = 1; i <= 6; i++) str(dict(uns, `z${i}_provenance`), 'log', 'y'.repeat(200_000))
+  })
+  const m = convert(many, 'many-records.zip', ['--label', 'many'])
+  attempt('records are copied until the section would pass 1,048,576 characters; the rest are named',
+    () => m.o.parts[0].meta.run.records.map(x => `${x.path}:${typeof x.record === 'string' ? 'named' : 'copied'}`),
+    ['uns/scintegrate/provenance:copied', 'uns/z1_provenance:copied', 'uns/z2_provenance:copied',
+      'uns/z3_provenance:copied', 'uns/z4_provenance:copied', 'uns/z5_provenance:copied', 'uns/z6_provenance:named'])
+  attempt('so meta.json stays under the section budget and a little more', () => m.o.parts[0].files['meta.json'].length < 1_100_000, true)
 }
 
 // ===========================================================================
