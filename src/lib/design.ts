@@ -66,8 +66,8 @@ function levelsInUse(col: Column): number {
  *
  * Named in formula notation (`factor_a:factor_b`) with levels `a1:b1`, ordered
  * with the first factor slowest — the order a design table is written in. Only
- * arms that hold cells become levels, so a fractional design does not grow
- * empty groups. A cell missing either factor is missing here too.
+ * arms that hold cells become levels, so a fractional design gains no empty
+ * groups. A cell missing either factor is missing here too.
  */
 export function interactionColumn(factors: Column[]): Column {
   const n = factors[0]?.codes.length ?? 0
