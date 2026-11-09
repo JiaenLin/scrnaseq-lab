@@ -584,16 +584,22 @@ export const RUN_MAX_NODES = 10_000
 export const RUN_SECTION_NODES = 50_000
 
 /**
- * One record's walk through the run section's single walk: the HDF5 objects
- * reached so far by any record, by identity, and how many groups and datasets
- * this record and the whole section have read. An object reached again — a
- * hard link back to an ancestor, a second link, or a link from another record
- * to an object already read — is named in place, never read again.
+ * One record's walk: the HDF5 objects this record has read, by identity, and
+ * how many groups and datasets this record and the whole section have read.
+ * An object the record reaches again — a hard link back to an ancestor, a
+ * second hard or soft link — is named in place, never read again.
+ *
+ * `seen` is the record's own. Shared across records, an object first reached
+ * by a record whose content is never written (over its budget, left out of
+ * the section, or reached past the depth limit) turned every later record
+ * that reached it into a pointer to nothing, and a tool's record was lost.
+ * What bounds the cost of many records reaching one large object is the
+ * section's own node budget.
  */
 interface Walk {
   /** The record's own path, for the notes. */
   record: string
-  /** Shared by every record of the section: identity → the path that first reached it. */
+  /** This record's: identity → the path in the record that first reached it. */
   seen: Map<string, string>
   /** Groups and datasets read for this record. */
   visited: number
@@ -605,15 +611,27 @@ interface Walk {
 
 /**
  * An HDF5 object's identity: the object reference h5wasm makes for it, which
- * is its address in the file, whatever path reached it. Null where the
- * reader cannot make one, and then that object is simply not tracked.
+ * is its address in its file, whatever path reached it — tagged with that
+ * file. An external link leads into another file, whose addresses can equal
+ * this file's (a copy of an object holds the same layout), so `file` names
+ * the file any external link on the way led to, and '' is this one. Null
+ * where the reader cannot make a reference, and then the object is not tracked.
  */
-function identity(o: H5): string | null {
+function identity(o: H5, file: string): string | null {
   try {
     const bytes = o.create_reference?.()?.ref_data as ArrayLike<number> | undefined
-    return bytes ? Array.from(bytes).join('.') : null
+    return bytes ? `${file}|${Array.from(bytes).join('.')}` : null
   } catch {
     return null
+  }
+}
+
+/** The file an external link named `name` in `group` leads to; '' for a link inside the same file. */
+function linkFile(group: H5, name: string): string {
+  try {
+    return String(group.get_external_link?.(`${group.path}/${name}`)?.filename ?? '')
+  } catch {
+    return ''
   }
 }
 
@@ -721,18 +739,21 @@ function spent(walk: Walk): string | null {
  * counts groups below the record's own entry (past RUN_MAX_DEPTH a group is
  * not read); the walk counts the groups and datasets read, for the record
  * (RUN_MAX_NODES) and for the whole section (RUN_SECTION_NODES); and an object
- * already reached, by this record or any other, is not read again.
+ * this record has already read is not read again. Only what is read is
+ * remembered as read, so "again" always points at content in the same record.
+ * `file` is the file an external link on the way led to ('' for this one).
  */
-function plain(o: H5, path: string, walk: Walk, depth = 0): unknown {
+function plain(o: H5, path: string, walk: Walk, depth = 0, file = ''): unknown {
   if (!isDataset(o) && !isGroup(o)) return null
   const stop = spent(walk)
   if (stop) {
     walk.crowded.add(walk.record)
     return `(not copied: ${path} lies past ${stop})`
   }
+  if (isGroup(o) && depth > RUN_MAX_DEPTH) return `(not copied: ${path} is nested more than ${RUN_MAX_DEPTH} groups below its record)`
   walk.visited++
   walk.section.visited++
-  const id = identity(o)
+  const id = identity(o, file)
   if (id !== null) {
     const first = walk.seen.get(id)
     if (first !== undefined) {
@@ -742,7 +763,6 @@ function plain(o: H5, path: string, walk: Walk, depth = 0): unknown {
     walk.seen.set(id, path)
   }
   if (isDataset(o)) return plainDataset(o, path)
-  if (depth > RUN_MAX_DEPTH) return `(not copied: ${path} is nested more than ${RUN_MAX_DEPTH} groups below its record)`
   const strings = nullableStrings(o)
   if (strings) {
     return strings.values.length > RUN_ARRAY_CAP
@@ -760,7 +780,7 @@ function plain(o: H5, path: string, walk: Walk, depth = 0): unknown {
       out['(not copied)'] = `${(keys.length - i).toLocaleString('en-US')} more entries of ${path}, past ${stop}`
       break
     }
-    out[keys[i]] = plain(o.get(keys[i]), `${path}/${keys[i]}`, walk, depth + 1)
+    out[keys[i]] = plain(o.get(keys[i]), `${path}/${keys[i]}`, walk, depth + 1, linkFile(o, keys[i]) || file)
   }
   return out
 }
@@ -852,10 +872,10 @@ function schemaSaysProvenance(o: H5): boolean {
  * record, and then that record is left out and named first, because the
  * records left out are named largest first. Written records keep uns order.
  *
- * All records are read in one walk: an object one record has read is named,
- * not read again, wherever else it is reached, and the section reads at most
- * RUN_SECTION_NODES groups and datasets; records it reaches after that are
- * left out, unread. A record over RUN_RECORD_BUDGET is written as a sentence
+ * Each record is read on its own: an object it reaches twice is read once in
+ * it, and two records that reach one object both copy it. The section reads at
+ * most RUN_SECTION_NODES groups and datasets; records it reaches after that
+ * are left out, unread. A record over RUN_RECORD_BUDGET is written as a sentence
  * naming its size. One entry, `leftOut`, and one note cover every record left
  * out.
  *
@@ -871,9 +891,8 @@ export function readRun(uns: H5, note: (s: string) => void): RunSection {
   const n = (x: number) => x.toLocaleString('en-US')
   const relinked = new Set<string>()
   const crowded = new Set<string>()
-  const seen = new Map<string, string>()
   const section = { visited: 0 }
-  const walkOf = (record: string): Walk => ({ record, seen, visited: 0, section, relinked, crowded })
+  const walkOf = (record: string): Walk => ({ record, seen: new Map(), visited: 0, section, relinked, crowded })
 
   // ---- found, in uns order; each entry inspected on its own -------------
   type Found = { path: string; kind: number; read: (say: (s: string) => void) => unknown }
@@ -889,7 +908,7 @@ export function readRun(uns: H5, note: (s: string) => void): RunSection {
         // The harness's record is one JSON string. Parsed, so that it reads
         // as the structure it is; kept as its text when it does not parse.
         found.push({ path, kind: 0, read: say => {
-          const v = plain(o, path, walkOf(path))
+          const v = plain(o, path, walkOf(path), 0, linkFile(uns, k))
           if (typeof v !== 'string') return v
           try {
             return JSON.parse(v)
@@ -899,13 +918,13 @@ export function readRun(uns: H5, note: (s: string) => void): RunSection {
           }
         } })
       } else if (named(k)) {
-        found.push({ path, kind: kindOf(k), read: () => plain(o, path, walkOf(path)) })
+        found.push({ path, kind: kindOf(k), read: () => plain(o, path, walkOf(path), 0, linkFile(uns, k)) })
       } else if (schemaSaysProvenance(o)) {
-        found.push({ path, kind: 3, read: () => plain(o, path, walkOf(path)) })
+        found.push({ path, kind: 3, read: () => plain(o, path, walkOf(path), 0, linkFile(uns, k)) })
       } else if (isDict(o)) {
         for (const c of o.keys() as string[]) {
           const at = `${path}/${c}`
-          if (named(c)) found.push({ path: at, kind: kindOf(c), read: () => plain(o.get(c), at, walkOf(at)) })
+          if (named(c)) found.push({ path: at, kind: kindOf(c), read: () => plain(o.get(c), at, walkOf(at), 0, linkFile(o, c) || linkFile(uns, k)) })
         }
       }
     } catch (e) {
@@ -964,7 +983,7 @@ export function readRun(uns: H5, note: (s: string) => void): RunSection {
     note(`${some(uninspected)} could not be inspected (${why}), so the run section cannot tell whether ${uninspected.length > 1 ? 'they hold records' : 'it holds a record'}`)
   }
   if (relinked.size) {
-    note(`${some([...relinked])} ${relinked.size > 1 ? 'reach' : 'reaches'} an HDF5 object by more than one link; the object is copied once, and each other link to it is named in place`)
+    note(`${some([...relinked])} ${relinked.size > 1 ? 'reach' : 'reaches'} an HDF5 object by more than one link; within the record the object is copied once, and each other link to it is named in place`)
   }
   if (crowded.size) {
     note(`${some([...crowded])} ${crowded.size > 1 ? 'were' : 'was'} read only to the ${n(RUN_MAX_NODES)} groups and datasets one record may take, or the ${n(RUN_SECTION_NODES)} the run section may; past that, the rest is named in place, unread`)

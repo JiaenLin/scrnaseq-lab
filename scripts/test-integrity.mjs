@@ -596,12 +596,16 @@ console.log('\nTHE RUN SECTION IS READ IN ONE WALK: AN OBJECT IS READ ONCE, WHAT
   })
   const s = convert(shared, 'shared.zip', ['--label', 'shared'], 60_000)
   attempt('400 records linked to one large group convert, in seconds', () => [s.r.code, s.r.seconds < 30], [0, true])
-  attempt('the group is copied once, under the first record, and every other record names it',
+  // Each record is read on its own, so five copy the group whole and the
+  // sixth reaches the section's 50,000 groups and datasets part-way through;
+  // the 394 after it are left out, unread.
+  attempt('the section stops reading at 50,000 groups and datasets, and leaves the rest out, unread',
     () => {
-      const recs = s.o.parts[0].meta.run.records.filter(x => /^uns\/r\d{4}_provenance$/.test(x.path))
-      return [recs.length, Object.keys(recs[0].record).length,
-        recs.slice(1).every(x => String(x.record).startsWith(`(not copied: ${x.path} is uns/r0000_provenance again`))]
-    }, [400, 9_990, true])
+      const run = s.o.parts[0].meta.run
+      const recs = run.records.filter(x => /^uns\/r\d{4}_provenance$/.test(x.path))
+      return [recs.length, recs.slice(0, 5).map(x => Object.keys(x.record).length), /past the 50,000 groups and datasets read for the run section$/.test(recs[5].record['(not copied)']), run.leftOut.count]
+    }, [6, [9_990, 9_990, 9_990, 9_990, 9_990], true, 394])
+  attempt('and the note says 394 were not read', () => s.o.parts[0].meta.notes.some(n => /394 of them were not read/.test(n)), true)
 
   // The section's own budget, on groups shaped like h5wasm's: 60 records of
   // 1,000 datasets each, every one its own object. After 50,000 groups and
@@ -618,6 +622,51 @@ console.log('\nTHE RUN SECTION IS READ IN ONE WALK: AN OBJECT IS READ ONCE, WHAT
     () => { const run = h5.readRun(uns, s => said.push(s)); return [run.records.length, run.leftOut.count, run.leftOut.paths[0]] },
     [50, 10, 'uns/r50_provenance'])
   attempt('and the note says how many were not read', () => said.filter(s => /left out of run/.test(s) && /10 of them were not read/.test(s)).length, 1)
+}
+
+console.log('\nAN OBJECT ONE RECORD READ IS NOT TAKEN FROM ANOTHER')
+{
+  // A holds a link to the tool's group and is over its budget, so its content
+  // is never written; B is the tool's group itself. Remembered across records,
+  // B became a pointer into A, and the tool's record was lost.
+  const toobig = copyWith(FIX.classic, 'toobig.h5ad', f => {
+    const t = dict(f, 'toolrec')
+    str(t, 'tool', 'B-tool')
+    str(t, 'version', '9.9')
+    str(t, 'commit', 'deadbeef')
+    const a = dict(f.get('uns'), 'a_provenance')
+    str(a, 'tool', 'A-tool')
+    for (const [name, k] of [['big', 1], ['big2', 2]]) {
+      enc(a.create_dataset({ name, data: Float64Array.from({ length: 9_000 }, (_v, i) => Math.sin(i * k + 0.5) * 1e6) }), 'array', '0.2.0')
+    }
+    a.create_hard_link('/toolrec', 'shared')
+    f.get('uns').create_hard_link('/toolrec', 'b_provenance')
+  })
+  const t = convert(toobig, 'toobig.zip', ['--label', 'toobig'])
+  attempt("a record that reaches what an unwritten record reached is still copied: the tool's record is not lost",
+    () => {
+      const run = t.o.parts[0].meta.run
+      return [/^\(not copied: [\d,]+ bytes as written/.test(run.records.find(x => x.path === 'uns/a_provenance').record),
+        run.records.find(x => x.path === 'uns/b_provenance').record]
+    }, [true, { commit: 'deadbeef', tool: 'B-tool', version: '9.9' }])
+
+  // Another file, a copy of the fixture with one more field in its
+  // integration record: the record's group sits at the same address in both
+  // files. Linked from this file, it was taken for this file's own.
+  const other = copyWith(FIX.classic, 'other.h5ad', f => str(f.get('uns/scintegrate/provenance'), 'origin', 'OTHER-FILE'))
+  const ext = copyWith(FIX.classic, 'extcollide.h5ad', f => {
+    const uns = f.get('uns')
+    uns.create_external_link(other, '/uns/scintegrate/provenance', 'extp_provenance')
+    const m = dict(uns, 'mix_provenance')
+    m.create_hard_link('/uns/scintegrate/provenance', 'local')
+    m.create_external_link(other, '/uns/scintegrate/provenance', 'remote')
+  })
+  const e = convert(ext, 'extcollide.zip', ['--label', 'extcollide'])
+  const rec = (p) => e.o.parts[0].meta.run.records.find(x => x.path === p)?.record
+  attempt('a record in another file, at the same address as one here, is copied as its own',
+    () => [rec('uns/extp_provenance')?.origin, rec('uns/scintegrate/provenance')?.origin], ['OTHER-FILE', undefined])
+  attempt('and inside one record, an object here and one in another file at the same address are both copied',
+    () => [rec('uns/mix_provenance')?.local?.tool, rec('uns/mix_provenance')?.remote?.origin], ['scintegrate', 'OTHER-FILE'])
 }
 
 console.log("\nWITHIN A KIND, FIRST FIT IN uns ORDER; WHAT IS LEFT OUT IS NAMED LARGEST FIRST")
