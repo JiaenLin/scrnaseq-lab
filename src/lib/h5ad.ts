@@ -535,8 +535,32 @@ function sampleMatrix(m: H5, want = 20000): Float64Array {
 /** Where the reader looks for the run's record. Written into the bundle beside what it found. */
 export const RUN_SEARCHED = 'uns/harness_run; every entry of uns, and every child of a dict directly under uns, named provenance or *_provenance; every dict directly under uns whose own schema names provenance'
 
-/** Arrays longer than this are named in a record rather than copied into it. */
+/** Arrays longer than this are named in a record rather than read into it. */
 const RUN_ARRAY_CAP = 10_000
+
+/**
+ * The most JSON one record may take, in characters; past it the record is
+ * named in place with its size, not copied.
+ *
+ * The run section is written into every part of a split object, so a record
+ * is paid for once per part. A tool's provenance is a few hundred characters
+ * to a few tens of thousands (an annotator's per-label counts on an atlas);
+ * a quarter of a million holds those with room to spare, and stops a record
+ * that is really a result (a log, a table) from being copied forty times.
+ */
+export const RUN_RECORD_BUDGET = 262_144
+
+/** The most the whole run section may take, in characters of JSON; later records are named. */
+export const RUN_SECTION_BUDGET = 1_048_576
+
+/**
+ * HDF5 type classes JSON has no form for, named in place rather than copied:
+ * a reference's bytes mean nothing outside its file, and opaque bytes, a
+ * bitfield or a time have no agreed reading.
+ */
+const UNHELD: Record<number, string> = {
+  2: 'HDF5 time values', 4: 'an HDF5 bitfield', 5: 'opaque HDF5 bytes', 7: 'HDF5 references',
+}
 
 /**
  * A dict in anndata's layout, or a plain group from a writer that names no encoding.
@@ -550,13 +574,20 @@ const isDict = (g: H5): boolean => {
   return isGroup(g) && (encoding === '' || encoding === 'dict')
 }
 
-/** One stored value as JSON can hold it: int64 as a number, NaN as "NaN". */
+/**
+ * One stored value as JSON can hold it: int64 as a number (its exact digits as
+ * a string past 2**53), NaN as "NaN", and a list — a compound row, an array
+ * member, a ragged row — value by value. A row of a structured array arrives
+ * as a list holding BigInts, and copying it as it came crashed the whole
+ * conversion at JSON.stringify.
+ */
 function jsonValue(v: unknown): unknown {
   if (typeof v === 'bigint') {
     return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v.toString()
   }
   if (typeof v === 'number') return Number.isFinite(v) ? v : String(v)
-  if (v instanceof Uint8Array) return new TextDecoder().decode(v)
+  if (Array.isArray(v) || ArrayBuffer.isView(v)) return Array.from(v as ArrayLike<unknown>, jsonValue)
+  if (v !== null && typeof v === 'object') return '(not copied: a value JSON has no form for)'
   return v ?? null
 }
 
@@ -569,19 +600,46 @@ function nest(flat: unknown[], shape: number[]): unknown[] {
   return out
 }
 
-/** A dataset as JSON: a scalar as itself, an array as a list (nested by shape). */
+/**
+ * A dataset as JSON: a scalar as itself, an array as a list (nested by shape),
+ * a structured array as one object per row under its field names.
+ *
+ * What cannot be copied is named in place, so one odd leaf never costs the
+ * rest of its record.
+ */
 function plainDataset(d: H5, path: string): unknown {
+  const info = d.metadata ?? {}
+  const unheld = UNHELD[info.type as number]
+  if (unheld) return `(not copied: ${path} holds ${unheld})`
+  if (info.type === 1 && info.size === 2) return `(not copied: ${path} is float16, which this reader cannot read)`
   const shape = (d.shape as number[] | undefined) ?? []
   const size = shape.reduce((a, b) => a * b, 1)
   if (size > RUN_ARRAY_CAP) return `(not copied: ${path} holds ${size.toLocaleString('en-US')} values)`
-  const v = d.value
+  let v: unknown
+  try {
+    v = d.value
+  } catch (e) {
+    return `(not copied: ${path} could not be read: ${(e as Error).message})`
+  }
   if (v == null) return `(not copied: ${path} is of a type this reader cannot read)`
   // h5py stores a numpy bool as an HDF5 enum of FALSE and TRUE, and h5wasm
-  // hands back the integer. It was a boolean when it was written.
-  const members = d.metadata?.enum_type?.members as Record<string, number> | undefined
+  // hands back the integer. It was a boolean when it was written; any other
+  // enum value is its member's name.
+  const members = info.enum_type?.members as Record<string, number> | undefined
   const bool = !!members && Object.keys(members).length === 2 && 'TRUE' in members && 'FALSE' in members
-  const one = (x: unknown) => (bool ? Number(x) === members!.TRUE : jsonValue(x))
-  if (!shape.length) return one(typeof v === 'object' && v !== null && 'length' in v ? (v as ArrayLike<unknown>)[0] : v)
+  const fields = info.compound_type?.members as { name: string }[] | undefined
+  const one = (x: unknown): unknown => {
+    if (bool) return Number(x) === members!.TRUE
+    if (members) return Object.keys(members).find(k => members[k] === Number(x)) ?? jsonValue(x)
+    if (fields && Array.isArray(x)) return Object.fromEntries(fields.map((f, i) => [f.name, jsonValue(x[i])]))
+    return jsonValue(x)
+  }
+  if (!shape.length) {
+    // A scalar comes back as itself, or wrapped in a one-element list; a
+    // compound scalar is its row of fields, possibly wrapped the same way.
+    if (fields) return one(Array.isArray(v) && Array.isArray(v[0]) ? v[0] : v)
+    return one(typeof v === 'object' && 'length' in v ? (v as ArrayLike<unknown>)[0] : v)
+  }
   return nest(Array.from(v as ArrayLike<unknown>, one), shape)
 }
 
@@ -616,19 +674,39 @@ function schemaSaysProvenance(o: H5): boolean {
  * Every record of the run the object carries, in uns order.
  *
  * A record that cannot be read is listed with a null record and a note, never
- * dropped: an absent entry would read as "this object has no such record".
+ * dropped: an absent entry would read as "this object has no such record". A
+ * record past RUN_RECORD_BUDGET, or one that would take the section past
+ * RUN_SECTION_BUDGET, is listed as a sentence naming its size.
  */
 function readRun(uns: H5, note: (s: string) => void): RunSection {
   const records: RunRecord[] = []
   if (!isGroup(uns)) return { searched: RUN_SEARCHED, records }
   const named = (k: string) => k === 'provenance' || k.endsWith('_provenance')
+  const n = (x: number) => x.toLocaleString('en-US')
+  let spent = 0
   const take = (path: string, read: () => unknown) => {
+    let record: unknown
+    let size: number
     try {
-      records.push({ path, record: read() })
+      record = read() ?? null
+      // Serialised here, inside the try, because the bundle's meta.json is
+      // written by JSON.stringify too: anything JSON cannot hold must fail
+      // this record, never the conversion.
+      size = JSON.stringify(record).length
     } catch (e) {
       note(`${path} could not be read (${(e as Error).message}); run lists it without its content`)
       records.push({ path, record: null })
+      return
     }
+    if (size > RUN_RECORD_BUDGET) {
+      record = `(not copied: ${n(size)} characters of JSON, over the ${n(RUN_RECORD_BUDGET)} one record may take)`
+      note(`${path} is ${n(size)} characters of JSON, over the ${n(RUN_RECORD_BUDGET)} budget for one record, so run names it with its size instead of copying it into every part`)
+    } else if (spent + size > RUN_SECTION_BUDGET) {
+      record = `(not copied: ${n(size)} characters of JSON; the run section had reached its ${n(RUN_SECTION_BUDGET)} budget)`
+      note(`${path} (${n(size)} characters of JSON) would take the run section past its ${n(RUN_SECTION_BUDGET)} budget, so run names it with its size instead of copying it`)
+    }
+    spent += JSON.stringify(record).length
+    records.push({ path, record })
   }
   for (const k of uns.keys() as string[]) {
     const path = `uns/${k}`
