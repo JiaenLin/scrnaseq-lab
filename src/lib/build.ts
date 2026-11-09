@@ -21,6 +21,22 @@ export const SCHEMA = 'scrnaseq-studio/bundle@1'
 
 export class BuildError extends Error {}
 
+/**
+ * The modification time stamped on every entry of a bundle.
+ *
+ * Fixed, so that converting one object twice gives the same bytes and a sha256
+ * can say that two conversions agree. Left to the default, fflate stamps the
+ * current time, and two conversions of the same object differed in nothing
+ * but that.
+ *
+ * Built from LOCAL date parts, not from an epoch, because fflate encodes the
+ * DOS date and time from local-time getters: 1980-01-01 12:00 constructed in
+ * any time zone encodes to the same two words. Noon, so that no zone's
+ * offset change near midnight can move it to another day. 1980 is the first
+ * year a zip entry can carry.
+ */
+const ZIP_MTIME = new Date(1980, 0, 1, 12, 0, 0)
+
 /** One 2D embedding inside the bundle. */
 export interface EmbeddingEntry {
   /** The name the object gave it, e.g. `X_UMAP`. */
@@ -634,6 +650,6 @@ export function buildBundle(
   }
 
   onProgress('Compressing')
-  const zip = zipSync(files, { level: 6 })
+  const zip = zipSync(files, { level: 6, mtime: ZIP_MTIME })
   return { zip, meta, pseudobulkColumns: pbColumns }
 }
