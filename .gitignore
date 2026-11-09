@@ -29,4 +29,7 @@ dist-ssr
 *.h5Seurat
 *.loom
 *.zip
+# ...except the synthetic test objects, which scripts/make-family-fixture.py writes from
+# made-up names and numbers (nothing real may ever replace them)
+!scripts/fixtures/*.h5ad
 .verify-tmp/
