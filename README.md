@@ -153,9 +153,11 @@ Some things are named in place, with a note, rather than copied:
 - **What JSON has no form for:** float16, an HDF5 reference, opaque bytes, a dataframe or a
   sparse matrix. The rest of the record is still copied.
 - **Anything nested more than 16 groups below its record.**
-- **An HDF5 object reached a second time,** by the same record or another, through any
-  link (a hard link back to an ancestor, a second hard or soft link). It is copied once, and
-  each other link to it is named. All records are read in one walk.
+- **An HDF5 object a record reaches a second time** through another link (a hard link back to
+  an ancestor, a second hard or soft link). Within that record it is copied once, and each
+  other link to it is named. Each record is read on its own, so two records that reach one
+  object both copy it. An object reached through an external link is told apart by its file
+  as well as its address.
 - **Anything past 10,000 groups and datasets read for one record.** The whole section reads
   at most 50,000. Records it reaches after that are left out, unread.
 - **A record too large to copy into every part.** The section goes into every part of a split
