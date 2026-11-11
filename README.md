@@ -148,7 +148,7 @@ by row, under its field names. When the object carries none, `run.records` is em
 note says so; `run.searched` says where the lab looked. A Seurat object has no `uns`, so its
 bundle has no `run`. Readers that do not know the field ignore it.
 
-Some things are named in place, with a note, rather than copied:
+Some things are named in place rather than copied (the last three with a note as well):
 
 - **What JSON has no form for:** float16, an HDF5 reference, opaque bytes, a dataframe or a
   sparse matrix. The rest of the record is still copied.
@@ -156,8 +156,9 @@ Some things are named in place, with a note, rather than copied:
 - **An HDF5 object a record reaches a second time** through another link (a hard link back to
   an ancestor, a second hard or soft link). Within that record it is copied once, and each
   other link to it is named. Each record is read on its own, so two records that reach one
-  object both copy it. An object reached through an external link is told apart by its file
-  as well as its address.
+  object both copy it. An object reached through an external link is told apart by the file
+  name its link gives as well as its address, so two files linked under one name from
+  different folders are not told apart.
 - **Anything past 10,000 groups and datasets read for one record.** The whole section reads
   at most 50,000. Records it reaches after that are left out, unread.
 - **A record too large to copy into every part.** The section goes into every part of a split
