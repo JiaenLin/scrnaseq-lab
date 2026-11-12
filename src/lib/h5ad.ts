@@ -1002,10 +1002,12 @@ function readIdentity(rec: H5, path: string): Identity {
  * string such as the harness's JSON, an array, a group of another encoding) is
  * named with what it is, and nothing of it is read. The first value longer than
  * RUN_FIELD_MAX ends the reading, so a long value is read once, however many
- * records reach it. Every record found and not listed (none of the six, not a
- * dict, unreadable, past the cap, after that value) is counted in `leftOut`, in
- * uns order, the first ten named: a reader of the bundle that sees no record
- * still learns that one was found. Nothing here can stop the conversion.
+ * records reach it. The records past the cap and after that value are counted
+ * in `leftOut`, in uns order, the first ten named. When no record is listed, so
+ * is every other record found (none of the six, not a dict, unreadable): a
+ * reader of the bundle that sees no record still learns that one was found.
+ * Beside a listed record those are named in the notes only. Nothing here can
+ * stop the conversion.
  */
 function readRun(uns: H5, note: (s: string) => void): RunSection {
   const records: RunRecord[] = []
@@ -1087,9 +1089,15 @@ function readRun(uns: H5, note: (s: string) => void): RunSection {
   if (pastCap.length) {
     note(`${n(found.length)} records were found and run reads the first ${RUN_MAX_RECORDS}: the ${n(pastCap.length)} after them ${pastCap.length > 1 ? 'were' : 'was'} not read: ${some(pastCap)}`)
   }
+  // Beside a listed record, `leftOut` holds only what the budget left out (past
+  // the cap, after the long value): a reader of the bundle says those were left
+  // out over its budget, which is false of the others, and the notes name them.
+  // When none is listed, it holds every record found, so that a reader that
+  // sees no record still learns that one was found.
+  const leftOut = records.length ? [...afterLong, ...pastCap] : unlisted
   return {
     searched: RUN_SEARCHED, records,
-    ...(unlisted.length ? { leftOut: { count: unlisted.length, paths: unlisted.slice(0, 10) } } : {}),
+    ...(leftOut.length ? { leftOut: { count: leftOut.length, paths: leftOut.slice(0, 10) } } : {}),
   }
 }
 

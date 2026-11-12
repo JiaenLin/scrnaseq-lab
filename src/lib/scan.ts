@@ -105,11 +105,12 @@ export interface RunSection {
    */
   records: RunRecord[]
   /**
-   * Every record found and not listed, in uns order: one that holds none of
-   * the six, one that is not a dict, one that could not be read, one past the
-   * first 64, one after a value longer than 256 characters ended the reading
-   * (the notes say which). How many, and the first ten paths. Absent when every
-   * record found is listed.
+   * The records found that the budget left out, in uns order: one past the
+   * first 64, one after a value longer than 256 characters ended the reading.
+   * When no record is listed, every record found: also one that holds none of
+   * the six, one that is not a dict, one that could not be read (beside a
+   * listed record those are in the notes only). How many, and the first ten
+   * paths. Absent when there is none.
    */
   leftOut?: { count: number; paths: string[] }
 }

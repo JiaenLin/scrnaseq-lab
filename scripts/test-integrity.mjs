@@ -683,6 +683,62 @@ console.log("\nTHE READER ON THE SHAPES THE FAMILY'S TOOLS WRITE")
       notesOf(part, /^uns\/scqc: run carries its tool, version, commit and run_key; not carried: 14 other entries$/).length,
       notesOf(part, /^uns\/cell_type_provenance holds none of .* so run does not list it; not carried: 8 other entries$/).length,
       notesOf(part, /^uns\/harness_run is a string/).length, notesOf(part, /scprofile/).length], [1, 1, 1, 1, 0])
+  // The deployed Studio says of every leftOut entry beside a listed record that
+  // it was left out over the bundle's budget: no budget left these two out.
+  attempt('beside the listed records, the column record and the harness string are in the notes only: nothing is counted in leftOut',
+    () => [fr.r.code, part.meta.run.leftOut ?? null], [0, null])
+}
+
+console.log('\nRUN.LEFTOUT BY THE STATE OF THE RECORDS: BESIDE A LISTED RECORD, ONLY WHAT THE BUDGET LEFT OUT')
+{
+  // Fix round 2's truth table: {0, 1, 2 listed} x {no other, one holding none
+  // of the six, one not a dict} x {no tail, past the cap, after a long value}.
+  // uns iterates by name, so names set the order: the others (a..), the listed
+  // (l..), the tail (z..). Past the cap needs 64 records read before it, so
+  // there the other kind fills what the listed do not (64 - L of it); with no
+  // other kind the 64 are listed, the one row of that column. The long value is
+  // the last listed record's version; with none listed it is a tool, and that
+  // record holds none of the six. The deployed Studio says, with no record
+  // listed, "None of the N run records the converter found in the object was
+  // copied into this bundle: ..."; beside one, "N more records the converter
+  // found, left out of this bundle over its budget: ...".
+  const p2 = (i) => String(i).padStart(2, '0')
+  const rows = []
+  for (const L of [0, 1, 2]) {
+    for (const O of ['none', 'six-less', 'not-a-dict']) {
+      for (const T of ['none', 'cap', 'long']) {
+        if (O === 'none' && T === 'cap') { if (L === 0) rows.push({ L: 64, O, T }); continue }
+        rows.push({ L, O, T })
+      }
+    }
+  }
+  for (const { L, O, T } of rows) {
+    const others = O === 'none' ? 0 : T === 'cap' ? 64 - L : 1
+    const name = `tt-${L}-${O}-${T}`
+    const c = convert(copyWith(FIX.mask, `${name}.h5ad`, f => {
+      const uns = f.get('uns')
+      for (let i = 0; i < others; i++) {
+        if (O === 'six-less') int(dict(uns, `a${p2(i)}_provenance`), 'tool', 7)
+        else str(uns, `a${p2(i)}_provenance`, '{"tool": "h"}')
+      }
+      for (let i = 0; i < L; i++) {
+        const r = dict(uns, `l${p2(i)}_provenance`)
+        str(r, 'tool', `l${p2(i)}-tool`)
+        if (T === 'long' && i === L - 1) str(r, 'version', 'L'.repeat(257))
+      }
+      if (T === 'long' && L === 0) str(dict(uns, 'l00_provenance'), 'tool', 'L'.repeat(257))
+      for (let i = 0; i < (T === 'cap' ? 2 : T === 'long' ? 1 : 0); i++) str(dict(uns, `z${i}_provenance`), 'tool', `z${i}-tool`)
+    }), `${name}.zip`, ['--label', 'p'])
+    const run = c.o?.parts[0].meta.run
+    const a = Array.from({ length: others }, (_v, i) => `uns/a${p2(i)}_provenance`)
+    const z = Array.from({ length: T === 'cap' ? 2 : T === 'long' ? 1 : 0 }, (_v, i) => `uns/z${i}_provenance`)
+    const left = L === 0 ? [...a, ...(T === 'long' ? ['uns/l00_provenance'] : []), ...z] : z
+    attempt(`${L} listed, ${O === 'none' ? 'no other' : `${others} ${O}`}, ${{ none: 'no tail', cap: '2 past the cap', long: '1 after a long value' }[T]}: leftOut ${left.length ? `counts ${left.length}` : 'is absent'}${L && others ? ', the others in the notes only' : ''}`,
+      () => [c.r.code, run?.records.map(x => x.path), run?.leftOut ?? null,
+        notesOf(c.o.parts[0], /^uns\/a\d\d_provenance (holds none of|is a string, not a dict)/).length],
+      [0, Array.from({ length: L }, (_v, i) => `uns/l${p2(i)}_provenance`),
+        left.length ? { count: left.length, paths: left.slice(0, 10) } : null, others])
+  }
 }
 
 console.log('\nA RECORD OF ODD SHAPES CONVERTS, AND ONLY ITS IDENTITY IS READ')
@@ -867,9 +923,9 @@ console.log('\nA RECORD FOUND AND NOT LISTED IS COUNTED WHERE A READER OF THE BU
     () => [bare.r.code, runOf(bare)?.records, runOf(bare)?.leftOut ?? null], [0, [], null])
   attempt('the only record found holds none of the six: none listed, and it is counted and named in leftOut',
     () => [none.r.code, runOf(none)?.records, runOf(none)?.leftOut], [0, [], { count: 1, paths: ['uns/x_provenance'] }])
-  attempt('a record that is not a dict is counted beside one that is listed',
-    () => [odd.r.code, runOf(odd)?.records, runOf(odd)?.leftOut],
-    [0, [{ path: 'uns/a_provenance', record: { tool: 'a-tool' } }], { count: 1, paths: ['uns/harness_run'] }])
+  attempt('a record that is not a dict, beside one that is listed, is named in the notes and not counted in leftOut',
+    () => [odd.r.code, runOf(odd)?.records, runOf(odd)?.leftOut ?? null, notesOf(odd.o?.parts[0], /^uns\/harness_run is a string, not a dict/).length],
+    [0, [{ path: 'uns/a_provenance', record: { tool: 'a-tool' } }], null, 1])
   const cut = convert(copyWith(FIX.mask, 'cut-record.h5ad', f => {
     const r = dict(f.get('uns'), 'a_provenance')
     str(r, 'tool', 'CUT-TOOL'); str(r, 'version', 'L'.repeat(257)); str(r, 'commit', 'CUT-COMMIT'); str(r, 'job', 'CUT-JOB')

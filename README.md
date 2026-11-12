@@ -156,14 +156,16 @@ of the six as such a string is not listed, and its note says so; one that is not
 An integration stage writes its `job` as a dict of scheduler, id and host, so that `job` is
 named as a group and not carried.
 
-At most 64 records are read, in `uns` order. Every record found and not listed is counted in
-`run.leftOut`, in `uns` order, with the first ten named: one that holds none of the six, one
-that is not a dict, one that could not be read, one past the 64th, one after a long value. So a
-bundle that lists no record still says that one was found, and the notes say why each was left
-out. A record cut by a long value keeps the fields read before it, and its note names the fields
-of the six it holds that were not read. The first string longer than 256 characters ends the reading, so that
-one long value is read once, however many records reach it; the records after it are counted in
-`run.leftOut` too. When the object carries no record, `run.records` is empty and a note says
+At most 64 records are read, in `uns` order. The records the budget left out, one past the 64th
+and one after a long value, are counted in `run.leftOut`, in `uns` order, with the first ten
+named. When no record is listed, `run.leftOut` counts every record found: also one that holds
+none of the six, one that is not a dict and one that could not be read, so a bundle that lists
+no record still says that one was found. Beside a listed record those three are named in the
+notes only, since a reader of the bundle says a record in `run.leftOut` beside listed ones was
+left out over the bundle's budget. The notes say why each was left out. A record cut by a long
+value keeps the fields read before it, and its note names the fields of the six it holds that
+were not read. The first string longer than 256 characters ends the reading, so that one long
+value is read once, however many records reach it. When the object carries no record, `run.records` is empty and a note says
 so; `run.searched` says where the lab looked. A Seurat object has no `uns`, so its bundle has no
 `run`. Readers that do not know the field ignore it. An `uns` entry that cannot even be
 inspected (an attribute the reader cannot read) is named in a note and never stops the
