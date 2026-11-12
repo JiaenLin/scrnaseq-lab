@@ -222,6 +222,46 @@ Genes with no symbol keep their accession and are counted; several accessions sh
 symbol keep their own rows and are counted — merging them would sum two genes under one
 name.
 
+## What it states about the object, and from where
+
+Every statement a bundle makes about its object is one row of a closed table
+(`src/lib/facts.ts`), written into `meta.facts` with its source, in the shapes the studio
+reads (its `tools/BUNDLE.md`, section "facts"). Only a recorded fact, with its place, may be
+read as "as recorded in the object".
+
+| fact | kind | where it comes from |
+|---|---|---|
+| integration method, and that method's embedding | recorded | `default_method` and `default_embedding` in a dict directly under `uns` |
+| normalization | recorded | scanpy's own record, `uns/log1p` |
+| doublet tool, ambient-RNA tool | recorded | `doublet_method`, `ambient_method` in a dict directly under `uns` |
+| what the expression values are | measured | `expm1` summed per cell over up to 2,000 cells in 8 runs spread over the object: "scaled to N per cell" only when every sum is within 0.1% of N |
+| raw counts | measured | the first matrix whose sampled values are integers (or log1p of integers), on the whole object; carried, or not and why |
+| per-cell total, genes detected | recorded or measured | an obs column at a standard key (named), or summed from the matrix it names: a total is of counts only when that matrix holds them |
+| mitochondrial % | recorded | an obs column at a standard key |
+| cell type column, the embedding that opens, the cells not called | chosen | a flag, the command's guess from a name, or the app's page |
+| gene identifiers | measured | every gene name, the accessions counted |
+
+**Nothing is decided from a name.** An embedding called `X_harmony` is not a record that
+harmony was run, a column called `predicted_doublet` is not a record of a doublet tool, and a
+key holding "pca" is not a PCA. Where the place holds nothing the fact is "not recorded", with
+the place the lab looked; two places that both record one are named in the notes and neither
+is stated. A value at the place is carried only as one line of 64 characters or fewer without
+markup; anything else is named in the notes and stays in the object. The older `provenance`
+fields hold the recorded value or null. A Seurat object's records are not read, so a bundle
+from one states none of the recorded facts. The cells the annotator did not call are counted,
+on every embedding carried, for those with no finite coordinates.
+
+**The page says what the build does.** What the app shows before converting (whether the
+object is held in parts, which embeddings travel and which do not, whether the raw counts
+travel, whether pseudobulk will be possible) is the plan of `src/lib/plan.ts`, and the command
+and the worker run that plan.
+
+**A split object's raw counts are not carried, and that is said.** An object held in parts is
+read for one matrix, the expression; its counts stay in the object. The page says so before
+converting, the notes of the collection and of every part say so, and `meta.facts.counts`
+says it with `carried: false` and why. Its per-cell totals are then sums of the expression
+matrix, and name it.
+
 ## Decisions it makes, and shows
 
 Slot names lie. An `.h5ad` routinely keeps scaled values in `X` and `log1p(counts)` in `.raw`;
@@ -384,6 +424,8 @@ whose `encoding-type` attribute is float16, which anndata itself refuses to read
 
 ## Known limits
 
+- **A split object's raw counts are not carried** (said in the page, the notes and
+  `meta.facts.counts`), so pseudobulk sums cannot be saved from an object held in parts.
 - **`.rds` is still read whole.** The lazy path is `.h5ad` only: R's serialization is a stream
   with no index, so it cannot be read out of order. Very large Seurat objects remain limited by
   memory — save as `.h5ad` if yours is big.
