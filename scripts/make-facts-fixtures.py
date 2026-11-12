@@ -46,7 +46,8 @@ rng = np.random.default_rng(20261112)
 TYPES = ["type_a", "type_b", "type_c", "type_d"]
 samples = np.array([f"s{i % 8 + 1}" for i in range(n)])
 group = np.array(["g1" if int(s[1:]) <= 4 else "g2" for s in samples])
-label = np.array([TYPES[i % 4] for i in range(n)], dtype=object)
+# every sample holds every cell type, as in the real object
+label = np.array([TYPES[(i // 8) % 4] for i in range(n)], dtype=object)
 label[np.arange(n) % 12 == 5] = "EXCLUDED"
 label[np.arange(n) % 12 == 7] = "UNRESOLVED"
 excluded = label == "EXCLUDED"
