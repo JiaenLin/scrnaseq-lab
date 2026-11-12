@@ -931,7 +931,7 @@ function readRecorded(uns: H5, obsmKeys: string[], note: (s: string) => void): N
       if (str === null) {
         note(`${at} is ${kind ?? 'a value that could not be read as a string'}, so it is not read as the object's record of ${WHAT[id]}`)
       } else if (!isLine(str, MAX_VALUE) || !isLine(at, MAX_PLACE)) {
-        note(`${at} holds more than one line of ${MAX_VALUE} characters without markup, so it is not carried as the object's record of ${WHAT[id]}; it stays in the object`)
+        note(`${at} holds a value that is not one line of ${MAX_VALUE} characters or fewer without markup, so it is not carried as the object's record of ${WHAT[id]}; it stays in the object`)
       } else {
         hits.get(id)!.push({ value: str, at })
       }
