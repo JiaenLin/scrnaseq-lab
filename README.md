@@ -173,7 +173,9 @@ the converter lets HDF5 open no other file. What the scan meets that leads out o
 read as absent and named once, in one note, with its target as the link states it: an external
 link, whatever file it names (the input's own name included), a soft link that reaches nothing
 in the file, a virtual dataset whose values lie in another file, and a dataset whose values are
-stored in another file (one value of each array is read first to tell). This holds for the
+stored in another file (one value of each array is read first to tell; a dataset compressed with
+a filter this reader lacks, such as LZF, is named this way too, since HDF5 looks for the filter
+as a file). This holds for the
 observations, the variables, the matrix and its layers, the embeddings and `uns` alike, so the
 same input gives the same bundle, whatever sits beside it. An ordinary soft or hard link inside
 the file still reads.
