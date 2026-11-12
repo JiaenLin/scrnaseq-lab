@@ -79,8 +79,20 @@ export function resolveRoles(scan: Scan, a: ConvertArgs): Resolved {
     const shown = values.length ? values.map(v => `--${flag} ${shell(v)}`).join(' ') : `--${flag} none`
     said.push(`guessed ${shown}  (${why})`)
   }
+  // A column the reader could not read is absent from the scan. One a flag
+  // names, or one named like a role that is being guessed, would be in use, so
+  // the command stops and names it rather than build the bundle without it.
+  const lostAs = (name: string) => scan.unreadableColumns?.find(u => u.name === name)
+  const guessing = (role: 'cluster' | 'sample' | 'condition') => {
+    const u = scan.unreadableColumns?.find(x => namedLike(x.name, role))
+    if (u) {
+      throw new CliError(`obs/${u.name} could not be read (${u.why}), and it is named like ${ROLE_WORD[role]}: the conversion stops rather than guess ${ROLE_WORD[role]} without it. Name ${ROLE_WORD[role]} with --${role}${role === 'cluster' ? '' : ` (or --${role} none)`} to convert without it`, EXIT.input)
+    }
+  }
   const named = (flag: string, name: string, role: Role, taken: (string | null)[] = []): Column => {
     const c = col(name)
+    const u = c ? undefined : lostAs(name)
+    if (u) throw new CliError(`--${flag} ${name}: obs/${name} could not be read (${u.why}), so the conversion stops`, EXIT.input)
     if (!c) {
       throw new CliError(`--${flag} ${name}: this object has no obs column called "${name}". Its columns are: ${scan.columns.map(x => x.name).join(', ') || '(none)'}`, EXIT.roles)
     }
@@ -95,6 +107,7 @@ export function resolveRoles(scan: Scan, a: ConvertArgs): Resolved {
   if (a.cluster !== undefined) {
     cluster = named('cluster', a.cluster, 'cluster').name
   } else {
+    guessing('cluster')
     const g = guessCluster(scan)
     if (!g) throw new CliError('no column can be the cell annotation: none is a grouping of 2 to 300 levels. Name one with --cluster', EXIT.build)
     cluster = g
@@ -106,6 +119,7 @@ export function resolveRoles(scan: Scan, a: ConvertArgs): Resolved {
   if (a.sample !== undefined) {
     sample = isNone(a.sample) ? null : named('sample', a.sample, 'sample', [cluster]).name
   } else {
+    guessing('sample')
     sample = guessRole(scan, 'sample', [cluster])
     say('sample', sample ? [sample] : [], sample ? 'named like a sample' : 'no column is named like a sample')
   }
@@ -119,6 +133,7 @@ export function resolveRoles(scan: Scan, a: ConvertArgs): Resolved {
   if (a.condition !== undefined) {
     condition = isNone(a.condition) ? null : named('condition', a.condition, 'condition', [cluster, sample]).name
   } else if (sampleCol) {
+    guessing('condition')
     // `candidates` ranks by name first, then the coarsest — and keeps obs order
     // among equals — so among the factors this is the conventional choice.
     const pick = candidates(scan, 'condition', [cluster, sample]).find(c => isFactor.has(c.name)) ?? null
@@ -127,6 +142,7 @@ export function resolveRoles(scan: Scan, a: ConvertArgs): Resolved {
       : namedLike(pick.name, 'condition') ? 'named like a condition, and one value in every sample'
       : 'one value in every sample; no such column is named like a condition')
   } else {
+    guessing('condition')
     condition = guessRole(scan, 'condition', [cluster])
     say('condition', condition ? [condition] : [], condition
       ? 'named like a condition; with no sample column, nothing tells a factor from a cell label'

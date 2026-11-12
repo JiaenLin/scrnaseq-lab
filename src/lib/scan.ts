@@ -105,9 +105,11 @@ export interface RunSection {
    */
   records: RunRecord[]
   /**
-   * The records found and not read: past the first 64, or after a value longer
-   * than 256 characters ended the reading. How many, and the first ten paths.
-   * Absent when every record found was read.
+   * Every record found and not listed, in uns order: one that holds none of
+   * the six, one that is not a dict, one that could not be read, one past the
+   * first 64, one after a value longer than 256 characters ended the reading
+   * (the notes say which). How many, and the first ten paths. Absent when every
+   * record found is listed.
    */
   leftOut?: { count: number; paths: string[] }
 }
@@ -175,6 +177,13 @@ export interface Scan {
   run?: RunSection
   /** Everything the reader had to decide, in the order it decided it. */
   notes: string[]
+  /**
+   * The obs columns the reader could not read (HDF5 failed the read, their
+   * codes are not integers, or a part of them is not in the file), and why.
+   * They are absent from `columns` and named in the notes; a command that
+   * would use one for a role stops instead (src/cli/roles.ts).
+   */
+  unreadableColumns?: { name: string; why: string }[]
 }
 
 /** The three questions the lab asks, plus whatever else is worth carrying. */

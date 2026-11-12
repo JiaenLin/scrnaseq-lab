@@ -21,9 +21,9 @@ import { writeChunked, readGenes, makeChunkCache } from '../src/lib/chunked.ts'
 const TARGET = (Number(process.argv[2]) || 25) * 1e6
 const ms = t => `${((Date.now() - t) / 1000).toFixed(1)} s`
 
-const { FS } = await h5wasm.ready
+const lib = await h5wasm.ready
 let t = Date.now()
-const f = openInput(h5wasm, FS, 'E:/developing_mouse_nervous_system.h5ad')
+const f = openInput(h5wasm, lib, 'E:/developing_mouse_nervous_system.h5ad')
 const scan = scanOpenH5ad(f, 'developing_mouse_nervous_system.h5ad')
 const M = scan.matrices[0]
 const nnzPer = M.nnzPerCell()

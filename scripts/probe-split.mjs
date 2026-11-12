@@ -5,9 +5,9 @@ import { buildBundle } from '../src/lib/build.ts'
 import { column } from '../src/lib/scan.ts'
 import { parseBundle, bundleDataset } from '../../scrnaseq-studio/src/lib/bundle.ts'
 
-const { FS } = await h5wasm.ready
+const lib = await h5wasm.ready
 const t0 = Date.now()
-const f = openInput(h5wasm, FS, 'E:/developing_mouse_nervous_system.h5ad')
+const f = openInput(h5wasm, lib, 'E:/developing_mouse_nervous_system.h5ad')
 const scan = scanOpenH5ad(f, 'developing_mouse_nervous_system.h5ad')
 console.log(`scanned 9.3 GB in ${Date.now() - t0} ms`)
 console.log(`${scan.nCells.toLocaleString()} cells - ${scan.columns.length} columns - matrices:`,

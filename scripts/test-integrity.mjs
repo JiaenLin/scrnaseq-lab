@@ -62,6 +62,9 @@ const FIX = {
   unreadable: here('./fixtures/uns-unreadable.h5ad'),
   stored: here('./fixtures/stored-outside.h5ad'),
   storedBin: here('./fixtures/stored-outside.bin'),
+  damaged: here('./fixtures/damaged-reads.h5ad'),
+  half: here('./fixtures/damaged-half.h5ad'),
+  onlyMatrix: here('./fixtures/damaged-only-matrix.h5ad'),
 }
 const BIN = here('../bin/scrnaseq-lab.mjs')
 const tmp = mkdtempSync(join(tmpdir(), 'lab-integrity-test-'))
@@ -468,13 +471,14 @@ console.log('\nONE FILE: A LINK OUT OF THE INPUT IS NAMED ONCE AND NEVER READ')
   const all = one.o ? bundleText(one.o) : ''
   attempt('it converts, and nothing of either other file is in the bundle',
     () => [one.r.code, ['OUTSIDE-INPUT-TOKEN', 'SIBLING-FILE-CONTENT', 'SIBLING-TOOL'].filter(s => all.includes(s))], [0, []])
-  attempt('one note names each link not followed, once, with its target as the link states it',
+  attempt('one note names each link not followed, once, by its own place in the file, and carries no target',
     () => {
       const n = notesOf(part, /^the converter reads only the file it is given/)
-      return [n.length, ...[`uns/abs_provenance (an external link to /secret in ${secret})`, 'uns/e_provenance (an external link to /rec in other.h5)',
-        'uns/f_provenance/version (an external link to /rec/tool in other.h5)', 'uns/o_provenance (a soft link to /nowhere, which reaches nothing in this file)',
-        'obsm/X_away (an external link to /rec in other.h5)', 'layers/away (an external link to /rec in other.h5)'].map(s => (n[0] ?? '').split(s).length - 1)]
-    }, [1, 1, 1, 1, 1, 1, 1])
+      const out = 'an external link, which points outside this file'
+      return [n.length, ...[`uns/abs_provenance (${out})`, `uns/e_provenance (${out})`, `uns/f_provenance/version (${out})`,
+        'uns/o_provenance (a soft link that reaches nothing in this file)', `obsm/X_away (${out})`, `layers/away (${out})`]
+        .map(s => (n[0] ?? '').split(s).length - 1), [secret, away, 'other.h5', '/nowhere'].filter(t => all.includes(t))]
+    }, [1, 1, 1, 1, 1, 1, 1, []])
   attempt('an ordinary soft link inside the file still reads: the record it reaches carries its identity',
     () => [JSON.stringify(recOf(part, 'uns/mirror_provenance')), JSON.stringify(recOf(part, 'uns/f_provenance'))],
     [JSON.stringify(recOf(g, 'uns/scintegrate/provenance')), JSON.stringify({ tool: 'F-TOOL' })])
@@ -775,6 +779,118 @@ console.log('\nCOPIES ARE FOUND ON THE WHOLE OBJECT')
 }
 
 // ===========================================================================
+console.log('\nA READ HDF5 REPORTS AS FAILED IS NEVER USED AS VALUES')
+{
+  // scripts/fixtures/damaged-*.h5ad, written by h5py (scripts/make-damaged-fixtures.py): 8 bytes
+  // overwritten inside one gzip chunk of obsm/X_umap, X/data and obs/sample/codes; three
+  // embeddings whose stored type is not numbers; an embedding of 16-bit floats. h5wasm drops
+  // the status of HDF5's read, so on 8b4997e each came back as plausible numbers with no note
+  // (or, for the 16-bit one, stopped the conversion). Every value carried is compared with the
+  // source's: the same object converted from its undamaged original.
+  const embOf = (part) => Object.fromEntries((part?.meta.embeddings ?? []).map(e => [e.key, sha256(part.files[e.file])]))
+  /** An embedding's values as the source file stores them, read straight from it. */
+  const source = (file, key) => {
+    const f = new h5wasm.File(file, 'r')
+    try { const v = f.get(`obsm/${key}`).value; return sha256(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) } finally { f.close() }
+  }
+  const rest = (part) => Object.keys(part?.files ?? {}).filter(k => k !== 'meta.json' && !k.startsWith('embed.')).sort()
+    .map(k => `${k}:${sha256(part.files[k])}`)
+  const guessed = convert(FIX.damaged, 'dmg-guess.zip', ['--label', 'p'])
+  attempt('codes HDF5 cannot read stop the conversion when their column would be the guessed sample, naming the dataset',
+    () => [guessed.r.code, /obs\/sample could not be read \(HDF5 could not read obs\/sample\/codes /.test(guessed.r.err)], [3, true])
+  const asked = convert(FIX.damaged, 'dmg-asked.zip', ['--label', 'p', '--sample', 'sample'])
+  attempt('and when a flag names that column',
+    () => [asked.r.code, /--sample sample: obs\/sample could not be read \(HDF5 could not read obs\/sample\/codes /.test(asked.r.err)], [3, true])
+  const d = convert(FIX.damaged, 'dmg.zip', ['--label', 'p', '--sample', 'none'])
+  const c = convert(FIX.classic, 'dmg-clean.zip', ['--label', 'p', '--sample', 'none'])
+  const dp = d.o?.parts[0], cp = c.o?.parts[0]
+  attempt('without that column it converts, the column named as unreadable in a note',
+    () => [d.r.code, notesOf(dp, /^obs\/sample could not be read \(HDF5 could not read obs\/sample\/codes /).length], [0, 1])
+  attempt('an embedding with a damaged chunk is named and never offered; every embedding carried is the source\'s, value for value',
+    () => { const de = embOf(dp); return [Object.keys(de).sort(), Object.keys(de).every(k => de[k] === source(FIX.classic, k)),
+      notesOf(dp, /^obsm\/X_umap could not be read \(HDF5 could not read obsm\/X_umap /).length] },
+    [['X_umap_harmony', 'X_umap_none'], true, 1])
+  attempt('an opaque, a compound and an empty embedding are each named by what they are stored as, and never offered',
+    () => [Object.keys(embOf(dp)).filter(k => /X_opaque|X_compound|X_null/.test(k)), notesOf(dp, /^obsm\/X_(opaque|compound|null) /)],
+    [[], ['obsm/X_compound is stored as a compound type, not numbers; it is not offered as an embedding',
+      'obsm/X_null is a dataset with no values (an empty dataspace); it is not offered as an embedding',
+      'obsm/X_opaque is stored as opaque bytes, not numbers; it is not offered as an embedding']])
+  attempt('a matrix with a damaged chunk is named and not used, the note says which was used, and the expression and every other file are the source\'s',
+    () => [notesOf(dp, /^X could not be read \(HDF5 could not read X\/data /).length, notesOf(dp, /^expression taken from /),
+      JSON.stringify(rest(dp)) === JSON.stringify(rest(cp)), rest(dp).length],
+    [1, ['expression taken from layers["lognorm"], already log-normalized'], true, rest(cp).length])
+  const only = convert(FIX.onlyMatrix, 'dmg-only.zip', ['--label', 'p'])
+  attempt('when the matrix HDF5 cannot read is the only one, the conversion stops and names it',
+    () => [only.r.code, /no matrix in this object can be read, so the conversion stops: X \(HDF5 could not read X\/data /.test(only.r.err)], [3, true])
+  const h = convert(FIX.half, 'dmg-half.zip', ['--label', 'p'])
+  const m = convert(FIX.mask, 'dmg-mask.zip', ['--label', 'p'])
+  attempt('an embedding of 16-bit floats, the one a guess takes first, is named and left out; the conversion goes on with the next, the source\'s values',
+    () => [h.r.code, notesOf(h.o?.parts[0], /^obsm\/X_umap is stored as 16-bit floats, which this reader does not read; it is not offered/).length,
+      Object.keys(embOf(h.o?.parts[0])), embOf(h.o?.parts[0]).X_tsne === source(FIX.half, 'X_tsne'), embOf(m.o?.parts[0]).X_umap === source(FIX.half, 'X_tsne')],
+    [0, 1, ['X_tsne'], true, true])
+
+  // The browser's worker reads through h5wasm's other build, with the File mounted as the worker mounts it.
+  const esm = await tryImport('../node_modules/h5wasm/dist/esm/hdf5_hl.js')
+  const h5ad = await tryImport('../src/lib/h5ad.ts')
+  let w = null
+  try {
+    globalThis.FileReaderSync ??= class { readAsArrayBuffer(b) { return b.buf.buffer.slice(b.buf.byteOffset, b.buf.byteOffset + b.buf.byteLength) } }
+    const bytes = readFileSync(FIX.damaged)
+    const r = await h5ad.scanH5adFile(esm.default ?? esm, { name: 'damaged-reads.h5ad', size: bytes.length, slice: (a, b) => ({ buf: bytes.subarray(a, b) }) })
+    w = r.scan
+    r.handle.close()
+  } catch (e) { w = { error: e.message } }
+  attempt('in the browser build too: the same parts are named, none is offered, and an embedding carried is the source\'s values',
+    () => {
+      const none = w.embeddings.find(e => e.key === 'X_umap_none').load()
+      return [w.embeddings.map(e => e.key), w.matrices.map(x => x.key), w.unreadableColumns.map(u => u.name),
+        w.notes.filter(n => /^(X|obsm\/X_umap|obs\/sample) could not be read \(HDF5 could not read /.test(n)).length,
+        sha256(new Uint8Array(none.buffer, none.byteOffset, none.byteLength)) === source(FIX.classic, 'X_umap_none')]
+    }, [['X_harmony', 'X_none', 'X_pca', 'X_umap_harmony', 'X_umap_none'], ['layers["counts"]', 'layers["lognorm"]'], ['sample'], 3, true])
+}
+
+console.log('\nA RECORD FOUND AND NOT LISTED IS COUNTED WHERE A READER OF THE BUNDLE LOOKS')
+{
+  const runOf = (x) => x.o?.parts[0].meta.run
+  const bare = convert(FIX.mask, 'run-bare.zip', ['--label', 'p'])
+  const none = convert(copyWith(FIX.mask, 'none-of-six.h5ad', f => int(dict(f.get('uns'), 'x_provenance'), 'tool', 7)), 'none-of-six.zip', ['--label', 'p'])
+  const odd = convert(copyWith(FIX.mask, 'not-a-dict.h5ad', f => {
+    str(dict(f.get('uns'), 'a_provenance'), 'tool', 'a-tool')
+    str(f.get('uns'), 'harness_run', '{"tool": "h"}')
+  }), 'not-a-dict.zip', ['--label', 'p'])
+  attempt('no record found: none listed, nothing counted',
+    () => [bare.r.code, runOf(bare)?.records, runOf(bare)?.leftOut ?? null], [0, [], null])
+  attempt('the only record found holds none of the six: none listed, and it is counted and named in leftOut',
+    () => [none.r.code, runOf(none)?.records, runOf(none)?.leftOut], [0, [], { count: 1, paths: ['uns/x_provenance'] }])
+  attempt('a record that is not a dict is counted beside one that is listed',
+    () => [odd.r.code, runOf(odd)?.records, runOf(odd)?.leftOut],
+    [0, [{ path: 'uns/a_provenance', record: { tool: 'a-tool' } }], { count: 1, paths: ['uns/harness_run'] }])
+  const cut = convert(copyWith(FIX.mask, 'cut-record.h5ad', f => {
+    const r = dict(f.get('uns'), 'a_provenance')
+    str(r, 'tool', 'CUT-TOOL'); str(r, 'version', 'L'.repeat(257)); str(r, 'commit', 'CUT-COMMIT'); str(r, 'job', 'CUT-JOB')
+  }), 'cut-record.zip', ['--label', 'p'])
+  attempt('a record cut by a long value keeps the fields before it, and its note names the fields it holds that were not read',
+    () => [cut.r.code, runOf(cut)?.records, notesOf(cut.o?.parts[0], /^uns\/a_provenance:/), ['CUT-COMMIT', 'CUT-JOB'].filter(t => bundleText(cut.o).includes(t))],
+    [0, [{ path: 'uns/a_provenance', record: { tool: 'CUT-TOOL' } }],
+      ['uns/a_provenance: run carries its tool; not carried: version (a string longer than 256 characters), commit (not read: it comes after that string) and job (not read: it comes after that string)'], []])
+}
+
+console.log('\nA NAME FROM THE INPUT IS CUT IN A NOTE OR A LIST, SO META.JSON STAYS SMALL')
+{
+  // 70 records whose names are 20,013 characters each: on 8b4997e, meta.json was 3.2 MB.
+  const big = convert(copyWith(FIX.mask, 'long-names.h5ad', f => {
+    for (let i = 0; i < 70; i++) str(dict(f.get('uns'), `${String(i).padStart(2, '0')}${'n'.repeat(20000)}_provenance`), 'tool', `t${i}`)
+  }), 'long-names.zip', ['--label', 'p'])
+  const part = big.o?.parts[0]
+  const cutName = `uns/00${'n'.repeat(198)}… (cut: a name of 20,013 characters)`
+  attempt('meta.json and collection.json each stay under 100,000 bytes',
+    () => [big.r.code, part?.files['meta.json'].length < 100_000, strFromU8(unzipSync(big.o.bytes)['collection.json']).length < 100_000], [0, true, true])
+  attempt('each name is cut at 200 characters, and the cut is marked: in the records, in leftOut (past the 64th) and in the notes',
+    () => [part.meta.run.records.length, part.meta.run.records[0].path, part.meta.run.leftOut.count, part.meta.run.leftOut.paths[0],
+      notesOf(part, /^uns\/00n+… \(cut: a name of 20,013 characters\): run carries its tool$/).length],
+    [64, cutName, 6, cutName.replace('uns/00', 'uns/64'), 1])
+}
+
 console.log('\nNOTHING ELSE IN THE FIXTURE\'S BUNDLE CHANGED (against 51a00fa)')
 {
   // Measured on 51a00fa's conversion of the committed fixture (every role

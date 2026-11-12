@@ -154,8 +154,7 @@ export async function convert(a: ConvertArgs, say: (line: string) => void): Prom
   // The input is the one file HDF5 may open while it is read: an external
   // link, a virtual dataset's source or external raw storage cannot reach the
   // host's other files.
-  const { FS } = await h5wasm.ready
-  const f = openInput(h5wasm, FS, a.input)
+  const f = openInput(h5wasm, await h5wasm.ready, a.input)
   if (!(Number(f.file_id) >= 0)) throw new CliError(`${a.input} could not be opened as HDF5`, EXIT.input)
 
   const scratch = mkdtempSync(join(tmpdir(), 'scrnaseq-lab-'))

@@ -108,7 +108,9 @@ const UNFOLLOWED = new Map<string, Map<string, string>>()
  * Open `path` read-only as the converter's input: the one way in the scan
  * accepts. Until the handle is closed, HDF5 can open no other file.
  */
-export function openInput(h5wasm: H5Module, FS: H5, path: string): H5 {
+export function openInput(h5wasm: H5Module, lib: H5Lib, path: string): H5 {
+  guardReads(lib)
+  const FS = lib.FS
   const s = sealOf(FS)
   const f = throughDoor(FS, () => new h5wasm.File(path, 'r'))
   if (!(Number(f?.file_id) >= 0)) return f
@@ -129,7 +131,7 @@ function elsewhere(d: H5): string | null {
   try {
     const files = [...new Set(((d.metadata?.virtual_sources ?? []) as { file_name: string }[])
       .map(v => v.file_name).filter(name => name !== '.'))]
-    return files.length ? `a virtual dataset whose values lie in ${files.join(', ')}` : null
+    return files.length ? 'a virtual dataset whose values lie in another file' : null
   } catch {
     return null
   }
@@ -176,8 +178,9 @@ function ownValue(d: H5): unknown {
  * fails, while one name at a time it hands back the link itself. An external
  * link (whatever file it names: under the seal none can be opened), a soft link
  * that reaches nothing in this file, and a virtual dataset whose values lie in
- * another file are each remembered once, with what the link states, as text,
- * and are absent to the scan.
+ * another file are each remembered once, by their own place in this file, and
+ * are absent to the scan. What a link points to is never carried: its target
+ * text can be a path on the machine that wrote the file.
  */
 function child(g: H5, name: string): H5 | null {
   let at: H5 = g
@@ -185,8 +188,8 @@ function child(g: H5, name: string): H5 | null {
     if (!part) continue
     if (!isGroup(at)) return null
     const o = at.get(part)
-    const says = o?.type === 'ExternalLink' ? `an external link to ${o.obj_path} in ${o.filename}`
-      : o?.type === 'BrokenSoftLink' ? `a soft link to ${o.target}, which reaches nothing in this file`
+    const says = o?.type === 'ExternalLink' ? 'an external link, which points outside this file'
+      : o?.type === 'BrokenSoftLink' ? 'a soft link that reaches nothing in this file'
         : isDataset(o) ? elsewhere(o) ?? (storedElsewhere(o) ? 'a dataset whose values are stored in another file' : null) : null
     if (says) {
       UNFOLLOWED.get(String(at.file_id))?.set(`${at.path}/${part}`.replace(/^\/+/, ''), says)
@@ -197,6 +200,14 @@ function child(g: H5, name: string): H5 | null {
   }
   return at
 }
+
+/** What `part` below `g` is, when the scan did not follow it; null otherwise. */
+function notFollowed(g: H5, part: string): string | null {
+  return UNFOLLOWED.get(String(g?.file_id))?.get(`${g.path}/${part}`.replace(/^\/+/, '')) ?? null
+}
+
+/** An obs column the scan could not read, and why: absent, and named. */
+interface Lost { name: string; why: string }
 
 /** Why a part the scan needs is missing, when it is something the converter did not follow. */
 function unfollowed(f: H5, path: string): string | null {
@@ -225,6 +236,126 @@ const toStrings = (v: unknown): string[] =>
   (v as unknown[]).map(x => (x instanceof Uint8Array ? new TextDecoder().decode(x) : String(x)))
 
 export class H5adError extends Error {}
+
+// ---- one read: every value the converter takes from the file ----------------
+//
+// h5wasm reads a dataset's or an attribute's values through one call into
+// HDF5, and drops the status that call returns. A read HDF5 could not finish (a
+// damaged compressed chunk, a filter or a conversion it lacks, values in a file
+// the seal refused) came back as whatever its buffer held: an embedding offered
+// with half its rows garbage, a matrix used as the expression, sample codes
+// that moved cells between samples, all deterministic and named nowhere.
+// `guardReads` wraps that call, once per module and the way the seal wraps the
+// filesystem's open, so every read the converter makes goes through it: a read
+// HDF5 reports as failed throws `UnreadableError`, naming what it read, and its
+// buffer is never handed on as values. Each use then decides, by the rule the
+// README states: an optional part is named in a note and is absent; a part the
+// bundle depends on stops the conversion, by name.
+
+/** A read HDF5 reported as failed: none of its values are used. */
+export class UnreadableError extends H5adError {
+  /** What the failed read was of: a dataset's path, or an attribute and its object's. */
+  readonly what: string
+  constructor(what: string) {
+    super(`HDF5 could not read ${what} (a damaged chunk, or a filter or a type it cannot decode), so none of its values are used`)
+    this.what = what
+  }
+}
+
+/** What `h5wasm.ready` resolves to: the HDF5 module, with its filesystem and its read calls. */
+export interface H5Lib {
+  FS: H5
+  get_dataset_data: (...a: any[]) => number
+  get_attribute_data: (...a: any[]) => number
+  reclaim_vlen_memory: (...a: any[]) => number
+}
+
+const GUARDED = new WeakSet<object>()
+
+const pathOf = (path: unknown) => String(path).replace(/^\/+/, '') || '/'
+
+/** Every read of this module checked, from now on: see above. */
+function guardReads(lib: H5Lib): void {
+  if (GUARDED.has(lib)) return
+  if (typeof lib?.get_dataset_data !== 'function' || typeof lib.get_attribute_data !== 'function'
+    || typeof lib.reclaim_vlen_memory !== 'function') {
+    throw new H5adError('openInput takes the module h5wasm.ready resolves to, so that every read the converter makes is checked')
+  }
+  const { get_dataset_data: dataset, get_attribute_data: attribute, reclaim_vlen_memory: reclaim } = lib
+  // The buffer of the read that just failed. Its variable-length entries are
+  // whatever HDF5 left there, so it is not freed as strings: that would free
+  // memory nobody allocated. It is leaked instead.
+  const failed = new Set<unknown>()
+  const checked = (call: (...a: any[]) => number, ptr: number, what: (a: any[]) => string) =>
+    function (this: unknown, ...a: any[]): number {
+      failed.clear()
+      let status: number
+      try {
+        status = call.apply(this, a)
+      } catch {
+        status = -1
+      }
+      if (!(Number(status) >= 0)) {
+        failed.add(a[ptr])
+        throw new UnreadableError(what(a))
+      }
+      return status
+    }
+  lib.get_dataset_data = checked(dataset, 5, a => pathOf(a[1]))
+  lib.get_attribute_data = checked(attribute, 3, a => `the attribute ${String(a[2])} of ${pathOf(a[1])}`)
+  lib.reclaim_vlen_memory = function (this: unknown, ...a: any[]): number {
+    if (failed.delete(a[3])) return 0
+    return reclaim.apply(this, a)
+  }
+  GUARDED.add(lib)
+}
+
+/** HDF5's classes of stored type, as a note names them. */
+const STORED: Record<number, string> = {
+  2: 'a time type', 3: 'strings', 4: 'a bitfield', 5: 'opaque bytes', 6: 'a compound type', 7: 'references',
+  8: 'an enumeration', 9: 'variable-length sequences', 10: 'an array type',
+}
+
+/**
+ * Why a dataset's values are not numbers the converter can use, from its
+ * stored type alone; null when they are. Never reinterpreted: h5wasm hands an
+ * opaque or unknown type back as its raw bytes, which read as numbers.
+ */
+function notNumbers(d: H5, integers = false): string | null {
+  let m: H5
+  try {
+    m = d.metadata
+  } catch {
+    return 'a dataset whose stored type cannot be read'
+  }
+  if (!m?.shape) return 'a dataset with no values (an empty dataspace)'
+  if (m.type === 0) return null
+  if (m.type === 1) {
+    if (integers) return 'stored as floats, not integers'
+    return m.size === 4 || m.size === 8 ? null : `stored as ${m.size * 8}-bit floats, which this reader does not read`
+  }
+  return `stored as ${STORED[m.type as number] ?? 'a type HDF5 does not name'}, not ${integers ? 'integers' : 'numbers'}`
+}
+
+/** A read the bundle depends on: a failed one stops the conversion, saying what it was for. */
+function needed<T>(what: string, read: () => T): T {
+  try {
+    return read()
+  } catch (e) {
+    if (e instanceof UnreadableError) throw new H5adError(`${what} cannot be read, so the conversion stops: ${e.message}`)
+    throw e
+  }
+}
+
+/** The longest name from the input that a note or a list carries whole, in characters (code points). */
+export const NAME_MAX = 200
+
+/** A name read from the input, as a note or a list carries it: whole up to NAME_MAX characters, else cut there and marked. */
+export function shown(name: string): string {
+  if (!longer(name, NAME_MAX)) return name
+  const points = Array.from(name)
+  return `${points.slice(0, NAME_MAX).join('')}… (cut: a name of ${points.length.toLocaleString('en-US')} characters)`
+}
 
 /**
  * A string column in anndata's nullable encoding: a group of `values` + `mask`.
@@ -305,17 +436,28 @@ const fieldOf = (c: Compound, name: string): unknown[] | null => {
  * categorical column's level names exist — the column itself is bare integers,
  * and reading it without them turns "B cells" into 2.
  */
-function readObs(obs: H5, uns: H5, nCells: number, note: (s: string) => void): Column[] {
+function readObs(obs: H5, uns: H5, nCells: number, note: (s: string) => void, lost: Lost[]): Column[] {
   const out: Column[] = []
+  const unread = (name: string, why: string) => {
+    note(`obs/${shown(name)} could not be read (${why}); skipped`)
+    lost.push({ name, why })
+  }
 
-  const comp = compound(obs)
+  const comp = needed('the obs table', () => compound(obs))
   if (comp) {
     for (let i = 0; i < comp.names.length; i++) {
       const name = comp.names[i]
       if (name === 'index' || name === '_index') continue
       const raw = comp.rows.map(r => r[i])
       const catsDs = uns ? child(uns, `${name}_categories`) : null
-      const cats = isDataset(catsDs) ? toStrings(catsDs.value) : null
+      let cats: string[] | null
+      try {
+        cats = isDataset(catsDs) ? toStrings(catsDs.value) : null
+      } catch (e) {
+        // Without its levels the column is bare integers: left out, never read as numbers.
+        unread(name, (e as Error).message)
+        continue
+      }
       if (cats) {
         out.push(fromFactor(name, toI32(raw.map(Number)), cats))
       } else if (typeof raw[0] === 'string') {
@@ -336,7 +478,11 @@ function readObs(obs: H5, uns: H5, nCells: number, note: (s: string) => void): C
   for (const key of keys) {
     if (key === indexName) continue
     const o = child(obs, key)
-    if (!o) continue
+    if (!o) {
+      const says = notFollowed(obs, key)
+      if (says) lost.push({ name: key, why: `obs/${shown(key)} is ${says}` })
+      continue
+    }
     try {
       if (isGroup(o)) {
         const strings = nullableStrings(o)
@@ -352,11 +498,19 @@ function readObs(obs: H5, uns: H5, nCells: number, note: (s: string) => void): C
         const cats = child(o, 'categories')
         const codes = child(o, 'codes')
         if (cats && codes) {
+          const bad = notNumbers(codes, true)
+          if (bad) throw new Error(`its codes are ${bad}`)
           out.push(fromFactor(key, toI32(codes.value), toStrings(cats.value)))
           continue
         }
+        const gone = ['categories', 'codes'].find(p => notFollowed(o, p))
+        if (gone) throw new Error(`obs/${shown(key)}/${gone} is ${notFollowed(o, gone)}`)
         note(`obs/${key} is a group this reader does not understand; skipped`)
         continue
+      }
+      if (o.metadata?.type !== 3 && o.metadata?.type !== 8) {
+        const bad = notNumbers(o)
+        if (bad) throw new Error(`it is ${bad}`)
       }
       const v = o.value
       if (v?.length !== nCells) {
@@ -368,8 +522,8 @@ function readObs(obs: H5, uns: H5, nCells: number, note: (s: string) => void): C
       } else {
         out.push(maybeDiscrete(numeric(key, toF32(v)), nCells))
       }
-    } catch {
-      note(`obs/${key} could not be read; skipped`)
+    } catch (e) {
+      unread(key, (e as Error).message)
     }
   }
   return out
@@ -446,8 +600,8 @@ function readVarStringColumns(v: H5, nGenes: number, note: (s: string) => void):
       if (!val || val.length !== nGenes) continue
       if (typeof val[0] !== 'string' && !(val[0] instanceof Uint8Array)) continue
       out.push({ name: key, values: toStrings(val) })
-    } catch {
-      note(`var/${key} could not be read; skipped`)
+    } catch (e) {
+      note(`var/${shown(key)} could not be read (${(e as Error).message}); skipped`)
     }
   }
   return out
@@ -825,6 +979,12 @@ function readIdentity(rec: H5, path: string): Identity {
       refused.push(`${field} (a value that is not a string)`)
     } else if (longer(s, RUN_FIELD_MAX)) {
       refused.push(`${field} (a string longer than ${RUN_FIELD_MAX} characters)`)
+      // Nothing after it is read. The fields of the six this record holds
+      // after it are named, by the converter's own names, and never opened.
+      const holds = rec.keys() as string[]
+      for (const later of RUN_FIELDS.slice(RUN_FIELDS.indexOf(field) + 1)) {
+        if (holds.includes(later)) refused.push(`${later} (not read: it comes after that string)`)
+      }
       return { record, refused, others, long: `${path}/${field}` }
     } else {
       record[field] = s
@@ -842,8 +1002,10 @@ function readIdentity(rec: H5, path: string): Identity {
  * string such as the harness's JSON, an array, a group of another encoding) is
  * named with what it is, and nothing of it is read. The first value longer than
  * RUN_FIELD_MAX ends the reading, so a long value is read once, however many
- * records reach it. Records not read, past the cap or after that value, are
- * counted in `leftOut`, the first ten named. Nothing here can stop the conversion.
+ * records reach it. Every record found and not listed (none of the six, not a
+ * dict, unreadable, past the cap, after that value) is counted in `leftOut`, in
+ * uns order, the first ten named: a reader of the bundle that sees no record
+ * still learns that one was found. Nothing here can stop the conversion.
  */
 function readRun(uns: H5, note: (s: string) => void): RunSection {
   const records: RunRecord[] = []
@@ -856,7 +1018,7 @@ function readRun(uns: H5, note: (s: string) => void): RunSection {
   const uninspected: string[] = []
   let why = ''
   for (const k of uns.keys() as string[]) {
-    const path = `uns/${k}`
+    const path = `uns/${shown(k)}`
     try {
       const o = child(uns, k)
       if (!o) continue
@@ -866,7 +1028,7 @@ function readRun(uns: H5, note: (s: string) => void): RunSection {
         for (const c of o.keys() as string[]) {
           if (!named(c)) continue
           const oc = child(o, c)
-          if (oc) found.push({ path: `${path}/${c}`, o: oc })
+          if (oc) found.push({ path: `${path}/${shown(c)}`, o: oc })
         }
       }
     } catch (e) {
@@ -881,15 +1043,17 @@ function readRun(uns: H5, note: (s: string) => void): RunSection {
   const pastCap: string[] = []
   const afterLong: string[] = []
   const failed: string[] = []
+  const unlisted: string[] = []
   let long: string | null = null
   for (let i = 0; i < found.length; i++) {
     const { path, o } = found[i]
-    if (long !== null) { afterLong.push(path); continue }
-    if (i >= RUN_MAX_RECORDS) { pastCap.push(path); continue }
+    if (long !== null) { afterLong.push(path); unlisted.push(path); continue }
+    if (i >= RUN_MAX_RECORDS) { pastCap.push(path); unlisted.push(path); continue }
     try {
       if (!isDict(o)) {
         const what = isGroup(o) ? 'a group of another encoding than dict' : kindOf(o) ?? 'a string'
         note(`${path} is ${what}, not a dict of named fields, so run reads nothing from it`)
+        unlisted.push(path)
         continue
       }
       const id = readIdentity(o, path)
@@ -901,13 +1065,14 @@ function readRun(uns: H5, note: (s: string) => void): RunSection {
         note(`${path}: run carries its ${and(carried)}${rest}`)
       } else {
         note(`${path} holds none of ${and([...RUN_FIELDS])} as a string of ${RUN_FIELD_MAX} characters or fewer, so run does not list it${rest}`)
+        unlisted.push(path)
       }
       long = id.long
     } catch (e) {
       failed.push(`${path} (${(e as Error).message})`)
+      unlisted.push(path)
     }
   }
-  const unread = [...afterLong, ...pastCap]
 
   // ---- said, once each -------------------------------------------------------
   if (uninspected.length) {
@@ -924,12 +1089,12 @@ function readRun(uns: H5, note: (s: string) => void): RunSection {
   }
   return {
     searched: RUN_SEARCHED, records,
-    ...(unread.length ? { leftOut: { count: unread.length, paths: unread.slice(0, 10) } } : {}),
+    ...(unlisted.length ? { leftOut: { count: unlisted.length, paths: unlisted.slice(0, 10) } } : {}),
   }
 }
 
 export interface H5Module {
-  ready: Promise<{ FS: H5 }>
+  ready: Promise<H5Lib>
   File: new (name: string, mode: string) => H5
 }
 
@@ -960,19 +1125,20 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
   const nGenes = Number(shape[1])
   if (!nCells || !nGenes) throw new H5adError('the /X matrix has no readable shape')
 
-  const legacy = compound(obsRaw) != null
+  const legacy = needed('the obs table', () => compound(obsRaw)) != null
   note(legacy
     ? 'read in the legacy AnnData layout — obs and obsm are compound datasets and categorical levels come from uns'
     : 'read in the modern AnnData layout')
 
   const uns = child(f, 'uns')
-  const columns = readObs(obsRaw, uns, nCells, note)
+  const lost: Lost[] = []
+  const columns = readObs(obsRaw, uns, nCells, note, lost)
 
   // ---- gene lists -------------------------------------------------------
   const geneSets: Record<string, string[]> = {}
   const geneAliases: Record<string, GeneAlias> = {}
   const varDs = child(f, 'var')
-  const varGenes = readVar(varDs, 'var')
+  const varGenes = needed('the gene names (var)', () => readVar(varDs, 'var'))
   const varSet = internGeneSet(geneSets, varGenes, 'var')
   const varAlias = readVarAlias(varDs, varGenes, note)
   if (varAlias) geneAliases[varSet] = varAlias
@@ -988,38 +1154,56 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
         const a = readVarAlias(rawVarDs, rawGenes, note)
         if (a) geneAliases[rawSet] = a
       }
-    } catch { /* no raw genes */ }
+    } catch (e) {
+      // No raw genes. When HDF5 could not read them, that is said: raw.X is not used.
+      if (e instanceof UnreadableError) note(`raw.var could not be read (${e.message}); raw.X is not used`)
+    }
   }
 
   // ---- candidate matrices ----------------------------------------------
   const matrices: MatrixRef[] = []
+  const unreadable: string[] = []
   const add = (key: string, m: H5, geneSet: string, cells: number, genes: number) => {
     if (!m) return
     try {
-      // Every member a load will read, looked up now: what is not in this file
-      // is named by the scan, never met later by a load.
+      // Every member a load will read, looked up now and its stored type
+      // checked: what is not in this file, or not numbers, is named by the
+      // scan, never met later by a load.
       if (isGroup(m)) {
         for (const part of ['data', 'indices', 'indptr']) {
-          if (!isDataset(child(m, part))) throw new Error(`its ${part} is not a dataset in this file`)
+          const d = child(m, part)
+          if (!isDataset(d)) throw new Error(`its ${part} is not a dataset in this file`)
+          const bad = notNumbers(d, part !== 'data')
+          if (bad) throw new Error(`its ${part} is ${bad}`)
         }
+      } else {
+        const bad = notNumbers(m)
+        if (bad) throw new Error(`it is ${bad}`)
       }
       const csr = !isDataset(m) &&
         !text(attr(m, 'encoding-type') ?? attr(m, 'h5sparse_format') ?? '').includes('csc')
+      // A read of a matrix after the scan, when the bundle is built from it,
+      // that HDF5 reports as failed stops the conversion, by name: it never
+      // falls to another matrix.
+      const chosen = <A extends unknown[], T>(read: (...a: A) => T) => (...a: A): T =>
+        needed(shown(key), () => read(...a))
       matrices.push({
         key, geneSet, nCells: cells, nGenes: genes,
         kind: classify(sampleMatrix(m)),
-        load: () => readMatrix(m, cells, genes, key),
+        load: chosen(() => readMatrix(m, cells, genes, key)),
         ...(csr ? {
-          nnzPerCell: () => rowLengths(m, cells),
+          nnzPerCell: chosen(() => rowLengths(m, cells)),
           // Only CSR: in a CSC matrix `indices` are cell ids, and counting
           // distinct cells would answer a different question entirely.
           coverage: () => geneCoverage(m, genes),
-          loadGroups: (groups, onProgress) =>
-            readGroupsCSR(m, groups, cells, genes, onProgress),
+          loadGroups: chosen((groups: Int32Array[], onProgress?: (frac: number) => void) =>
+            readGroupsCSR(m, groups, cells, genes, onProgress)),
         } : {}),
       })
     } catch (e) {
-      note(`${key} could not be read (${(e as Error).message}); skipped`)
+      const why = (e as Error).message
+      note(`${shown(key)} could not be read (${why}); skipped`)
+      unreadable.push(`${shown(key)} (${why})`)
     }
   }
 
@@ -1032,11 +1216,17 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
   if (rawX && rawSet) {
     add('raw.X', rawX, rawSet, nCells, geneSets[rawSet].length)
   }
+  if (!matrices.length) throw new H5adError(`no matrix in this object can be read, so the conversion stops: ${unreadable.join('; ')}`)
 
   // ---- embeddings -------------------------------------------------------
   const embeddings: EmbeddingRef[] = []
   const obsm = child(f, 'obsm')
-  const comp = obsm ? compound(obsm) : null
+  let comp: Compound | null = null
+  try {
+    comp = obsm ? compound(obsm) : null
+  } catch (e) {
+    note(`obsm could not be read (${(e as Error).message}); no embedding is offered from it`)
+  }
   if (comp) {
     comp.members.forEach((m: H5, i: number) => {
       const width = m.array_type?.shape?.[0] ?? 0
@@ -1057,15 +1247,25 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
   } else if (isGroup(obsm)) {
     for (const k of obsm.keys()) {
       const ds = child(obsm, k)
-      const s = ds?.shape as number[] | undefined
-      if (!s || s.length < 2 || s[1] < 2 || s[0] !== nCells) continue
-      embeddings.push(once({
-        key: k, nDims: s[1],
-        load: () => {
-          const flat = toF32(ds.slice([[0, nCells], [0, 2]]))
-          return flat.length === nCells * 2 ? flat : toF32(ds.value).filter((_v, i) => i % s[1] < 2)
-        },
-      }))
+      if (!isDataset(ds)) continue
+      // Its stored type checked, then read now: an embedding that is not
+      // numbers, or that HDF5 cannot read, is named here and never offered.
+      const bad = notNumbers(ds)
+      if (bad) {
+        note(`obsm/${shown(k)} is ${bad}; it is not offered as an embedding`)
+        continue
+      }
+      const s = ds.shape as number[]
+      if (s.length < 2 || s[1] < 2 || s[0] !== nCells) continue
+      let xy: Float32Array
+      try {
+        const flat = toF32(ds.slice([[0, nCells], [0, 2]]))
+        xy = flat.length === nCells * 2 ? flat : toF32(ds.value).filter((_v, i) => i % s[1] < 2)
+      } catch (e) {
+        note(`obsm/${shown(k)} could not be read (${(e as Error).message}); it is not offered as an embedding`)
+        continue
+      }
+      embeddings.push({ key: k, nDims: s[1], load: () => xy })
     }
   }
 
@@ -1083,12 +1283,13 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
   // ---- what was not followed, named once -----------------------------------
   const outside = [...(UNFOLLOWED.get(String(f.file_id)) ?? [])]
   if (outside.length) {
-    note(`the converter reads only the file it is given and follows no link out of it: ${some(outside.map(([path, says]) => `${path} (${says})`))} ${outside.length > 1 ? 'are' : 'is'} not read`)
+    note(`the converter reads only the file it is given and follows no link out of it: ${some(outside.map(([path, says]) => `${shown(path)} (${says})`))} ${outside.length > 1 ? 'are' : 'is'} not read`)
   }
 
   return {
     format: 'h5ad', source: filename, nCells, columns, matrices, embeddings,
     geneSets, geneAliases, provenance, run, notes,
+    ...(lost.length ? { unreadableColumns: lost } : {}),
   }
 }
 
@@ -1105,7 +1306,8 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
 export async function scanH5ad(
   h5wasm: H5Module, bytes: Uint8Array, filename: string,
 ): Promise<Scan> {
-  const { FS } = await h5wasm.ready
+  const lib = await h5wasm.ready
+  const FS = lib.FS
 
   // h5wasm is a 32-bit WebAssembly build of HDF5, and its emulated filesystem
   // holds the whole file. Lengths there are signed 32-bit, so 2 GB is a hard
@@ -1123,13 +1325,14 @@ export async function scanH5ad(
     throw new H5adError(
       `this .h5ad (${(bytes.length / 1e9).toFixed(1)} GB) would not fit in the reader's memory.`)
   }
-  return scanOpenH5ad(openOrFail(h5wasm, FS, path), filename)
+  return scanOpenH5ad(openOrFail(h5wasm, lib, path), filename)
 }
 
-function openOrFail(h5wasm: H5Module, FS: H5, path: string): H5 {
+function openOrFail(h5wasm: H5Module, lib: H5Lib, path: string): H5 {
   try {
-    return openInput(h5wasm, FS, path)
-  } catch {
+    return openInput(h5wasm, lib, path)
+  } catch (e) {
+    if (e instanceof H5adError) throw e
     throw new H5adError('this file is not readable as HDF5. An .h5ad is an HDF5 file — if this came from Seurat, save it as .rds instead.')
   }
 }
@@ -1231,11 +1434,11 @@ function mountBlockCached(FS: H5, file: File, dir: string, name: string): string
 export async function scanH5adFile(h5wasm: H5Module, file: File): Promise<{
   scan: Scan; handle: H5
 }> {
-  const { FS } = await h5wasm.ready
+  const lib = await h5wasm.ready
   if (typeof FileReaderSync === 'undefined') {
     throw new H5adError('a file this large can only be read inside a worker, and this is not one.')
   }
   const safe = file.name.replace(/[^\w.-]/g, '_')
-  const handle = openOrFail(h5wasm, FS, mountBlockCached(FS, file, '/lazy', safe))
+  const handle = openOrFail(h5wasm, lib, mountBlockCached(lib.FS, file, '/lazy', safe))
   return { scan: scanOpenH5ad(handle, file.name), handle }
 }

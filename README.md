@@ -156,8 +156,12 @@ of the six as such a string is not listed, and its note says so; one that is not
 An integration stage writes its `job` as a dict of scheduler, id and host, so that `job` is
 named as a group and not carried.
 
-At most 64 records are read, in `uns` order. Past that they are counted in `run.leftOut`, and
-the first ten are named. The first string longer than 256 characters ends the reading, so that
+At most 64 records are read, in `uns` order. Every record found and not listed is counted in
+`run.leftOut`, in `uns` order, with the first ten named: one that holds none of the six, one
+that is not a dict, one that could not be read, one past the 64th, one after a long value. So a
+bundle that lists no record still says that one was found, and the notes say why each was left
+out. A record cut by a long value keeps the fields read before it, and its note names the fields
+of the six it holds that were not read. The first string longer than 256 characters ends the reading, so that
 one long value is read once, however many records reach it; the records after it are counted in
 `run.leftOut` too. When the object carries no record, `run.records` is empty and a note says
 so; `run.searched` says where the lab looked. A Seurat object has no `uns`, so its bundle has no
@@ -170,15 +174,41 @@ commit.
 names, a virtual dataset's source, a dataset's external raw storage. From the command those are
 this machine's own files, and in the browser the files the tab holds. While the input is open,
 the converter lets HDF5 open no other file. What the scan meets that leads out of the file is
-read as absent and named once, in one note, with its target as the link states it: an external
-link, whatever file it names (the input's own name included), a soft link that reaches nothing
-in the file, a virtual dataset whose values lie in another file, and a dataset whose values are
+read as absent and named once, in one note, by its own place in the file and what it is; what a
+link points to is never carried, since its target can be a path on the machine that wrote the
+file: an external link, whatever file it names (the input's own name included), a soft link that
+reaches nothing in the file, a virtual dataset whose values lie in another file, and a dataset whose values are
 stored in another file (one value of each array is read first to tell; a dataset compressed with
 a filter this reader lacks, such as LZF, is named this way too, since HDF5 looks for the filter
 as a file). This holds for the
 observations, the variables, the matrix and its layers, the embeddings and `uns` alike, so the
 same input gives the same bundle, whatever sits beside it. An ordinary soft or hard link inside
 the file still reads.
+
+**A read that fails is never used.** h5wasm, the HDF5 library the lab runs in the browser and
+in the command, hands back whatever its buffer held when HDF5 could not finish a read (a damaged
+compressed chunk, a filter or a type it cannot decode): plausible numbers, and no error. Every
+read the converter makes goes through one place that knows whether HDF5 finished it, and a read
+that failed is never used as values. Then, by what the bundle needs:
+
+- *An optional part is named once in a note and is absent*: an embedding, a matrix that is not
+  the one used, an annotation column, the var table's other gene names, `raw`'s genes (then
+  `raw.X` is not used). When a matrix is left out this way, the note on the expression says which
+  matrix was used instead.
+- *A part the bundle depends on stops the conversion, with an error naming the dataset*: the
+  gene names, the obs table of the legacy layout, a matrix read after the scan to build the
+  bundle (never replaced by another), every matrix when none can be read, and an obs column a
+  role would use: one a flag names (`--cluster`, `--sample`, `--condition`, `--extra`), or one
+  named like the role the command is guessing. Name the role, or `--sample none`, to convert
+  without it. In the app the column is not offered, and the bundle's notes name it. The lab does
+  not read the cells' names from an `.h5ad`.
+- *Values whose stored type is not numbers are named and left out, never reinterpreted*: a
+  matrix, an embedding or a column's codes stored as opaque bytes, a compound type, strings, an
+  empty dataspace, or 16-bit floats (which this reader does not read).
+
+Embeddings are read during the scan, so one HDF5 cannot read is never offered. A name read from
+the object (an `uns` key, a column's, a layer's, an embedding's) is cut at 200 characters, and the
+cut marked, wherever a note or the run section's lists carry it.
 
 **Both namings of the genes.** `genes.txt` is whatever the matrix rows are indexed by —
 `ENSMUSG00000038751` as often as `Sox2` — and `meta.geneIdKind` says which, judged from the

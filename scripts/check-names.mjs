@@ -16,11 +16,11 @@ import { geneNameKind, guessCluster, guessEmbedding, guessRole } from '../src/li
 
 const files = process.argv.slice(2)
 if (!files.length) files.push('C:/Users/Lin/scrnaseq-studio/testdata/pbmc3k_processed.h5ad')
-const { FS } = await h5wasm.ready
+const lib = await h5wasm.ready
 
 for (const path of files) {
   console.log(`\n=== ${path}`)
-  const f = openInput(h5wasm, FS, path)
+  const f = openInput(h5wasm, lib, path)
   const scan = scanOpenH5ad(f, path.split(/[\\/]/).pop())
   console.log(`  ${scan.nCells} cells`)
   console.log(`  embeddings: ${scan.embeddings.map(e => `${e.key}(${e.nDims}D)`).join(', ') || 'none'}`)

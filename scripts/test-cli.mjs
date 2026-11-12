@@ -161,10 +161,10 @@ const EXPLICIT = [
   '--sentinel', 'EXCLUDED', '--sentinel', 'UNRESOLVED', '--label', 'family',
 ]
 
-const { FS } = await h5wasm.ready
+const lib = await h5wasm.ready
 /** Scan, run `fn`, close. The scan's matrices read lazily, so `fn` runs while the file is open. */
 function withScan(path, fn) {
-  const f = openInput(h5wasm, FS, path)
+  const f = openInput(h5wasm, lib, path)
   try { return fn(scanOpenH5ad(f, path.split(/[\\/]/).pop())) } finally { f.close() }
 }
 const scanFile = (path) => withScan(path, s => s)
