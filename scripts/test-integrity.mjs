@@ -60,6 +60,8 @@ const FIX = {
   mask: here('./fixtures/nullable-mask.h5ad'),
   records: here('./fixtures/uns-records.h5ad'),
   unreadable: here('./fixtures/uns-unreadable.h5ad'),
+  stored: here('./fixtures/stored-outside.h5ad'),
+  storedBin: here('./fixtures/stored-outside.bin'),
 }
 const BIN = here('../bin/scrnaseq-lab.mjs')
 const tmp = mkdtempSync(join(tmpdir(), 'lab-integrity-test-'))
@@ -487,6 +489,27 @@ console.log('\nONE FILE: A LINK OUT OF THE INPUT IS NAMED ONCE AND NEVER READ')
     () => [two.r.code, three.r.code, sha256(two.o.bytes) === sha256(one.o.bytes), sha256(three.o.bytes) === sha256(one.o.bytes)], [0, 0, true, true])
   rmSync(dir, { recursive: true, force: true })
   rmSync(away, { recursive: true, force: true })
+}
+
+console.log('\nA DATASET WHOSE VALUES ARE STORED IN ANOTHER FILE IS NAMED, NOT READ')
+{
+  // scripts/fixtures/stored-outside.h5ad, written by h5py: an embedding whose
+  // raw values HDF5 keeps in stored-outside.bin (external storage), which
+  // h5wasm cannot write. Under the seal HDF5 could not open that file, and
+  // h5wasm handed back whatever its buffer held, with no error: offered as an
+  // embedding, it was memory, not the object.
+  const dir = mkdtempSync(join(tmpdir(), 'lab-stored-'))
+  const input = join(dir, 'stored-outside.h5ad')
+  copyFileSync(FIX.stored, input)
+  const a = convert(input, 'stored1.zip', ['--label', 'stored'])
+  copyFileSync(FIX.storedBin, join(dir, 'stored-outside.bin'))
+  const b = convert(input, 'stored2.zip', ['--label', 'stored'])
+  attempt('it converts, the embedding is not offered, and one note names it',
+    () => [a.r.code, JSON.stringify(a.o.parts[0].meta.embeddings).includes('X_stored_outside'),
+      notesOf(a.o.parts[0], /obsm\/X_stored_outside \(a dataset whose values are stored in another file\)/).length], [0, false, 1])
+  attempt('and the bundle is the same whether that file sits beside the input or not',
+    () => [b.r.code, sha256(a.o.bytes) === sha256(b.o.bytes)], [0, true])
+  rmSync(dir, { recursive: true, force: true })
 }
 
 console.log('\nTWO FILES OF ONE NAME CANNOT COLLIDE: NEITHER IS READ')

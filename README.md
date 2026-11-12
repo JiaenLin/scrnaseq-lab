@@ -172,7 +172,8 @@ this machine's own files, and in the browser the files the tab holds. While the 
 the converter lets HDF5 open no other file. What the scan meets that leads out of the file is
 read as absent and named once, in one note, with its target as the link states it: an external
 link, whatever file it names (the input's own name included), a soft link that reaches nothing
-in the file, and a virtual dataset whose values lie in another file. This holds for the
+in the file, a virtual dataset whose values lie in another file, and a dataset whose values are
+stored in another file (one value of each array is read first to tell). This holds for the
 observations, the variables, the matrix and its layers, the embeddings and `uns` alike, so the
 same input gives the same bundle, whatever sits beside it. An ordinary soft or hard link inside
 the file still reads.
@@ -341,7 +342,9 @@ checks that every cell keeps its condition, that the run's identity travels and 
 a record does, that no link leads it out of the file, and that only two-column embeddings are
 offered. It also checks that nothing else in the fixture's bundle
 moved. `uns-records.h5ad` holds run records h5wasm cannot write (a structured array with an
-int64 field, float16, an HDF5 reference): they convert, and only their identity is read. `uns-unreadable.h5ad` holds an `uns` entry
+int64 field, float16, an HDF5 reference): they convert, and only their identity is read.
+`stored-outside.h5ad` (from `scripts/make-stored-outside-fixture.py`, h5py) holds an embedding
+whose values HDF5 keeps in `stored-outside.bin`, which h5wasm cannot write. `uns-unreadable.h5ad` holds an `uns` entry
 whose `encoding-type` attribute is float16, which anndata itself refuses to read.
 
 ## Known limits

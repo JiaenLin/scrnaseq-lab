@@ -64,6 +64,14 @@ interface Seal { inputs: number; door: boolean }
 const SEALS = new WeakMap<object, Seal>()
 
 /**
+ * Opens the seal refused, counted. HDF5 does not fail every read it could not
+ * finish: a dataset whose raw values are stored in another file came back from
+ * h5wasm as whatever its buffer held, with no error. A refusal during a read is
+ * the one sign that the values are not this file's.
+ */
+const REFUSED = { opens: 0 }
+
+/**
  * This filesystem's seal, put on at its first use: from then on, while an input
  * opened by `openInput` is open, every open is refused (EACCES) except one made
  * through the door, which only the converter's own operations use.
@@ -74,7 +82,10 @@ function sealOf(FS: H5): Seal {
     const s: Seal = { inputs: 0, door: false }
     const open = FS.open
     FS.open = function (this: unknown, ...args: unknown[]) {
-      if (s.inputs > 0 && !s.door) throw new FS.ErrnoError(2)
+      if (s.inputs > 0 && !s.door) {
+        REFUSED.opens++
+        throw new FS.ErrnoError(2)
+      }
       return open.apply(this, args)
     }
     SEALS.set(FS, seal = s)
@@ -125,6 +136,39 @@ function elsewhere(d: H5): string | null {
 }
 
 /**
+ * Read one value of an array dataset, and say whether that read tried to open
+ * another file: external raw storage, or a virtual source no mapping names.
+ * One element is enough, since the first lies where the rest do.
+ */
+function storedElsewhere(d: H5): boolean {
+  const shape = (d.shape as number[] | null) ?? []
+  if (!shape.length || shape.some(x => !(x > 0))) return false
+  // h5wasm's slice of a variable-length type ran out of its memory, and the
+  // scan reads those whole anyway. Raw values stored in another file have a
+  // fixed size.
+  try {
+    if (d.metadata?.vlen || d.metadata?.vlen_type) return false
+  } catch {
+    return false
+  }
+  const before = REFUSED.opens
+  try {
+    d.slice(shape.map(() => [0, 1]))
+  } catch {
+    // A read that fails for another reason is the reader's to report, later.
+  }
+  return REFUSED.opens !== before
+}
+
+/** A scalar's value, read only from this file. */
+function ownValue(d: H5): unknown {
+  const before = REFUSED.opens
+  const v = d.value
+  if (REFUSED.opens !== before) throw new Error('its value is stored in another file, which the converter does not read')
+  return v
+}
+
+/**
  * The object at `name` below `g`, never reached through a link out of the file.
  *
  * Looked up one name at a time: for a path that runs through a link it cannot
@@ -143,7 +187,7 @@ function child(g: H5, name: string): H5 | null {
     const o = at.get(part)
     const says = o?.type === 'ExternalLink' ? `an external link to ${o.obj_path} in ${o.filename}`
       : o?.type === 'BrokenSoftLink' ? `a soft link to ${o.target}, which reaches nothing in this file`
-        : isDataset(o) ? elsewhere(o) : null
+        : isDataset(o) ? elsewhere(o) ?? (storedElsewhere(o) ? 'a dataset whose values are stored in another file' : null) : null
     if (says) {
       UNFOLLOWED.get(String(at.file_id))?.set(`${at.path}/${part}`.replace(/^\/+/, ''), says)
       return null
@@ -733,7 +777,7 @@ function schemaSaysProvenance(o: H5): boolean {
   if (!isDict(o)) return false
   try {
     const s = child(o, 'schema')
-    return isDataset(s) && /provenance/i.test(text(s.value))
+    return isDataset(s) && /provenance/i.test(text(ownValue(s)))
   } catch {
     return false
   }
@@ -771,9 +815,9 @@ function readIdentity(rec: H5, path: string): Identity {
     }
     let v: unknown
     try {
-      v = o.value
+      v = ownValue(o)
     } catch {
-      refused.push(`${field} (a string that could not be read)`)
+      refused.push(`${field} (a string that could not be read from this file)`)
       continue
     }
     const s = typeof v === 'string' ? v : Array.isArray(v) && v.length === 1 && typeof v[0] === 'string' ? v[0] : null
