@@ -1022,9 +1022,12 @@ console.log('\nNOTHING ELSE IN THE FIXTURE\'S BUNDLE CHANGED (against 51a00fa)')
   }, 'a9985a264cf4021d54153cc03fa2bb5ba1d901804355295cfac697d2f3380cc4')
   const again = convert(FIX.classic, 'guessed-again.zip', ['--label', 'family'])
   // W064: a55a9f06... before; only meta.json (facts added, the sentinel note
-  // restated, one measured note) and collection.json's notes moved.
+  // restated, one measured note) and collection.json's notes moved (d596404e...).
+  // W064's fix round: only meta.json's facts moved, by the two chosen roles
+  // (sample_column, condition_column, by guess), as predicted before the change;
+  // so collection.json moved only in the part's bytes and sha256.
   attempt('the bundle is the one predicted: the closed reader, then the facts', () => sha256(G.o.bytes),
-    'd596404e79864ac31351d498001b48b34b620d950684d69f8e8818dd56b44d06')
+    '56374e13eebec6b039057044b5e3950477b4b5c86266beb8d40f9c12a51dc2c3')
   attempt('two conversions are still byte-identical',
     () => [again.r.code, sha256(readFileSync(again.out)) === sha256(G.o.bytes)], [0, true])
 }

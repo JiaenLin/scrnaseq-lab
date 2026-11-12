@@ -245,6 +245,10 @@ export function chooseMatrices(scan: Scan, note: (s: string) => void): {
   displayKey: string
   countsKey: string | null
   from: 'lognorm' | 'counts' | 'log-counts' | 'linear'
+  /** What the counts were read as: stored counts, or log1p(counts) exponentiated back. */
+  countsKind: 'counts' | 'log-counts' | null
+  /** The linear matrix as stored, before the log1p the expression takes; only when `from` is linear. */
+  stored: CellMajor | null
 } {
   const kinds = usableCoverage(scan.matrices, note)
   for (const m of kinds) note(`${m.key} looks like ${m.kind}`)
@@ -286,22 +290,25 @@ export function chooseMatrices(scan: Scan, note: (s: string) => void): {
     }
     agree(asLognorm.key, counts ? countsRef!.key : null)
     return { display, counts, geneSet: asLognorm.geneSet, expression: 'log1p(CP10K)',
-      displayKey: asLognorm.key, countsKey: counts ? countsRef!.key : null, from: 'lognorm' }
+      displayKey: asLognorm.key, countsKey: counts ? countsRef!.key : null, from: 'lognorm',
+      countsKind: counts ? countsRef!.kind as 'counts' | 'log-counts' : null, stored: null }
   }
 
   if (counts && countsSet) {
     note('expression computed here as log1p(CP10K) from the counts')
     agree(countsRef!.key, countsRef!.key)
     return { display: lognormalize(counts), counts, geneSet: countsSet, expression: 'log1p(CP10K)',
-      displayKey: countsRef!.key, countsKey: countsRef!.key, from: countsRef!.kind as 'counts' | 'log-counts' }
+      displayKey: countsRef!.key, countsKey: countsRef!.key, from: countsRef!.kind as 'counts' | 'log-counts',
+      countsKind: countsRef!.kind as 'counts' | 'log-counts', stored: null }
   }
 
   const asLinear = first('linear')
   if (asLinear) {
     note(`${asLinear.key} is normalized but not logged; log1p applied`)
     agree(asLinear.key, null)
-    return { display: log1p(asLinear.load()), counts: null, geneSet: asLinear.geneSet, expression: 'log1p(normalized)',
-      displayKey: asLinear.key, countsKey: null, from: 'linear' }
+    const stored = asLinear.load()
+    return { display: log1p(stored), counts: null, geneSet: asLinear.geneSet, expression: 'log1p(normalized)',
+      displayKey: asLinear.key, countsKey: null, from: 'linear', countsKind: null, stored }
   }
 
   throw new BuildError(
@@ -545,6 +552,43 @@ function qcColumn(scan: Scan, names: string[]): { name: string; values: Float32A
   return null
 }
 
+/** A per-cell number of the QC block, and the fact that says what it is: made together, in one place. */
+export interface PerCell { values: Float32Array; fact: Fact | undefined }
+
+/** The matrices chooseMatrices loaded, as perCellQC needs them. */
+export type Summable = Pick<ReturnType<typeof chooseMatrices>, 'display' | 'counts' | 'displayKey' | 'countsKey' | 'countsKind' | 'from' | 'stored'>
+
+/**
+ * The per-cell total and genes detected: THE one place that computes them, and
+ * the only place their facts' words are made, from the branch that made the
+ * numbers. Each is an obs column read at a standard key (recorded, at its
+ * place), or computed here from ONE matrix, and then the fact names that matrix
+ * and what was done to its stored values before they were summed or counted:
+ * the counts as stored; the counts a log1p(counts) matrix holds, exponentiated
+ * back and rounded; or, with no counts, the expression matrix as STORED (a
+ * linear one before the log1p the bundle's expression takes; a logged one as
+ * the logs it holds).
+ */
+export function perCellQC(scan: Scan, m: Summable, note: (s: string) => void): { total: PerCell; genes: PerCell } {
+  const totalCol = qcColumn(scan, ['n_counts', 'total_counts', 'nCount_RNA'])
+  const nGeneCol = qcColumn(scan, ['n_genes', 'n_genes_by_counts', 'nFeature_RNA'])
+  const src = m.counts
+    ? { matrix: m.counts, of: placeOf(m.countsKey!),
+      done: m.countsKind === 'log-counts' ? ', after expm1 of each stored value (its log1p(counts)), rounded to an integer' : '' }
+    : { matrix: m.from === 'linear' && m.stored ? m.stored : m.display, of: placeOf(m.displayKey), done: '' }
+  let q: { total: Float32Array; genes: Float32Array } | null = null
+  const computed = () => (q ??= cellQC(src.matrix))
+  const total: PerCell = totalCol
+    ? { values: totalCol.values, fact: factOr(() => recorded(totalCol.name, `obs/${totalCol.name}`), note, `the total column's name`) }
+    : { values: computed().total, fact: measured(null, src.of, `summed per cell over every gene${src.done}`) }
+  const genes: PerCell = nGeneCol
+    ? { values: nGeneCol.values, fact: factOr(() => recorded(nGeneCol.name, `obs/${nGeneCol.name}`), note, `the detected-gene column's name`) }
+    : { values: computed().genes, fact: measured(null, src.of, `values above zero counted per cell${src.done}`) }
+  if (!totalCol) note('no total-count column; recomputed from the matrix')
+  if (!nGeneCol) note('no detected-gene column; recomputed from the matrix')
+  return { total, genes }
+}
+
 /** A fact, or none and a note when the object's own text cannot be carried as one line. */
 function factOr(make: () => Fact, note: (s: string) => void, what: string): Fact | undefined {
   try {
@@ -579,7 +623,8 @@ export function buildBundle(
   }
 
   onProgress('Reading the expression matrix')
-  const { display, counts, geneSet, displayKey, countsKey, from } = chooseMatrices(scan, note)
+  const chosenMatrices = chooseMatrices(scan, note)
+  const { display, counts, geneSet, displayKey, from } = chosenMatrices
   if ((counts != null) !== p.carried) {
     throw new BuildError('the plan and the build disagree on whether the raw counts travel: this is a bug in the converter')
   }
@@ -750,34 +795,21 @@ export function buildBundle(
   // ---- QC ---------------------------------------------------------------
   onProgress('Computing QC')
   const MITO = ['percent_mito', 'pct_counts_mt', 'percent.mt', 'percent_mt']
-  const totalCol = qcColumn(scan, ['n_counts', 'total_counts', 'nCount_RNA'])
-  const nGeneCol = qcColumn(scan, ['n_genes', 'n_genes_by_counts', 'nFeature_RNA'])
   const mitoCol = qcColumn(scan, MITO)
-  let total = totalCol?.values ?? null
-  let nGene = nGeneCol?.values ?? null
+  // The total and the genes detected, each with the words of what was summed,
+  // from the one function that sums them.
+  const perCell = perCellQC(scan, chosenMatrices, note)
+  const total = perCell.total.values
+  const nGene = perCell.genes.values
   let mito = mitoCol?.values ?? null
-
-  // A total is of counts only when it is summed from the matrix measured to
-  // hold them; otherwise it names the matrix it was summed from.
-  const summed = placeOf(countsKey ?? displayKey)
-  const after = countsKey && from === 'log-counts' ? ', after expm1 of its stored log1p(counts)' : ''
   const qcFacts = {
-    total: totalCol
-      ? factOr(() => recorded(totalCol.name, `obs/${totalCol.name}`), note, `the total column's name`)
-      : measured(null, summed, `summed per cell over every gene${after}`),
-    genes_detected: nGeneCol
-      ? factOr(() => recorded(nGeneCol.name, `obs/${nGeneCol.name}`), note, `the detected-gene column's name`)
-      : measured(null, summed, 'values above zero counted per cell'),
+    total: perCell.total.fact,
+    genes_detected: perCell.genes.fact,
     mito: mitoCol
       ? factOr(() => recorded(mitoCol.name, `obs/${mitoCol.name}`), note, `the mitochondrial column's name`)
       : notRecorded(MITO.map(k => `obs/${k}`).join(', ')),
   }
 
-  if (!total || !nGene) {
-    const q = cellQC(counts ?? display)
-    if (!total) { total = q.total; note('no total-count column; recomputed from the matrix') }
-    if (!nGene) { nGene = q.genes; note('no detected-gene column; recomputed from the matrix') }
-  }
   if (!mito) {
     mito = new Float32Array(n)
     note('no mitochondrial fraction in the metadata — the QC panel will show a flat zero rather than a made-up number')
@@ -887,6 +919,9 @@ export function buildBundle(
       chosen: {
         cell_type_column: choiceOf(choices.cluster, choices.by?.cluster, note, 'the cell type column'),
         embedding: choiceOf(choices.embedding, choices.by?.embedding, note, 'the embedding'),
+        // The columns provenance.sample and .condition name, and who chose them.
+        sample_column: choiceOf(sampleCol?.kind === 'categorical' ? sampleCol.name : null, choices.by?.sample, note, 'the sample column'),
+        condition_column: choiceOf(condCol?.kind === 'categorical' ? condCol.name : null, choices.by?.condition, note, 'the condition column'),
         ...(choices.sentinels
           ? { not_called: choiceOf(choices.sentinels.length ? choices.sentinels.join(', ') : null, choices.by?.sentinels, note, 'the labels of the cells not called') }
           : {}),

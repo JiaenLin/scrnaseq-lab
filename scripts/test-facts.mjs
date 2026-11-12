@@ -18,11 +18,12 @@
 
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { unzipSync, strFromU8 } from 'fflate'
+import { nameRules, rulesIn } from './name-rules.mjs'
 
 let failed = 0
 const report = (name, ok, detail) => {
@@ -67,6 +68,11 @@ const B = {
   f: convert(FIX('f-two'), 'f'),
   g: convert(FIX('g-lognorm'), 'g'),
   h: convert(FIX('h-hostile'), 'h'),
+  aRoles: convert(FIX('a'), 'a-roles', ['--sample', 'sample', '--condition', 'group']),
+  n: convert(FIX('n-nothing'), 'n'),
+  l: convert(FIX('l-linear'), 'l'),
+  c: convert(FIX('c-loglayer'), 'c'),
+  d: convert(FIX('d-damaged'), 'd'),
 }
 
 const notRec = (searched) => ({ kind: 'recorded', value: null, searched })
@@ -136,6 +142,15 @@ const ROWS = {
     // Labels spelled as the profile's words: chosen by a guess, and never said "drawn".
     decoy: [B.a, b => [fact(b, 'not_called')?.by, b?.meta.notes.some(s => /stay drawn/.test(s))], ['guess', false]],
   },
+  // The two the Studio's reader has no id for yet (it ignores them): who chose is still written.
+  sample_column: {
+    right: [B.aRoles, b => fact(b, 'sample_column'), { kind: 'chosen', value: 'sample', by: 'flag' }],
+    decoy: [B.a, b => [fact(b, 'sample_column'), legacy(b, 'sample')], [{ kind: 'chosen', value: 'sample', by: 'guess' }, 'sample']],
+  },
+  condition_column: {
+    right: [B.aRoles, b => fact(b, 'condition_column'), { kind: 'chosen', value: 'group', by: 'flag' }],
+    decoy: [B.a, b => [fact(b, 'condition_column'), legacy(b, 'condition')], [{ kind: 'chosen', value: 'group', by: 'guess' }, 'group']],
+  },
   gene_ids: {
     right: [B.a, b => [fact(b, 'gene_ids')?.value, fact(b, 'gene_ids')?.of], ['4 of 40 names are accessions', 'var']],
     // A var column named gene_ids holding symbols changes nothing.
@@ -163,23 +178,26 @@ attempt('every bundle carries facts, version 1', () => Object.values(B).map(b =>
 
 console.log('\nNO RULE IN THE SOURCE DECIDES A FACT FROM A NAME')
 {
-  // A regex literal or a string test holding a method's, a tool's or a
-  // normalisation's word: the shape every guess this wave removed had.
-  const WORD = /harmony|scanvi|scvi|mnn|bbknn|combat|scanorama|liger|integrat|doublet|scrublet|soupx|cellbender|decontx|ambient|pca|log1p|cp10k|normali/i
-  const files = []
-  const walk = (d) => { for (const n of readdirSync(d)) { const p = join(d, n); if (statSync(p).isDirectory()) walk(p); else if (/\.tsx?$/.test(n)) files.push(p) } }
-  walk(here('../src'))
-  const hits = []
-  for (const f of files) {
-    readFileSync(f, 'utf8').split('\n').forEach((line, i) => {
-      const code = line.replace(/\/\/.*$/, '').trim()
-      if (!code || code.startsWith('*') || code.startsWith('/*')) return
-      const literals = [...code.matchAll(/(?:^|[=(,:!&|?\s])\/((?:\\.|[^/\n])+)\/[dgimsuy]*\s*\.test\(/g)].map(m => m[1])
-      const strings = [...code.matchAll(/\.(?:includes|startsWith|endsWith)\(\s*['"`]([^'"`]+)['"`]\s*\)/g)].map(m => m[1])
-      for (const s of [...literals, ...strings]) if (WORD.test(s)) hits.push(`${f.split('/src/')[1]}:${i + 1}: ${s}`)
-    })
-  }
-  attempt('no regex or string test over a name holds a method, a tool or a normalisation', () => hits, [])
+  // scripts/name-rules.mjs reads every form a test over a name takes. One place
+  // is a guess said as one: the default embedding's rank of names, which the
+  // bundle states as `embedding` chosen by the command's guess.
+  const ALLOWED = ['lib/scan.ts: [umap, tsne, draw_graph, pca]']
+  const hits = nameRules(here('../src')).filter(h => !ALLOWED.includes(h.replace(/:\d+:/, ':')))
+  attempt('no regex, string test, comparison or list of names in the source holds a method, a tool or a normalisation', () => hits, [])
+  // The forms the read once missed, planted: each must be read.
+  const PLANTED = [
+    "if ({/pca/i.test(key)) return 'pca'",
+    "const m = /^X_(harmony|scanvi|scvi)$/i.exec(e.key)",
+    "const m = key.match(/scanvi/)",
+    "if (key.indexOf('harmony') >= 0) return 1",
+    "if (key === 'harmony') return 1",
+    "const METHODS = ['harmony', 'scanvi']; if (METHODS.some(m => key === m)) return 1",
+    "switch (key) { case 'bbknn': return 1 }",
+    "const r = new RegExp('scrublet', 'i')",
+    "return key.search('cellbender')",
+  ]
+  attempt('every form planted is read', () => PLANTED.filter(line => !rulesIn(line).length), [])
+  attempt('and a test over a name that holds no such word is not', () => rulesIn("if (/^X_umap/i.test(key) || key === 'cell_type') return 1"), [])
 }
 
 console.log('\nA FACT CANNOT BE MADE WITHOUT ITS SOURCE')
@@ -209,6 +227,64 @@ attempt('a group, an array, a number, 10,000 characters, a line break, markup: n
   ['as_group', 'as_array', 'as_number', 'as_long', 'as_lines', 'as_markup'].map(k => B.h?.meta.notes.some(s => s.startsWith(`uns/${k}/default_method `))),
 ], [null, [true, true, true, true, true, true]])
 attempt('a recorded embedding the object does not hold is said so', () => B.a?.meta.notes.some(s => /default_embedding names/.test(s)), false)
+
+console.log('\nNOTHING IS NOT A VALUE: THE WRITER\'S OWN NOTHINGS AT EVERY RECORDED PLACE')
+{
+  const NOTHING = { null_stage: 'a null value', empty_stage: 'an empty string', blank_stage: 'a blank string',
+    array_stage: 'an empty array', nan_stage: 'a number that is not finite (NaN)' }
+  const WHAT = { integration: 'an integration method', integration_embedding: "an integration method's embedding",
+    doublets: 'a doublet tool', ambient: 'an ambient-RNA tool' }
+  const KEY = { integration: 'default_method', integration_embedding: 'default_embedding', doublets: 'doublet_method', ambient: 'ambient_method' }
+  const LEGACY = { integration: 'integration', doublets: 'doublets', ambient: 'ambient' }
+  for (const id of Object.keys(KEY)) {
+    attempt(`${id}: None, "", "   ", [] and NaN at its place are nothing: not recorded, each place named, no value`, () => [
+      fact(B.n, id), LEGACY[id] ? legacy(B.n, LEGACY[id]) : null,
+      Object.entries(NOTHING).filter(([k, w]) => !B.n?.meta.notes.includes(`uns/${k}/${KEY[id]} holds nothing (${w}), so it records no ${WHAT[id]}`)).map(([k]) => k),
+    ], [notRec(DICT(KEY[id])), null, []])
+  }
+  attempt('normalization: scanpy\'s default record, base None, is log1p with no base (never "base 0")', () => [
+    fact(B.n, 'normalization'), legacy(B.n, 'normalization'),
+    B.n?.meta.notes.includes('uns/log1p/base is nothing (a null value), not a number, so the normalization is stated with no base'),
+  ], [{ kind: 'recorded', value: 'log1p', at: 'uns/log1p' }, 'log1p', true])
+}
+
+console.log('\nA TOTAL SAYS WHAT WAS SUMMED: EVERY WAY, 200 CELLS AGAINST NUMPY\'S SUM OF WHAT THE WORDS NAME')
+{
+  const SUMS = JSON.parse(readFileSync(here('./fixtures/facts-sums.json'), 'utf8'))
+  const qc = (b) => { const f = b.parts[0].files['qc.f32']; return new Float32Array(f.buffer.slice(f.byteOffset, f.byteOffset + f.byteLength)) }
+  const near = (got, want) => got.length === want.length && got.every((v, i) => Math.abs(v - want[i]) <= 1e-5 * Math.max(1, Math.abs(want[i])))
+  const at = (b, col) => { const q = qc(b); return SUMS.cells.map(c => q[3 * c + col]) }
+  const S = 'summed per cell over every gene', G = 'values above zero counted per cell'
+  const BACK = ', after expm1 of each stored value (its log1p(counts)), rounded to an integer'
+  // [the way, the bundle, its sums, the total's words, what they name, the genes' words, what they name]
+  const WAYS = [
+    ['from a counts layer', B.a, 'a', ['measured', 'layers/counts', S], 'layers/counts', ['measured', 'layers/counts', G], 'layers/counts'],
+    ['from a logged X, no counts', B.g, 'g', ['measured', 'X', S], 'X', ['measured', 'X', G], 'X'],
+    ['from a linear X the lab logs for display', B.l, 'l', ['measured', 'X', S], 'X', ['measured', 'X', G], 'X'],
+    ['from the counts a log1p(counts) layer holds', B.c, 'c', ['measured', 'layers/lc', S + BACK], 'layers/lc expm1 rounded', ['measured', 'layers/lc', G + BACK], 'layers/lc expm1 rounded'],
+    ['from a column of the object under a standard name', B.e, 'e', ['recorded', 'obs/total_counts', null], 'obs/total_counts', ['recorded', 'obs/n_genes_by_counts', null], 'obs/n_genes_by_counts'],
+  ]
+  const words = (f) => [f?.kind, f?.of ?? f?.at, f?.how ?? null]
+  for (const [way, b, k, tw, tn, gw, gn] of WAYS) {
+    attempt(`total ${way}: the words, and 200 cells equal the sum of what they name`, () => {
+      const want = SUMS[k][tn]
+      return [words(fact(b, 'total')), !!b && near(at(b, 0), Array.isArray(want) ? want : want.total)]
+    }, [tw, true])
+    attempt(`genes detected ${way}: the words, and 200 cells equal the count on what they name`, () => {
+      const want = SUMS[k][gn]
+      return [words(fact(b, 'genes_detected')), !!b && near(at(b, 1), Array.isArray(want) ? want : want.genes)]
+    }, [gw, true])
+  }
+  attempt('a linear X: the total is not the sum of its log (what the bundle held before)', () => !!B.l && near(at(B.l, 0), SUMS.l['X'].total) && !near(at(B.l, 0), SUMS.g['X'].total), true)
+}
+
+console.log('\nA FAILED READ STATES NO FACT')
+attempt('a damaged counts layer: named as unreadable, and the counts not said absent', () => {
+  const f = fact(B.d, 'counts')
+  return [f?.kind, f?.value, f?.of, f?.carried, /^could not be read, so whether the object holds raw counts is not known/.test(f?.how ?? ''),
+    B.d?.meta.hasRawCounts, B.d?.meta.notes.some(s => s.startsWith('layers["counts"] could not be read ('))]
+}, ['measured', null, 'layers/counts', false, true, false, true])
+attempt('the same layer readable: raw counts, measured', () => [fact(B.a, 'counts')?.value, fact(B.a, 'counts')?.of], [true, 'layers/counts'])
 
 console.log('\nTHE PAGE SAYS WHAT THE BUNDLE THEN HOLDS')
 const planMod = await load('../src/lib/plan.ts')
@@ -243,7 +319,8 @@ const said = (p) => ({
 })
 let split = null
 if (planMod && h5 && roles && cliMod) {
-  for (const [name, input] of [['a', FIX('a')], ['b', FIX('b-decoy')], ['e', FIX('e-records')], ['g', FIX('g-lognorm')]]) {
+  for (const [name, input] of [['a', FIX('a')], ['b', FIX('b-decoy')], ['e', FIX('e-records')], ['g', FIX('g-lognorm')],
+    ['n', FIX('n-nothing')], ['l', FIX('l-linear')], ['c', FIX('c-loglayer')], ['d', FIX('d-damaged')]]) {
     attempt(`${name}: the page's embeddings, parts, raw counts and pseudobulk are the bundle's`,
       () => { const p = said(pageOf(input)); const h = holds(B[name]); return [p, h] }, (() => { const h = holds(B[name]); return [h, h] })())
   }
@@ -259,6 +336,9 @@ if (planMod && h5 && roles && cliMod) {
   attempt('a-split: the page says the counts will not be in the bundle, and why', () => pageOf(FIX('a'), {}, 2000).counts,
     `Your object holds raw counts at layers/counts; they will not be in the bundle: the object is converted in ${split?.parts.length} parts, and one matrix is read for them, X, the expression.`)
   attempt('a whole: the page says the counts travel', () => pageOf(FIX('a')).counts, 'Raw counts travel: layers/counts, summed per sample and cell type.')
+  attempt('a damaged counts layer: the page says it could not be read, never that the object holds none', () => [pageOf(FIX('d-damaged')).counts, pageOf(FIX('d-damaged')).pseudobulk],
+    ['layers/counts could not be read, so whether this object holds raw counts is not known; the bundle carries none.',
+      { yes: false, because: 'layers/counts could not be read, so whether this object holds raw counts is not known, and none are summed' }])
   attempt('a: two embeddings travel, the latent spaces and the copy are named as not offered', () => [pageOf(FIX('a')).travel, pageOf(FIX('a')).notOffered], [
     '2 embeddings travel in the file: X_umap, X_umap_harmony; X_umap opens first.',
     'Not offered beside them: X_harmony (10 columns, a latent space), X_scanvi (10 columns, a latent space) and X_umap_scanvi (the same coordinates as X_umap).'])

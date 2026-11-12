@@ -157,6 +157,8 @@ export interface ScanInfo {
   columns: Column[]
   /** `covered` (the share of genes it reaches) and `streamable`, measured for the plan (plan.ts, planInfo). */
   matrices: { key: string; geneSet: string; nGenes: number; nCells: number; kind: MatrixKind; covered?: number; streamable?: boolean }[]
+  /** The matrices the reader could not read (Scan.unreadableMatrices): what they hold is not known. */
+  unreadable?: { key: string; why: string }[]
   /** `same`: the first embedding whose two columns are these, bit for bit (plan.ts). */
   embeddings: { key: string; nDims: number; same?: string }[]
   geneSets: Record<string, string[]>
@@ -201,6 +203,13 @@ export interface Scan {
    * would use one for a role stops instead (src/cli/roles.ts).
    */
   unreadableColumns?: { name: string; why: string }[]
+  /**
+   * The matrices the reader could not read (a failed read, a member not in the
+   * file, values that are not numbers), by key, and why. Absent from `matrices`
+   * and named in the notes; what they hold is not known, so no fact is made of
+   * them: the counts fact says they could not be read (plan.ts).
+   */
+  unreadableMatrices?: { key: string; why: string }[]
 }
 
 /** The three questions the lab asks, plus whatever else is worth carrying. */
@@ -236,7 +245,7 @@ export interface Choices {
    * bundle's facts with each choice; a choice whose chooser is not given is
    * stated as no fact.
    */
-  by?: { cluster?: By; embedding?: By; sentinels?: By }
+  by?: { cluster?: By; embedding?: By; sentinels?: By; sample?: By; condition?: By }
 }
 
 // ---------------------------------------------------------------------------

@@ -421,7 +421,7 @@ export default function App() {
         label: file.name.replace(/\.(h5ad|rds|h5)$/i, ''),
         extras: [],
         // Shown in the page, where the user confirms or changes them.
-        by: { cluster: 'app', embedding: 'app' },
+        by: { cluster: 'app', embedding: 'app', sample: 'app', condition: 'app' },
       }
       setChoices(first)
       // The page's plan decides the split (lib/plan.ts); the worker runs the same plan.

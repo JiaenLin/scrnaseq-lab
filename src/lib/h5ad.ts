@@ -905,12 +905,55 @@ const WHAT: Record<RecordedId, string> = {
   normalization: 'a normalization', doublets: 'a doublet tool', ambient: 'an ambient-RNA tool',
 }
 
+/**
+ * What one place of the object holds, read once: THE reader of every recorded
+ * fact (readRecorded below). It tells a value from nothing there, and never
+ * makes nothing a value: no entry, a null (anndata writes None as a dataset
+ * with no dataspace, which a read gives as null and Number() as 0), an empty
+ * array, an empty or blank string, a number that is not finite. A read that
+ * fails is its own answer: what is there is not known, so no fact follows.
+ */
+export type Held =
+  | { is: 'value'; value: string | number | boolean }
+  | { is: 'nothing'; what: string }
+  | { is: 'unreadable'; what: string }
+  | { is: 'other'; what: string }
+
+function held(parent: H5, key: string): Held {
+  let o: H5 | null
+  try { o = child(parent, key) } catch (e) { return { is: 'unreadable', what: `an entry that could not be read (${(e as Error).message})` } }
+  if (!o) return { is: 'nothing', what: 'no entry' }
+  if (isGroup(o)) return { is: 'other', what: 'a group' }
+  if (!isDataset(o)) return { is: 'other', what: 'neither a dataset nor a group' }
+  let info: H5
+  try { info = o.metadata ?? {} } catch { return { is: 'unreadable', what: 'a value whose type cannot be read' } }
+  if (info.shape === null) return { is: 'nothing', what: 'a null value' }
+  const shape = (info.shape as number[] | undefined) ?? []
+  const size = shape.reduce((a, b) => a * b, 1)
+  if (shape.length && size === 0) return { is: 'nothing', what: 'an empty array' }
+  if (size > 1) return { is: 'other', what: `an array of ${size.toLocaleString('en-US')} values` }
+  let v: unknown
+  try { v = ownValue(o) } catch (e) { return { is: 'unreadable', what: `a value that could not be read (${(e as Error).message})` } }
+  if (Array.isArray(v) || ArrayBuffer.isView(v)) v = (v as unknown as ArrayLike<unknown>)[0]
+  if (typeof v === 'bigint') v = Number(v)
+  if (v === null || v === undefined) return { is: 'nothing', what: 'a null value' }
+  if (typeof v === 'number') return Number.isFinite(v) ? { is: 'value', value: v } : { is: 'nothing', what: `a number that is not finite (${v})` }
+  if (typeof v === 'boolean') return { is: 'value', value: v }
+  if (typeof v === 'string') return v.trim() ? { is: 'value', value: v } : { is: 'nothing', what: v ? 'a blank string' : 'an empty string' }
+  return { is: 'other', what: 'a value that is not a string, a number or a boolean' }
+}
+
+/** What a Held is, for a note: "a group", "a number", "nothing (a null value)". */
+const heldAs = (h: Held): string =>
+  h.is === 'value' ? `a ${typeof h.value}` : h.is === 'nothing' ? `nothing (${h.what})` : h.what
+
 function readRecorded(uns: H5, obsmKeys: string[], note: (s: string) => void): NonNullable<Sources['recorded']> {
   const out: NonNullable<Sources['recorded']> = {}
   const ids = Object.keys(RECORD_KEYS) as (keyof typeof RECORD_KEYS)[]
   const hits = new Map<RecordedId, { value: string; at: string }[]>(ids.map(id => [id, []]))
-  // Places that hold something this converter does not carry: then the fact is
-  // not stated (each is named), never "not recorded" of an object that holds one.
+  // Places that hold something this converter does not carry, or that could
+  // not be read: then the fact is not stated (each is named), never "not
+  // recorded" of an object that may hold one.
   const refused = new Set<RecordedId>()
   const keys: string[] = isGroup(uns) ? uns.keys() : []
   for (const k of keys) {
@@ -921,24 +964,22 @@ function readRecorded(uns: H5, obsmKeys: string[], note: (s: string) => void): N
     if (!o) continue
     for (const id of ids) {
       const field = RECORD_KEYS[id]
-      let c: H5 | null
-      try { c = child(o, field) } catch { c = null }
-      if (!c) continue
       const at = `uns/${shown(k)}/${field}`
-      const kind = kindOf(c)
-      let v: unknown = null
-      if (!kind) {
-        try { v = ownValue(c) } catch { v = null }
-      }
-      const str = typeof v === 'string' ? v : Array.isArray(v) && v.length === 1 && typeof v[0] === 'string' ? v[0] : null
-      if (str === null) {
+      const h = held(o, field)
+      if (h.is === 'nothing') {
+        // Nothing at the place records nothing: it is not a value, and not a refusal.
+        if (h.what !== 'no entry') note(`${at} holds nothing (${h.what}), so it records no ${WHAT[id]}`)
+      } else if (h.is === 'unreadable') {
         refused.add(id)
-        note(`${at} is ${kind ?? 'a value that could not be read as a string'}, so it is not read as the object's record of ${WHAT[id]}`)
-      } else if (!isLine(str, MAX_VALUE) || !isLine(at, MAX_PLACE)) {
+        note(`${at} could not be read (${h.what}), so the bundle states nothing of the object's ${WHAT[id]}`)
+      } else if (h.is === 'other' || typeof h.value !== 'string') {
+        refused.add(id)
+        note(`${at} is ${heldAs(h)}, so it is not read as the object's record of ${WHAT[id]}`)
+      } else if (!isLine(h.value, MAX_VALUE) || !isLine(at, MAX_PLACE)) {
         refused.add(id)
         note(`${at} holds a value that is not one line of ${MAX_VALUE} characters or fewer without markup, so it is not carried as the object's record of ${WHAT[id]}; it stays in the object`)
       } else {
-        hits.get(id)!.push({ value: str, at })
+        hits.get(id)!.push({ value: h.value, at })
       }
     }
   }
@@ -952,24 +993,25 @@ function readRecorded(uns: H5, obsmKeys: string[], note: (s: string) => void): N
   const e = out.integration_embedding
   if (e && 'at' in e && !obsmKeys.includes(e.value)) note(`${e.at} names ${e.value}, which is not an embedding of this object`)
 
+  // scanpy's record of log1p, a dict at uns/log1p: its base is stated only
+  // from a real number at uns/log1p/base (scanpy's default is None).
+  const top: Held = isGroup(uns) ? held(uns, 'log1p') : { is: 'nothing', what: 'no entry' }
   let n: H5 | null = null
-  let dict = false
-  try { n = isGroup(uns) ? child(uns, 'log1p') : null; dict = !!n && isDict(n) } catch { n = null }
-  if (n && dict) {
-    let base: number | null = null
-    try {
-      const b = child(n, 'base')
-      if (b && kindOf(b) === 'a number') {
-        const x = Number(ownValue(b))
-        if (Number.isFinite(x)) base = x
-      }
-    } catch { base = null }
+  if (top.is === 'other' && top.what === 'a group') {
+    try { n = child(uns, 'log1p'); if (n && !isDict(n)) n = null } catch { n = null }
+  }
+  if (n) {
+    const b = held(n, 'base')
+    const base = b.is === 'value' && typeof b.value === 'number' ? b.value : null
+    if (base === null && !(b.is === 'nothing' && b.what === 'no entry')) {
+      note(`uns/log1p/base is ${heldAs(b)}, not a number, so the normalization is stated with no base`)
+    }
     out.normalization = recorded(base === null ? 'log1p' : `log1p, base ${base}`, 'uns/log1p')
+  } else if (top.is === 'unreadable') {
+    note(`uns/log1p could not be read (${top.what}), so the bundle states nothing of the object's normalization`)
   } else {
-    if (n) {
-      let what = 'a string'
-      try { what = kindOf(n) ?? 'a string' } catch { what = 'an entry whose type cannot be read' }
-      note(`uns/log1p is ${what}, not a dict as scanpy records log1p, so no normalization is read from it`)
+    if (!(top.is === 'nothing' && top.what === 'no entry')) {
+      note(`uns/log1p is ${top.is === 'other' && top.what === 'a group' ? 'a group of another encoding than dict' : heldAs(top)}, not a dict as scanpy records log1p, so no normalization is read from it`)
     }
     out.normalization = notRecorded(SEARCHED.normalization)
   }
@@ -1047,7 +1089,9 @@ function kindOf(o: H5): string | null {
   } catch {
     return 'a value whose type cannot be read'
   }
-  const shape = (info.shape as number[] | null) ?? []
+  // anndata writes None as a dataset with no dataspace: a null, not a number.
+  if (info.shape === null) return 'a null value'
+  const shape = (info.shape as number[] | undefined) ?? []
   if (shape.length) {
     const n = shape.reduce((a, b) => a * b, 1)
     return `an array of ${n.toLocaleString('en-US')} value${n === 1 ? '' : 's'}`
@@ -1316,6 +1360,7 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
   // ---- candidate matrices ----------------------------------------------
   const matrices: MatrixRef[] = []
   const unreadable: string[] = []
+  const lostMatrices: { key: string; why: string }[] = []
   const add = (key: string, m: H5, geneSet: string, cells: number, genes: number) => {
     if (!m) return
     try {
@@ -1358,6 +1403,7 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
       const why = (e as Error).message
       note(`${shown(key)} could not be read (${why}); skipped`)
       unreadable.push(`${shown(key)} (${why})`)
+      lostMatrices.push({ key, why })
     }
   }
 
@@ -1444,6 +1490,7 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
     format: 'h5ad', source: filename, nCells, columns, matrices, embeddings,
     geneSets, geneAliases, provenance, recorded, run, notes,
     ...(lost.length ? { unreadableColumns: lost } : {}),
+    ...(lostMatrices.length ? { unreadableMatrices: lostMatrices } : {}),
   }
 }
 

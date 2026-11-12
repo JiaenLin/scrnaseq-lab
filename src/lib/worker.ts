@@ -53,6 +53,7 @@ function describe(s: Scan, nnzPerCell: Int32Array | null): ScanInfo {
   return {
     format: s.format, source: s.source, nCells: s.nCells, columns: s.columns,
     matrices: info.matrices, embeddings: info.embeddings,
+    ...(info.unreadable.length ? { unreadable: info.unreadable } : {}),
     geneSets: s.geneSets, geneAliases: s.geneAliases,
     provenance: s.provenance, notes: s.notes, nnzPerCell,
   }

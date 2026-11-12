@@ -363,7 +363,9 @@ matches('which labels are sentinels', r5.err, /^guessed --sentinel EXCLUDED --se
 attempt('the summary lists what was guessed', () => r5.summary.guessed,
   ['cluster', 'sample', 'condition', 'extra', 'interaction', 'embedding', 'sentinel'])
 // The bundle's facts say who chose each role (W064): "guess" here, "flag" there.
-// Everything else is the same bytes.
+// Everything else is the same bytes. Five places: the cell type column, the
+// embedding, the cells not called, and (W064's fix round) the sample and the
+// condition columns.
 attempt('the guesses are exactly the explicit flags: the same bytes, but for who chose', () => {
   const part = (p) => {
     const c = unzipSync(readFileSync(p))
@@ -374,7 +376,7 @@ attempt('the guesses are exactly the explicit flags: the same bytes, but for who
   const differ = Object.keys(b).filter(k => k !== 'meta.json' && (!a[k] || Buffer.compare(a[k], b[k]) !== 0))
   return [meta(a) === meta(b), differ, Object.keys(a).length === Object.keys(b).length,
     strFromU8(a['meta.json']).split('"by": "guess"').length - 1]
-}, [true, [], true, 3])
+}, [true, [], true, 5])
 
 const OUT6 = join(tmp, 'named.zip')
 const r6 = cli(['convert', FIX.classic, OUT6, '--condition', 'factor_b', '--label', 'family'])

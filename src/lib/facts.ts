@@ -93,6 +93,10 @@ export type FactId =
   | 'integration' | 'integration_embedding' | 'normalization' | 'doublets' | 'ambient'
   | 'expression' | 'counts' | 'total' | 'genes_detected' | 'mito'
   | 'cell_type_column' | 'embedding' | 'not_called' | 'gene_ids'
+  // The lab's own two, which the Studio's reader (at db78d6e) has no id for:
+  // it ignores an id it does not know (its tools/BUNDLE.md, "facts"), so they
+  // ride in meta.facts unread there until a reader takes them.
+  | 'sample_column' | 'condition_column'
 
 /** The facts read from the object's own records, by the .h5ad reader (h5ad.ts, readRecorded). */
 export type RecordedId = 'integration' | 'integration_embedding' | 'normalization' | 'doublets' | 'ambient'
@@ -104,7 +108,7 @@ export interface Sources {
   /** Measured or read by the build and by the plan (build.ts, plan.ts). */
   measured: Partial<Record<'expression' | 'counts' | 'total' | 'genes_detected' | 'mito' | 'gene_ids', Fact>>
   /** The conversion's choices, with who made them; absent when the caller did not say. */
-  chosen: Partial<Record<'cell_type_column' | 'embedding' | 'not_called', Chosen>>
+  chosen: Partial<Record<'cell_type_column' | 'embedding' | 'not_called' | 'sample_column' | 'condition_column', Chosen>>
 }
 
 interface Row {
@@ -134,6 +138,10 @@ export const FACTS: Record<FactId, Row> = {
   embedding: { kinds: ['chosen'], read: s => s.chosen.embedding },
   not_called: { kinds: ['chosen'], read: s => s.chosen.not_called },
   gene_ids: { kinds: ['measured'], read: s => s.measured.gene_ids },
+  // The columns the samples and the conditions were read from, and who chose
+  // them: written where the Studio's reader ignores what it does not know.
+  sample_column: { kinds: ['chosen'], read: s => s.chosen.sample_column },
+  condition_column: { kinds: ['chosen'], read: s => s.chosen.condition_column },
 }
 export const FACT_IDS = Object.keys(FACTS) as FactId[]
 

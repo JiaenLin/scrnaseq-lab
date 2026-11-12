@@ -26,6 +26,18 @@ sentinel labels, the cells of one of them with no coordinates on any embedding.
                         and an uns string saying "CP10K"
     facts-h-hostile.h5ad default_method in dicts as a group, an array, a number,
                         10,000 characters, a line break, markup
+    facts-n-nothing.h5ad the four recorded keys in five dicts, each holding the
+                        writer's own nothing: None (a null dataset), an empty
+                        string, a blank one, an empty array, NaN; and scanpy's
+                        default record of log1p, {"base": None}
+    facts-l-linear.h5ad X normalised and not logged, no counts
+    facts-c-loglayer.h5ad X log-normalised, the counts only as log1p(counts)
+                        in layers["lc"]
+    facts-d-damaged.h5ad the shape with the first stored chunk of
+                        layers["counts"]/data overwritten after the write
+    facts-sums.json     200 drawn cells of a, c, e, g and l: each total and
+                        genes-detected summed here by numpy from the file as
+                        written, of every matrix a total can be read from
 """
 import argparse
 import os
@@ -154,4 +166,59 @@ H.uns["as_long"] = {"default_method": "s" * 10_000}
 H.uns["as_lines"] = {"default_method": "scanvi\nharmony"}
 H.uns["as_markup"] = {"default_method": "<b>scanvi</b>"}
 write(H, "facts-h-hostile.h5ad")
-print(f"wrote 6 objects of {n} cells x {g} genes to {a.out}")
+
+N = shape()
+del N.uns["scintegrate"]
+N.uns["integrator"] = {"provenance": provenance()}
+NOTHING = {"null_stage": None, "empty_stage": "", "blank_stage": "   ",
+           "array_stage": np.array([], dtype=np.float64), "nan_stage": np.nan}
+for k, v in NOTHING.items():
+    N.uns[k] = {f: v for f in ("default_method", "default_embedding", "doublet_method", "ambient_method")}
+N.uns["log1p"] = {"base": None}
+write(N, "facts-n-nothing.h5ad")
+
+Lin = shape()
+del Lin.layers["counts"], Lin.layers["lognorm"]
+Lin.X = sp.csr_matrix((counts / tot * 1e4).astype(np.float32))
+write(Lin, "facts-l-linear.h5ad")
+
+Cl = shape()
+del Cl.layers["counts"]
+Cl.layers["lc"] = sp.csr_matrix(np.log1p(counts).astype(np.float32))
+write(Cl, "facts-c-loglayer.h5ad")
+
+D = shape()
+write(D, "facts-d-damaged.h5ad")
+import h5py
+path = os.path.join(a.out, "facts-d-damaged.h5ad")
+with h5py.File(path, "r") as f:
+    info = f["layers/counts/data"].id.get_chunk_info(0)
+with open(path, "r+b") as f:
+    f.seek(info.byte_offset + info.size // 2)
+    f.write(b"\xff" * min(64, info.size // 2))
+
+# Every total the lab may state, summed here from the file as written.
+draw = sorted(np.random.default_rng(64).choice(n, size=min(200, n), replace=False).tolist())
+def dense(m):
+    return np.asarray(m.todense() if sp.issparse(m) else m, dtype=np.float64)
+sums = {"cells": draw}
+for name, file in [("a", "facts-a.h5ad"), ("c", "facts-c-loglayer.h5ad"), ("e", "facts-e-records.h5ad"),
+                   ("g", "facts-g-lognorm.h5ad"), ("l", "facts-l-linear.h5ad")]:
+    A = ad.read_h5ad(os.path.join(a.out, file))
+    got = {"X": dense(A.X)}
+    for k in A.layers.keys():
+        got[f"layers/{k}"] = dense(A.layers[k])
+    out = {}
+    for k, m in got.items():
+        out[k] = {"total": m.sum(1)[draw].tolist(), "genes": (m > 0).sum(1)[draw].tolist()}
+        if m.max() < 30:  # a matrix of logs: the counts it holds, exponentiated back
+            r = np.round(np.expm1(m))
+            out[f"{k} expm1 rounded"] = {"total": r.sum(1)[draw].tolist(), "genes": (r > 0).sum(1)[draw].tolist()}
+    for k in ("total_counts", "n_genes_by_counts"):
+        if k in A.obs:
+            out[f"obs/{k}"] = A.obs[k].to_numpy(dtype=np.float64)[draw].tolist()
+    sums[name] = out
+import json
+with open(os.path.join(a.out, "facts-sums.json"), "w") as f:
+    json.dump(sums, f, separators=(",", ":"))
+print(f"wrote 10 objects of {n} cells x {g} genes, and the sums, to {a.out}")

@@ -40,6 +40,8 @@ export interface PlanInfo {
   nCells: number
   columns: Column[]
   matrices: { key: string; geneSet: string; kind: MatrixKind; covered?: number; streamable?: boolean }[]
+  /** The matrices the scan could not read: what they hold is not known, so nothing is concluded of them. */
+  unreadable?: { key: string; why: string }[]
   /** `same`: the first embedding, in the object's order, whose two columns are these bit for bit. */
   embeddings: { key: string; nDims: number; same?: string }[]
   nnzPerCell?: Int32Array | null
@@ -60,6 +62,12 @@ export interface Plan {
   pick: MatrixPick
   /** The object's raw counts, measured on its matrices' sampled values: the first matrix that holds them. */
   countsIn: { key: string; kind: 'counts' | 'log-counts' } | null
+  /**
+   * With no counts among the matrices read: the places of those that could not
+   * be read. Then whether the object holds raw counts is not known, and nothing
+   * is said of it but that (a failed read states no fact).
+   */
+  countsUnread: string[] | null
   carried: boolean
   embeddings: {
     /** In the bundle, the one that opens first. */
@@ -123,6 +131,8 @@ export function plan(info: PlanInfo, choices: Choices, comfortable = COMFORTABLE
   const whole = pickMatrices(kinds)
   const c = kinds.find(m => m.kind === 'counts') ?? kinds.find(m => m.kind === 'log-counts')
   const countsIn = c ? { key: c.key, kind: c.kind as 'counts' | 'log-counts' } : null
+  const lost = info.unreadable ?? []
+  const countsUnread = !countsIn && lost.length ? lost.map(x => placeOf(x.key)) : null
 
   let pick = whole
   let stream: string | null = null
@@ -155,7 +165,8 @@ export function plan(info: PlanInfo, choices: Choices, comfortable = COMFORTABLE
   const condCol = column(info, choices.condition)
   const reps = Object.values(replicatesPerCondition(sampleCol, condCol))
   const enough = condCol != null && reps.length > 1 && reps.every(v => v >= MIN_REPS_PB)
-  const because = !countsIn ? 'this object holds no raw counts to sum'
+  const because = countsUnread ? `${and(countsUnread)} could not be read, so whether this object holds raw counts is not known, and none are summed`
+    : !countsIn ? 'this object holds no raw counts to sum'
     : !carried ? `the raw counts in ${placeOf(countsIn.key)} will not be in the bundle: ${pick.dropped}`
     : !condCol ? 'needs a condition to compare'
     : reps.length < 2 ? 'needs at least two groups'
@@ -163,7 +174,7 @@ export function plan(info: PlanInfo, choices: Choices, comfortable = COMFORTABLE
     : `${reps.join(' v ')} samples per group — fewer than ${MIN_REPS_PB}, so only the per-cell Wilcoxon is offered`
 
   return {
-    split, stream, pick, countsIn, carried,
+    split, stream, pick, countsIn, countsUnread, carried,
     embeddings: { carried: carriedKeys, latent, copies },
     wide: def && def.nDims > 2 ? { key: def.key, nDims: def.nDims } : null,
     pseudobulk: { possible: enough && carried, because },
@@ -194,6 +205,7 @@ export function pageSays(p: Plan): PageSays {
     wide: p.wide ? `${p.wide.key} has ${p.wide.nDims} columns, and only its first two are drawn: a much coarser picture than a UMAP.` : null,
     counts: p.carried && p.pick.counts ? `Raw counts travel: ${placeOf(p.pick.counts.key)}, summed per sample and cell type.`
       : p.countsIn ? `Your object holds raw counts at ${placeOf(p.countsIn.key)}; they will not be in the bundle: ${p.pick.dropped}.`
+      : p.countsUnread ? `${and(p.countsUnread)} could not be read, so whether this object holds raw counts is not known; the bundle carries none.`
       : 'This object holds no raw counts: no matrix’s sampled values are integers.',
     pseudobulk: { yes: p.pseudobulk.possible, because: p.pseudobulk.because },
   }
@@ -231,10 +243,11 @@ function sameAs(es: EmbeddingRef[]): Map<string, string> {
 }
 
 /** The scan described for the plan; the worker sends this to the page. */
-export function planInfo(scan: Scan, nnzPerCell: Int32Array | null): Pick<ScanInfo, 'matrices' | 'embeddings'> & { nnzPerCell: Int32Array | null } {
+export function planInfo(scan: Scan, nnzPerCell: Int32Array | null): Pick<ScanInfo, 'matrices' | 'embeddings'> & { nnzPerCell: Int32Array | null; unreadable: { key: string; why: string }[] } {
   const same = sameAs(scan.embeddings)
   return {
     nnzPerCell,
+    unreadable: scan.unreadableMatrices ?? [],
     matrices: scan.matrices.map(m => {
       let covered: number | undefined
       try { covered = m.coverage ? m.coverage() : undefined } catch { covered = undefined }
@@ -351,8 +364,13 @@ export function measureObject(scan: Scan, p: Plan, choices: Choices): Measuremen
       ? 'its sampled stored values (up to 20,000, in 8 blocks spread over it) are integers'
       : 'its sampled stored values (up to 20,000, in 8 blocks spread over it) are log1p of integers',
       p.carried ? { carried: true } : { carried: false, why: p.pick.dropped ?? 'they are not read' })
-    : measured(false, all.length === 1 ? all[0] : `every matrix of the object (${all.join(', ')})`.slice(0, 256),
-      `no matrix's sampled stored values (up to 20,000 a matrix, in 8 blocks) are integers, nor log1p of integers`)
+    : p.countsUnread
+      // A failed read states no fact: the value is not known, and the words say why.
+      ? measured(null, p.countsUnread.join(', ').slice(0, 256),
+        `could not be read, so whether the object holds raw counts is not known; no matrix that could be read has sampled stored values that are integers or log1p of integers`,
+        { carried: false, why: 'what the object holds there could not be read' })
+      : measured(false, all.length === 1 ? all[0] : `every matrix of the object (${all.join(', ')})`.slice(0, 256),
+        `no matrix's sampled stored values (up to 20,000 a matrix, in 8 blocks) are integers, nor log1p of integers`)
   if (ci && !p.carried) {
     notes.push(`the object holds raw counts at ${placeOf(ci.key)}, and this bundle does not carry them: ${p.pick.dropped}. Pseudobulk sums cannot be saved from it`)
   }

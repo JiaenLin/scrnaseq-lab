@@ -273,6 +273,8 @@ export function resolveRoles(scan: Scan, a: ConvertArgs): Resolved {
         cluster: a.cluster !== undefined ? 'flag' : 'guess',
         embedding: a.embedding !== undefined ? 'flag' : 'guess',
         sentinels: a.sentinels !== undefined ? 'flag' : 'guess',
+        sample: a.sample !== undefined ? 'flag' : 'guess',
+        condition: a.condition !== undefined ? 'flag' : 'guess',
       },
     },
     added, interactions, sentinels, guessed, said, notes, info,
