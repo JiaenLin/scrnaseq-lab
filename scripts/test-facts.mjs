@@ -239,7 +239,7 @@ console.log('\nNOTHING IS NOT A VALUE: THE WRITER\'S OWN NOTHINGS AT EVERY RECOR
   for (const id of Object.keys(KEY)) {
     attempt(`${id}: None, "", "   ", [] and NaN at its place are nothing: not recorded, each place named, no value`, () => [
       fact(B.n, id), LEGACY[id] ? legacy(B.n, LEGACY[id]) : null,
-      Object.entries(NOTHING).filter(([k, w]) => !B.n?.meta.notes.includes(`uns/${k}/${KEY[id]} holds nothing (${w}), so it records no ${WHAT[id]}`)).map(([k]) => k),
+      Object.entries(NOTHING).filter(([k, w]) => !B.n?.meta.notes.includes(`uns/${k}/${KEY[id]} holds nothing (${w}): no record of ${WHAT[id]} is read from it`)).map(([k]) => k),
     ], [notRec(DICT(KEY[id])), null, []])
   }
   attempt('normalization: scanpy\'s default record, base None, is log1p with no base (never "base 0")', () => [

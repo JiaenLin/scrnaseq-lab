@@ -968,7 +968,7 @@ function readRecorded(uns: H5, obsmKeys: string[], note: (s: string) => void): N
       const h = held(o, field)
       if (h.is === 'nothing') {
         // Nothing at the place records nothing: it is not a value, and not a refusal.
-        if (h.what !== 'no entry') note(`${at} holds nothing (${h.what}), so it records no ${WHAT[id]}`)
+        if (h.what !== 'no entry') note(`${at} holds nothing (${h.what}): no record of ${WHAT[id]} is read from it`)
       } else if (h.is === 'unreadable') {
         refused.add(id)
         note(`${at} could not be read (${h.what}), so the bundle states nothing of the object's ${WHAT[id]}`)
