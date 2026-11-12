@@ -148,10 +148,11 @@ export interface BundleMeta {
   chunkGenes: number
   provenance: Record<string, string | null>
   /**
-   * The run's own record, as the object's uns holds it: each tool's provenance
-   * (the tool, its version and commit, the job, ...) and the harness's run
-   * record, copied rather than summarised. `records: []` means the converter
-   * looked and the object carries none.
+   * The run's identity, not its record: from each record the object's uns holds
+   * (a tool's provenance, the harness's run record), the fields tool, version,
+   * commit, stage, run_key and job it stores as strings of 256 characters or
+   * fewer, and nothing else. `records: []` means the converter looked and the
+   * object carries none.
    *
    * Absent in bundles from a Seurat object, which has no uns, and in bundles
    * written before it existed. bundle@1 readers ignore it.
@@ -693,13 +694,13 @@ export function buildBundle(
     note(`not offered as embeddings: ${why}.${latent.length ? ' A latent space can still be chosen as the one that opens first, and is then drawn by its first two columns' : ''}`)
   }
 
-  // The run's own record, copied from uns by the reader. Said in the notes
-  // too, because the notes are what the studio shows.
+  // The run's identity, read from uns by the reader. Said in the notes too,
+  // because the notes are what the studio shows.
   if (scan.run) {
     const paths = scan.run.records.map(r => r.path)
     note(paths.length
-      ? `the run's own record travels with the bundle, in run: ${list(paths, 20)}`
-      : "the object's uns holds no run record (nothing named provenance, no harness_run), so this bundle cannot say which run made it")
+      ? `run carries the run's identity, not its record: from ${list(paths, 20)}, each record's tool, version, commit, stage, run_key and job where it holds them as strings of 256 characters or fewer, and nothing else`
+      : "the object's uns holds no run record the lab can carry (none with a tool, version, commit, stage, run_key or job stored as a string of 256 characters or fewer), so this bundle cannot say which run made it")
   }
 
   // ---- QC ---------------------------------------------------------------

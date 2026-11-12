@@ -21,7 +21,7 @@
 
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { copyFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -341,22 +341,30 @@ console.log('\nTHROUGH THE COMMAND: NO SAMPLE COLUMN, EVERY CELL KEEPS ITS CONDI
 const G = convert(FIX.classic, 'guessed.zip', ['--label', 'family'])
 const g = G.o?.parts[0]
 
-console.log('\nTHE RUN\'S RECORD TRAVELS WITH THE BUNDLE')
+/** Every file of a written bundle, unzipped, as one text: collection.json and every entry of every part. */
+const bundleText = (o) => [strFromU8(unzipSync(o.bytes)['collection.json']),
+  ...o.parts.flatMap(p => Object.values(p.files).map(b => Buffer.from(b).toString('latin1')))].join('\n')
+const SIX = ['tool', 'version', 'commit', 'stage', 'run_key', 'job']
+const recOf = (part, p) => part?.meta.run.records.find(x => x.path === p)?.record
+const notesOf = (part, re) => part.meta.notes.filter(s => re.test(s))
+/** A new HDF5 file written through h5wasm. */
+const write = (path, edit) => { const f = new h5wasm.File(path, 'w'); try { edit(f) } finally { f.flush(); f.close() } }
+/** Edit a file in place through h5wasm. */
+const edit = (path, fn) => { const f = new h5wasm.File(path, 'a'); try { fn(f) } finally { f.flush(); f.close() } }
+
+console.log('\nTHE RUN\'S IDENTITY TRAVELS WITH THE BUNDLE, NOT ITS RECORD')
 {
-  // What scripts/make-family-fixture.py writes as uns['scintegrate']['provenance'].
-  const PROVENANCE = {
-    tool: 'scintegrate', version: '0.0.0+fixture', commit: '0'.repeat(40), state_version: 1,
-    argv: ['scintegrate', 'integrate', '--h5ad', 'joint.h5ad'], python: '3.12', job: 'fixture',
-    wrapped_versions: { anndata: '0.13.2' }, sees: { none: [], harmony: ['sample'] }, input: 'joint.h5ad',
-    batch_key: 'sample', label_key: 'cell_type', seed: 0,
-  }
   check('the guessed conversion exits 0', G.r.code, 0)
   attempt('meta.run lists the one record the object has, and where it was',
     () => g.meta.run.records.map(r => r.path), ['uns/scintegrate/provenance'])
-  attempt('and the record is the provenance itself: the tool, its version and commit, the job, argv, the seed',
-    () => canon(g.meta.run.records[0].record), canon(PROVENANCE))
+  attempt('and carries its identity as recorded, under the six names, and nothing else',
+    () => JSON.stringify(g.meta.run.records[0].record),
+    JSON.stringify({ tool: 'scintegrate', version: '0.0.0+fixture', commit: '0'.repeat(40), job: 'fixture' }))
   attempt('meta.run says where it looked', () => typeof g.meta.run.searched === 'string' && /provenance/.test(g.meta.run.searched) && /harness_run/.test(g.meta.run.searched), true)
-  attempt('a note names the record carried', () => g.meta.notes.filter(s => s.includes('uns/scintegrate/provenance')).length, 1)
+  attempt('a note says what of the record is carried, and counts the rest without naming it',
+    () => notesOf(g, /^uns\/scintegrate\/provenance:/), ['uns/scintegrate/provenance: run carries its tool, version, commit and job; not carried: 9 other entries'])
+  attempt("the record's argv, input path and settings are in no file of the bundle",
+    () => ['joint.h5ad', 'wrapped_versions', 'label_key', 'argv'].filter(s => bundleText(G.o).includes(s)), [])
 
   const d = convert(FIX.dflt, 'default.zip', ['--label', 'family'])
   attempt("anndata's default encoding gives the same run", () => [d.r.code, d.o.parts[0].meta.run.records.length, canon(d.o.parts[0].meta.run) === canon(g.meta.run)], [0, 1, true])
@@ -370,336 +378,296 @@ console.log('\nTHE RUN\'S RECORD TRAVELS WITH THE BUNDLE')
   // its entries by name, so the records come in that order.
   const many = copyWith(FIX.classic, 'records.h5ad', f => {
     const uns = f.get('uns')
-    const an = dict(uns, 'analysis')
-    const prov = dict(an, 'provenance')
+    const prov = dict(dict(uns, 'analysis'), 'provenance')
     str(prov, 'tool', 'synthetic-tool')
     int(prov, 'n', 3)
-    // A real h5py boolean (an HDF5 enum), linked from the fixture's own uns.
-    prov.create_hard_link('/uns/scintegrate/assessment/summary/needed', 'dirty')
     const ct = dict(uns, 'cell_type_provenance')
     str(ct, 'tree', 'synthetic')
     int(ct, 'n_cells', 240)
-    const deep = dict(dict(uns, 'deep'), 'inner')
-    str(dict(deep, 'provenance'), 'x', 'two levels down: not a record by the rule')
-    str(uns, 'harness_run', JSON.stringify({ stages: [{ stage: 'integration', tool: 'synthetic', run_key: 'rk-1', job: 'j-1', sealed: true }] }))
+    str(dict(dict(dict(uns, 'deep'), 'inner'), 'provenance'), 'tool', 'two levels down: not a record by the rule')
+    str(uns, 'harness_run', JSON.stringify({ stages: [{ stage: 'integration', tool: 'synthetic', run_key: 'HARNESS-RK-TOKEN', job: 'HARNESS-JOB-TOKEN' }] }))
     const qc = dict(uns, 'qc_decl')
     str(qc, 'schema', 'synthetic/provenance@1')
     str(qc, 'run_key', 'rk-0')
     str(qc, 'commit', 'abc1234')
-    const other = dict(uns, 'unrelated')
-    str(other, 'schema', 'synthetic/results@1')
+    str(dict(uns, 'unrelated'), 'schema', 'synthetic/results@1')
   })
   const r = convert(many, 'records.zip', ['--label', 'records'])
-  const run = r.o?.parts[0].meta.run
-  attempt('every record the rule names is carried, in uns order, and nothing else',
-    () => run.records.map(x => x.path),
-    ['uns/analysis/provenance', 'uns/cell_type_provenance', 'uns/harness_run', 'uns/qc_decl', 'uns/scintegrate/provenance'])
-  const rec = (p) => run.records.find(x => x.path === p)?.record
-  attempt('a boolean stays a boolean, an int64 a number', () => [rec('uns/analysis/provenance').dirty, rec('uns/analysis/provenance').n, rec('uns/cell_type_provenance').n_cells], [true, 3, 240])
-  attempt("the harness's run record is parsed from its JSON",
-    () => rec('uns/harness_run'), { stages: [{ stage: 'integration', tool: 'synthetic', run_key: 'rk-1', job: 'j-1', sealed: true }] })
-  attempt('a record that names provenance in its own schema is carried whole',
-    () => canon(rec('uns/qc_decl')), canon({ commit: 'abc1234', run_key: 'rk-0', schema: 'synthetic/provenance@1' }))
-
-  const bad = copyWith(FIX.classic, 'bad-run.h5ad', f => { str(f.get('uns'), 'harness_run', 'not json {') })
-  const br = convert(bad, 'bad-run.zip', ['--label', 'bad'])
-  const badRun = br.o?.parts[0].meta.run
-  attempt('a harness_run that is not JSON is carried as its text, not dropped',
-    () => badRun.records.find(x => x.path === 'uns/harness_run')?.record, 'not json {')
-  attempt('and a note says it is not JSON',
-    () => br.o.parts[0].meta.notes.filter(s => /harness_run/.test(s) && /not JSON/i.test(s)).length, 1)
+  const part = r.o?.parts[0]
+  attempt('each record the rule finds that holds one of the six is listed, in uns order, and nothing else is',
+    () => part.meta.run.records.map(x => x.path), ['uns/analysis/provenance', 'uns/qc_decl', 'uns/scintegrate/provenance'])
+  attempt('a record known by its schema carries its identity fields',
+    () => JSON.stringify(recOf(part, 'uns/qc_decl')), JSON.stringify({ commit: 'abc1234', run_key: 'rk-0' }))
+  attempt("a record with none of the six, an annotator's column record, is not listed, and its note says so",
+    () => notesOf(part, /^uns\/cell_type_provenance holds none of tool, version, commit, stage, run_key and job as a string of 256 characters or fewer, so run does not list it; not carried: 2 other entries$/).length, 1)
+  attempt("the harness's record, one JSON string, is named as a string and nothing of it is read",
+    () => [notesOf(part, /^uns\/harness_run is a string, not a dict of named fields, so run reads nothing from it$/).length,
+      ['HARNESS-RK-TOKEN', 'HARNESS-JOB-TOKEN'].filter(s => bundleText(r.o).includes(s))], [1, []])
 }
 
-console.log('\nA RECORD IS COPIED AS FAR AS JSON CAN HOLD IT, AND THE REST IS NAMED IN PLACE')
+console.log('\nNO STRING OF A RECORD BUT ITS SIX FIELDS REACHES THE BUNDLE')
 {
-  // scripts/fixtures/uns-records.h5ad, written by anndata and h5py (see
-  // make-family-fixture.py): its integration record holds a structured array
-  // with an int64 field, which crashed the whole conversion once ("Do not know
-  // how to serialize a BigInt", exit 1, no file); its other record holds
-  // leaves a JSON copy cannot hold as they are.
-  const u = convert(FIX.records, 'uns-records.zip', ['--label', 'records'])
-  check('an object whose provenance holds an int64 rec-array converts', u.r.code, 0)
-  const rec = (p) => u.o?.parts[0].meta.run.records.find(x => x.path === p)?.record
-  attempt('the rec-array is copied row by row, under its field names, int64 as a number',
-    () => rec('uns/scintegrate/provenance').ranked,
-    [{ method: 'harmony', rank: 3, score: 0.6 }, { method: 'none', rank: 1, score: 0.5 }])
-  attempt('a float16 leaf is named in place, and the rest of its record is still copied',
-    () => { const o = rec('uns/odd_provenance'); return [/^\(not copied: .*float16/.test(o.half), o.tool, o.flag] },
-    [true, 'synthetic-tool', false])
-  attempt('an HDF5 reference is named in place, not copied as bytes',
-    () => /^\(not copied: .*HDF5 reference/.test(rec('uns/odd_provenance').ref), true)
-  attempt('uint64 past 2**53 is its exact digits, and NaN and the infinities are words',
-    () => { const o = rec('uns/odd_provenance'); return [o.big, o.special] },
-    ['9223372036854775813', ['NaN', 'Infinity', '-Infinity', 1]])
-  attempt('a dataframe is named in place', () => /^\(not copied: .*dataframe/.test(rec('uns/odd_provenance').frame), true)
-}
-
-console.log('\nA RECORD PAST ITS BUDGET IS NAMED WITH ITS SIZE, NOT COPIED INTO EVERY PART')
-{
-  // The run section is written into every part of a split object, so what one
-  // record and the whole section may take is bounded, in bytes as meta.json
-  // writes them: 262,144 for a record, 1,048,576 for the section.
-  const big = copyWith(FIX.classic, 'big-record.h5ad', f => {
-    const p = dict(f.get('uns'), 'log_provenance')
-    str(p, 'log', 'x'.repeat(400_000))
-    str(p, 'tool', 'synthetic-tool')
+  // A record shaped as scIntegrate's writer builds it (cli.py: the job as a
+  // dict of scheduler, id and host, argv, the input path, nested settings),
+  // with a host path and an argument list planted in it.
+  const host = copyWith(FIX.classic, 'planted.h5ad', f => {
+    const p = dict(f.get('uns'), 'site_provenance')
+    str(p, 'tool', 'planted-tool')
+    str(p, 'version', '1.2.3')
+    str(p, 'commit', 'f'.repeat(40))
+    enc(p.create_dataset({ name: 'argv', data: ['tool', 'run', '--h5ad', '/planted/host/dir/input.h5ad', '--token', 'PLANTED-ARGV-TOKEN'] }), 'string-array', '0.2.0')
+    str(p, 'input', '/planted/host/dir/input.h5ad')
+    const job = dict(p, 'job')
+    str(job, 'scheduler', 'pbs')
+    str(job, 'id', '4242.PLANTED-HOST')
+    str(job, 'host', 'PLANTED-HOST')
+    str(dict(dict(p, 'method_settings'), 'harmony'), 'note', 'PLANTED-DEEP-TOKEN')
   })
-  const b = convert(big, 'big-record.zip', ['--label', 'big'])
-  const run = b.o?.parts[0].meta.run
-  attempt('a record over 262,144 bytes as written is named in place, with its size',
-    () => { const r = run.records.find(x => x.path === 'uns/log_provenance').record; return [typeof r, /400,0\d\d bytes as written/.test(r), /262,144/.test(r)] },
-    ['string', true, true])
-  attempt('the record under the budget is still copied',
-    () => run.records.find(x => x.path === 'uns/scintegrate/provenance').record.tool, 'scintegrate')
-  attempt('a note names the record left out, and why',
-    () => b.o.parts[0].meta.notes.filter(s => s.includes('uns/log_provenance') && /budget/.test(s)).length, 1)
-  attempt('so meta.json stays small', () => b.o.parts[0].files['meta.json'].length < 20_000, true)
+  const h = convert(host, 'planted.zip', ['--label', 'planted'])
+  const all = h.o ? bundleText(h.o) : ''
+  attempt('it converts, and carries the tool, version and commit',
+    () => [h.r.code, JSON.stringify(recOf(h.o?.parts[0], 'uns/site_provenance'))], [0, JSON.stringify({ tool: 'planted-tool', version: '1.2.3', commit: 'f'.repeat(40) })])
+  attempt('no host path, argument, job host or nested value of the record is in any file of the bundle',
+    () => ['/planted/host', 'PLANTED-ARGV-TOKEN', 'PLANTED-HOST', 'PLANTED-DEEP-TOKEN', 'method_settings'].filter(s => all.includes(s)), [])
+  attempt('a job written as a dict, as scIntegrate writes it, is named as a group and not carried',
+    () => notesOf(h.o.parts[0], /^uns\/site_provenance: run carries its tool, version and commit; not carried: job \(a group\) and 3 other entries$/).length, 1)
+}
 
-  // Six records of about 200,000 bytes each, every one under the record budget:
-  // after the fixture's own record and five of them, the sixth would pass the
-  // section's budget, and is left out.
-  const many = copyWith(FIX.classic, 'many-records.h5ad', f => {
+console.log('\nONE FILE: A LINK OUT OF THE INPUT IS NAMED ONCE AND NEVER READ')
+{
+  // The last re-checker's first reproduction: a record that is an external
+  // link by absolute path to a file outside the input's folder, and one to a
+  // file beside the input. Both were read as the object's own, named nowhere,
+  // and the bundle changed when only the other file did. Links out of the
+  // matrix's layers, the embeddings and one of a record's six fields, and a
+  // soft link to nothing, are each named too.
+  const dir = mkdtempSync(join(tmpdir(), 'lab-onefile-'))
+  const away = mkdtempSync(join(tmpdir(), 'lab-away-'))
+  const secret = join(away, 'secret.h5')
+  const sibling = join(dir, 'other.h5')
+  write(secret, f => str(dict(f, 'secret'), 'token', 'OUTSIDE-INPUT-TOKEN'))
+  write(sibling, f => { const r = dict(f, 'rec'); str(r, 'tool', 'SIBLING-TOOL'); str(r, 'origin', 'SIBLING-FILE-CONTENT') })
+  const input = join(dir, 'ext.h5ad')
+  copyFileSync(FIX.classic, input)
+  edit(input, f => {
     const uns = f.get('uns')
-    for (let i = 1; i <= 6; i++) str(dict(uns, `z${i}_provenance`), 'log', 'y'.repeat(200_000))
+    uns.create_external_link(secret, '/secret', 'abs_provenance')
+    uns.create_external_link('other.h5', '/rec', 'e_provenance')
+    const p = dict(uns, 'f_provenance')
+    str(p, 'tool', 'F-TOOL')
+    p.create_external_link('other.h5', '/rec/tool', 'version')
+    uns.create_soft_link('/nowhere', 'o_provenance')
+    uns.create_soft_link('/uns/scintegrate/provenance', 'mirror_provenance')
+    f.get('obsm').create_external_link('other.h5', '/rec', 'X_away')
+    f.get('layers').create_external_link('other.h5', '/rec', 'away')
   })
-  const m = convert(many, 'many-records.zip', ['--label', 'many'])
-  attempt('records are copied until the section would pass 1,048,576 bytes; the rest are left out, in one entry',
-    () => { const r = m.o.parts[0].meta.run; return [r.records.map(x => `${x.path}:${typeof x.record === 'string' ? 'named' : 'copied'}`), r.leftOut] },
-    [['uns/scintegrate/provenance:copied', 'uns/z1_provenance:copied', 'uns/z2_provenance:copied',
-      'uns/z3_provenance:copied', 'uns/z4_provenance:copied', 'uns/z5_provenance:copied'], { count: 1, paths: ['uns/z6_provenance'] }])
-  attempt('so meta.json stays under the section budget and a little more', () => m.o.parts[0].files['meta.json'].length < 1_100_000, true)
+  const one = convert(input, 'ext1.zip', ['--label', 'ext'])
+  const part = one.o?.parts[0]
+  const all = one.o ? bundleText(one.o) : ''
+  attempt('it converts, and nothing of either other file is in the bundle',
+    () => [one.r.code, ['OUTSIDE-INPUT-TOKEN', 'SIBLING-FILE-CONTENT', 'SIBLING-TOOL'].filter(s => all.includes(s))], [0, []])
+  attempt('one note names each link not followed, once, with its target as the link states it',
+    () => {
+      const n = notesOf(part, /^the converter reads only the file it is given/)
+      return [n.length, ...[`uns/abs_provenance (an external link to /secret in ${secret})`, 'uns/e_provenance (an external link to /rec in other.h5)',
+        'uns/f_provenance/version (an external link to /rec/tool in other.h5)', 'uns/o_provenance (a soft link to /nowhere, which reaches nothing in this file)',
+        'obsm/X_away (an external link to /rec in other.h5)', 'layers/away (an external link to /rec in other.h5)'].map(s => (n[0] ?? '').split(s).length - 1)]
+    }, [1, 1, 1, 1, 1, 1, 1])
+  attempt('an ordinary soft link inside the file still reads: the record it reaches carries its identity',
+    () => [JSON.stringify(recOf(part, 'uns/mirror_provenance')), JSON.stringify(recOf(part, 'uns/f_provenance'))],
+    [JSON.stringify(recOf(g, 'uns/scintegrate/provenance')), JSON.stringify({ tool: 'F-TOOL' })])
+  // The same input bytes, whatever the other files hold, and when they are gone.
+  write(secret, f => str(dict(f, 'secret'), 'token', 'CHANGED-TOKEN'))
+  write(sibling, f => str(dict(f, 'rec'), 'tool', 'OTHER-TOOL-2'))
+  const two = convert(input, 'ext2.zip', ['--label', 'ext'])
+  rmSync(secret)
+  rmSync(sibling)
+  const three = convert(input, 'ext3.zip', ['--label', 'ext'])
+  attempt('the same input bytes give the same bundle bytes when the linked files change, and when they are gone',
+    () => [two.r.code, three.r.code, sha256(two.o.bytes) === sha256(one.o.bytes), sha256(three.o.bytes) === sha256(one.o.bytes)], [0, 0, true, true])
+  rmSync(dir, { recursive: true, force: true })
+  rmSync(away, { recursive: true, force: true })
 }
 
-console.log('\nTHE BUDGETS COUNT WHAT meta.json WRITES, AND THE SECTION FILLS FAIRLY')
+console.log('\nTWO FILES OF ONE NAME CANNOT COLLIDE: NEITHER IS READ')
 {
-  /** int8 arrays of zeros, in anndata's array encoding. */
-  const zeros = (g, name) => enc(g.create_dataset({ name, data: new Int8Array(10_000) }), 'array', '0.2.0')
-
-  // Four records of 13 x 10,000 zeros: about 260,000 characters of compact
-  // JSON each, under the budget, but meta.json writes one number a line, and
-  // the four of them came to 4.7 MB.
-  const flat = copyWith(FIX.classic, 'written.h5ad', f => {
-    for (let r = 1; r <= 4; r++) {
-      const p = dict(f.get('uns'), `w${r}_provenance`)
-      for (let i = 0; i < 13; i++) zeros(p, `z${String(i).padStart(2, '0')}`)
-    }
+  // The last re-checker's third reproduction: x.h5 beside the input and x.h5
+  // in sub/, reached by two links from one record. An identity made of the
+  // link's file name and an address made the second "the first again": its
+  // content was lost, and the bundle said what was false.
+  const dir = mkdtempSync(join(tmpdir(), 'lab-collide-'))
+  mkdirSync(join(dir, 'sub'))
+  for (const [where, marker] of [[dir, 'X-TOP'], [join(dir, 'sub'), 'X-SUB']]) {
+    write(join(where, 'x.h5'), f => { const r = dict(f, 'r'); str(r, 'tool', marker); str(r, 'marker', marker) })
+  }
+  write(join(dir, 'sub', 'y.h5'), f => dict(f, 'g').create_external_link('x.h5', '/r', 'link'))
+  const input = join(dir, 'collide.h5ad')
+  copyFileSync(FIX.classic, input)
+  edit(input, f => {
+    const p = dict(f.get('uns'), 'col_provenance')
+    str(p, 'tool', 'COL-TOOL')
+    p.create_external_link('x.h5', '/r', 'a_top')
+    p.create_external_link('sub/y.h5', '/g', 'b_sub')
   })
-  const w = convert(flat, 'written.zip', ['--label', 'written'])
-  attempt('a record under the budget as compact JSON but over it as written is named with its written size',
-    () => w.o.parts[0].meta.run.records.filter(x => /^w\d/.test(x.path.slice(4)))
-      .map(x => /^\(not copied: [\d,]+ bytes as written, over the 262,144-byte budget/.test(x.record)),
-    [true, true, true, true])
-  attempt('so meta.json stays small', () => w.o.parts[0].files['meta.json'].length < 20_000, true)
+  const c = convert(input, 'collide.zip', ['--label', 'collide'])
+  const part = c.o?.parts[0]
+  attempt('the record carries its own identity, and nothing of either file of the one name is in the bundle',
+    () => [c.r.code, JSON.stringify(recOf(part, 'uns/col_provenance')), ['X-TOP', 'X-SUB'].filter(s => bundleText(c.o).includes(s))],
+    [0, JSON.stringify({ tool: 'COL-TOOL' }), []])
+  attempt('and no sentence says that one link reaches what another did',
+    () => /again/.test(JSON.stringify(part.meta.run) + part.meta.notes.join('\n')), false)
+  rmSync(dir, { recursive: true, force: true })
+}
 
-  // A record forty groups deep: read to sixteen, named below that.
-  const deep = copyWith(FIX.classic, 'deep.h5ad', f => {
-    let g = dict(f.get('uns'), 'deep_provenance')
-    for (let i = 0; i < 40; i++) g = dict(g, 'a')
-    str(g, 'leaf', 'x')
+console.log('\nNO NAME FROM THE OBJECT BECOMES A KEY, SO A FIELD NAMED LIKE AN OBJECT PROPERTY CANNOT VANISH')
+{
+  // The last re-checker's fourth reproduction: a record's field named
+  // __proto__, a string in one record and a group in another, vanished from
+  // the copy, and nothing said so. No field name comes from the object now:
+  // each such entry is counted among those not carried.
+  const proto = copyWith(FIX.classic, 'proto.h5ad', f => {
+    const uns = f.get('uns')
+    const a = dict(uns, 'proto_provenance')
+    str(a, 'tool', 'PROTO-TOOL')
+    str(a, '__proto__', 'PROTO-VALUE')
+    str(a, 'constructor', 'CTOR-VALUE')
+    const b = dict(uns, 'proto2_provenance')
+    str(b, 'tool', 'PROTO2-TOOL')
+    str(dict(b, '__proto__'), 'hidden', 'HIDDEN-VALUE')
   })
-  const d = convert(deep, 'deep.zip', ['--label', 'deep'])
-  attempt('a record is read sixteen groups deep, and what lies deeper is named in place',
-    () => {
-      let at = d.o.parts[0].meta.run.records.find(x => x.path === 'uns/deep_provenance').record
-      for (let i = 0; i < 16; i++) at = at.a
-      return [typeof at, /^\(not copied: .*nested more than 16 groups below its record/.test(at.a)]
-    }, ['object', true])
+  const pr = convert(proto, 'proto.zip', ['--label', 'proto'])
+  const part = pr.o?.parts[0]
+  attempt("each record carries its tool, under the converter's own key, and nothing else",
+    () => [pr.r.code, ...['uns/proto_provenance', 'uns/proto2_provenance'].map(p => JSON.stringify(recOf(part, p)))],
+    [0, JSON.stringify({ tool: 'PROTO-TOOL' }), JSON.stringify({ tool: 'PROTO2-TOOL' })])
+  attempt('and its note counts the entries named __proto__ and constructor among those not carried',
+    () => [notesOf(part, /^uns\/proto_provenance: run carries its tool; not carried: 2 other entries$/).length,
+      notesOf(part, /^uns\/proto2_provenance: run carries its tool; not carried: 1 other entry$/).length], [1, 1])
+  attempt('every key of every record is one of the six', () => part.meta.run.records.every(x => Object.keys(x.record).every(k => SIX.includes(k))), true)
+}
 
-  // 400 records of 3,000 bytes: about a sixth do not fit.
+console.log('\nAT MOST 64 RECORDS ARE READ; THE REST ARE COUNTED, AND THE FIRST TEN NAMED')
+{
   const crowd = copyWith(FIX.classic, 'crowd.h5ad', f => {
     const uns = f.get('uns')
-    for (let i = 0; i < 400; i++) str(uns, `r${String(i).padStart(3, '0')}_provenance`, 'x'.repeat(3_000))
+    for (let i = 0; i < 100; i++) str(dict(uns, `r${String(i).padStart(3, '0')}_provenance`), 'tool', `tool-${i}`)
   })
   const c = convert(crowd, 'crowd.zip', ['--label', 'crowd'])
-  attempt('once the section is full, one entry counts every record left out, and no record is written as "not copied"',
-    () => {
-      const run = c.o.parts[0].meta.run
-      return [run.records.length - 1 + run.leftOut.count, run.leftOut.paths.length,
-        run.records.filter(x => typeof x.record === 'string' && x.record.startsWith('(not copied')).length]
-    }, [400, 10, 0])
-  attempt('and one note says so', () => c.o.parts[0].meta.notes.filter(s => /left out of run/.test(s)).length, 1)
-
-  // Five records of 250,002 bytes, each under the record budget, all before
-  // the tool's own record in uns order: filled in uns order, they pushed it out.
-  const first = copyWith(FIX.classic, 'first.h5ad', f => {
-    for (let i = 1; i <= 5; i++) str(f.get('uns'), `a${i}_provenance`, 'q'.repeat(250_000))
-  })
-  const o = convert(first, 'first.zip', ['--label', 'first'])
-  attempt("a tool's own provenance is written before *_provenance records that come earlier in uns",
-    () => { const run = o.o.parts[0].meta.run; return [run.records.find(x => x.path === 'uns/scintegrate/provenance')?.record?.tool, run.leftOut] },
-    ['scintegrate', { count: 1, paths: ['uns/a5_provenance'] }])
+  const run = c.o?.parts[0].meta.run
+  attempt('the first 64 in uns order are read, and the 37 after them counted, the first ten named',
+    () => [c.r.code, run.records.length, run.records[63].path, run.leftOut.count, run.leftOut.paths],
+    [0, 64, 'uns/r063_provenance', 37, Array.from({ length: 10 }, (_v, i) => `uns/r${String(64 + i).padStart(3, '0')}_provenance`)])
+  attempt('and one note says so',
+    () => notesOf(c.o.parts[0], /^101 records were found and run reads the first 64: the 37 after them were not read: uns\/r064_provenance, /).length, 1)
 }
 
-console.log('\nHARD LINKS CANNOT MAKE A SMALL RECORD AN ENDLESS READ')
+console.log('\nA FIELD OF THE WRONG KIND IS NAMED WITH ITS KIND, NOT CARRIED')
 {
-  // Eighteen groups, each holding two hard links to the next: 2^17 paths in a
-  // small file, which read for minutes without finishing. 30 s is many times
-  // what the fixed reader needs; the old one is killed there.
-  const dag = copyWith(FIX.classic, 'dag.h5ad', f => {
-    const store = f.create_group('dagstore')
-    const levels = Array.from({ length: 18 }, (_v, i) => dict(store, `L${i}`))
-    str(levels[17], 'leaf', 'x')
-    for (let i = 0; i < 17; i++) for (const c of ['c0', 'c1']) levels[i].create_hard_link(`/dagstore/L${i + 1}`, c)
-    f.get('uns').create_hard_link('/dagstore/L0', 'dag_provenance')
+  const kinds = copyWith(FIX.classic, 'kinds.h5ad', f => {
+    const uns = f.get('uns')
+    const a = dict(uns, 'a_provenance')
+    str(a, 'tool', 'kind-tool')
+    int(a, 'version', 2)
+    enc(a.create_dataset({ name: 'commit', data: Float64Array.from([1.5]), shape: [] }), 'numeric-scalar', '0.2.0')
+    enc(a.create_dataset({ name: 'stage', data: ['s1', 's2', 's3'] }), 'string-array', '0.2.0')
+    // A real h5py boolean (an HDF5 enum), linked from the fixture's own uns.
+    a.create_hard_link('/uns/scintegrate/assessment/summary/needed', 'run_key')
+    str(dict(a, 'job'), 'id', '1')
+    const b = dict(uns, 'b_provenance')
+    str(b, 'tool', 'b-tool')
+    str(b, 'commit', 'c'.repeat(256))
+    str(b, 'version', '\u{1F600}'.repeat(256))
+    const c = dict(uns, 'c_provenance')
+    str(c, 'tool', 'c-tool')
+    str(c, 'commit', '\u{1F600}'.repeat(257))
+    str(dict(uns, 'd_provenance'), 'tool', 'd-tool')
   })
-  const g = convert(dag, 'dag.zip', ['--label', 'dag'], 30_000)
-  attempt('a record whose groups are reached by many hard links converts, in seconds', () => [g.r.code, g.r.seconds < 30], [0, true])
-  const rec = () => g.o.parts[0].meta.run.records.find(x => x.path === 'uns/dag_provenance').record
-  attempt('each group is copied once; another link to it is named in place, not read again',
-    () => [typeof rec().c0, /^\(not copied: uns\/dag_provenance\/c1 is uns\/dag_provenance\/c0 again, reached by another link/.test(rec().c1)],
-    ['object', true])
-  attempt('and a note says so', () => g.o.parts[0].meta.notes.filter(s => /uns\/dag_provenance/.test(s) && /more than one link/.test(s)).length, 1)
-
-  // A group holding three hard links to itself.
-  const loop = copyWith(FIX.classic, 'loop.h5ad', f => {
-    const p = dict(f.get('uns'), 'loop_provenance')
-    str(p, 'tool', 'synthetic-tool')
-    for (const c of ['self0', 'self1', 'self2']) p.create_hard_link('/uns/loop_provenance', c)
-  })
-  const l = convert(loop, 'loop.zip', ['--label', 'loop'], 30_000)
-  attempt('a group that links to itself converts, in seconds', () => [l.r.code, l.r.seconds < 30], [0, true])
-  attempt('each link back to it is named in place, and the rest of the record copied',
-    () => {
-      const r = l.o.parts[0].meta.run.records.find(x => x.path === 'uns/loop_provenance').record
-      return [r.tool, ...['self0', 'self1', 'self2'].map(k => String(r[k]).startsWith(`(not copied: uns/loop_provenance/${k} is uns/loop_provenance again`))]
-    }, ['synthetic-tool', true, true, true])
-
-  // 10,050 datasets in one record: read to 10,000 groups and datasets, the
-  // rest named in one sentence.
-  const wide = copyWith(FIX.classic, 'wide.h5ad', f => {
-    const p = dict(f.get('uns'), 'wide_provenance')
-    for (let i = 0; i < 10_050; i++) p.create_dataset({ name: `d${String(i).padStart(5, '0')}`, data: 'x' })
-  })
-  const w = convert(wide, 'wide.zip', ['--label', 'wide'], 60_000)
-  attempt('a record is read to 10,000 groups and datasets, and the rest of it is named in one sentence',
-    () => {
-      const r = w.o.parts[0].meta.run.records.find(x => x.path === 'uns/wide_provenance').record
-      return [Object.keys(r).length, /^51 more entries of uns\/wide_provenance, past the 10,000 groups and datasets/.test(r['(not copied)'])]
-    }, [10_000, true])
-  attempt('and a note says so', () => w.o.parts[0].meta.notes.filter(s => /uns\/wide_provenance/.test(s) && /read only to the 10,000 groups and datasets one record may take/.test(s)).length, 1)
+  const k = convert(kinds, 'kinds.zip', ['--label', 'kinds'])
+  const part = k.o?.parts[0]
+  attempt('the string is carried; a number, an array, a boolean and a group are each named with their kind',
+    () => [k.r.code, JSON.stringify(recOf(part, 'uns/a_provenance')), notesOf(part, /^uns\/a_provenance:/)],
+    [0, JSON.stringify({ tool: 'kind-tool' }),
+      ['uns/a_provenance: run carries its tool; not carried: version (a number), commit (a number), stage (an array of 3 values), run_key (a boolean) and job (a group)']])
+  attempt('a string of 256 characters is carried whole, counted as characters, not UTF-16 units',
+    () => { const b = recOf(part, 'uns/b_provenance'); return [b?.commit?.length, [...(b?.version ?? '')].length] }, [256, 256])
+  attempt('the first string longer than 256 characters is named, ends the reading, and the records after it are counted, unread',
+    () => [JSON.stringify(recOf(part, 'uns/c_provenance')), part.meta.run.leftOut,
+      notesOf(part, /^uns\/c_provenance\/commit is a string longer than 256 characters, so run read no value after it: 2 records found after it were not read: uns\/d_provenance, uns\/scintegrate\/provenance$/).length],
+    [JSON.stringify({ tool: 'c-tool' }), { count: 2, paths: ['uns/d_provenance', 'uns/scintegrate/provenance'] }, 1])
 }
 
-console.log('\nTHE RUN SECTION IS READ IN ONE WALK: AN OBJECT IS READ ONCE, WHATEVER REACHES IT')
+console.log("\nTHE READER ON THE SHAPES THE FAMILY'S TOOLS WRITE")
 {
-  // 400 records, half hard links and half soft links to one group of 9,990
-  // datasets. Read record by record, every link read the whole group again,
-  // about two seconds each; the old reader is killed at 60 s.
-  const shared = copyWith(FIX.classic, 'shared.h5ad', f => {
-    const g = dict(f, 'shared')
-    for (let i = 0; i < 9_990; i++) g.create_dataset({ name: `k${String(i).padStart(5, '0')}`, data: 'v' })
+  // Small objects shaped as each writer's code builds its record (the root
+  // design review lists them): an integration stage's uns/<tool>/provenance,
+  // the QC stage's declaration (found by its schema), the annotator's column
+  // record, the profiler's uns entry (no record by the rule), the harness's
+  // uns/harness_run (one JSON string).
+  const fam = copyWith(FIX.classic, 'family-shapes.h5ad', f => {
     const uns = f.get('uns')
-    for (let i = 0; i < 400; i++) {
-      const name = `r${String(i).padStart(4, '0')}_provenance`
-      if (i % 2) uns.create_soft_link('/shared', name)
-      else uns.create_hard_link('/shared', name)
-    }
+    const si = dict(dict(uns, 'integrate'), 'provenance')
+    str(si, 'tool', 'scintegrate')
+    str(si, 'version', '0.4.1')
+    str(si, 'commit', 'b'.repeat(40))
+    int(si, 'state_version', 3)
+    enc(si.create_dataset({ name: 'argv', data: ['scintegrate', 'integrate', '--h5ad', 'joint.h5ad'] }), 'string-array', '0.2.0')
+    str(si, 'python', '3.12.1')
+    const job = dict(si, 'job')
+    str(job, 'scheduler', 'pbs')
+    str(job, 'id', '77.queue')
+    str(job, 'host', 'node-1')
+    str(dict(si, 'wrapped_versions'), 'harmony', '0.0.10')
+    enc(dict(si, 'sees').create_dataset({ name: 'harmony', data: ['sample'] }), 'string-array', '0.2.0')
+    str(si, 'input', 'joint.h5ad')
+    int(si, 'seed', 0)
+    int(dict(dict(si, 'method_settings'), 'harmony'), 'theta', 2)
+    const qc = dict(uns, 'scqc')
+    for (const [k2, v] of [['schema', 'scqc/provenance@1'], ['tool', 'scQC'], ['version', '0.9.0'], ['commit', 'a'.repeat(40)],
+      ['run_key', 'RK-QC-1'], ['sample', 'S1'], ['written', '2026-01-01T00:00:00+00:00'], ['flag_column', 'qc_flag'],
+      ['flag_meaning', 'flagged by step 6'], ['flag_digest', 'd'.repeat(64)], ['flag_na_as', 'False'], ['watch_column', ''],
+      ['watch_meaning', ''], ['note', 'scQC removed nothing on the flag']]) str(qc, k2, v)
+    for (const [k2, v] of [['n_obs', 240], ['n_flagged', 3], ['n_examined', 240], ['removed_on_flag', 0]]) int(qc, k2, v)
+    const an = dict(uns, 'cell_type_provenance')
+    str(an, 'column', 'cell_type')
+    str(an, 'source', 'independent')
+    str(an, 'tree', 'tree-1')
+    int(an, 'n_cells', 240)
+    int(dict(an, 'labels'), 'B', 120)
+    str(an, 'replaced', '')
+    int(an, 'n_disagree', -1)
+    dict(an, 'disagreements')
+    const pf = dict(uns, 'scprofile')
+    str(pf, 'contract', '1.0')
+    str(dict(pf, 'input'), 'path', 'object.h5ad')
+    str(dict(dict(pf, 'kernels'), 'de'), 'method', 'pseudobulk')
+    str(uns, 'harness_run', JSON.stringify({ stages: [{ stage: 'qc', tool: 'scQC', run_key: 'RK-QC-1' }] }))
   })
-  const s = convert(shared, 'shared.zip', ['--label', 'shared'], 60_000)
-  attempt('400 records linked to one large group convert, in seconds', () => [s.r.code, s.r.seconds < 30], [0, true])
-  // Each record is read on its own, so five copy the group whole and the
-  // sixth reaches the section's 50,000 groups and datasets part-way through;
-  // the 394 after it are left out, unread.
-  attempt('the section stops reading at 50,000 groups and datasets, and leaves the rest out, unread',
-    () => {
-      const run = s.o.parts[0].meta.run
-      const recs = run.records.filter(x => /^uns\/r\d{4}_provenance$/.test(x.path))
-      return [recs.length, recs.slice(0, 5).map(x => Object.keys(x.record).length), /past the 50,000 groups and datasets read for the run section$/.test(recs[5].record['(not copied)']), run.leftOut.count]
-    }, [6, [9_990, 9_990, 9_990, 9_990, 9_990], true, 394])
-  attempt('and the note says 394 were not read', () => s.o.parts[0].meta.notes.some(n => /394 of them were not read/.test(n)), true)
-
-  // The section's own budget, on groups shaped like h5wasm's: 60 records of
-  // 1,000 datasets each, every one its own object. After 50,000 groups and
-  // datasets, the records not yet read are left out, unread.
-  let id = 0
-  const ref = () => { const k = ++id; return () => ({ ref_data: Uint8Array.from([k & 255, (k >> 8) & 255, (k >> 16) & 255]) }) }
-  const ds = () => ({ shape: [], value: 'v', metadata: { type: 3, size: 1 }, attrs: {}, create_reference: ref() })
-  const grp = (children) => ({ attrs: {}, keys: () => Object.keys(children), get: (k) => children[k] ?? null, create_reference: ref() })
-  const uns = grp(Object.fromEntries(Array.from({ length: 60 }, (_v, r) =>
-    [`r${String(r).padStart(2, '0')}_provenance`, grp(Object.fromEntries(Array.from({ length: 1_000 }, (_w, i) => [`d${String(i).padStart(3, '0')}`, ds()])))])))
-  const h5 = await tryImport('../src/lib/h5ad.ts')
-  const said = []
-  attempt('after 50,000 groups and datasets for the section, the records not yet reached are left out, unread',
-    () => { const run = h5.readRun(uns, s => said.push(s)); return [run.records.length, run.leftOut.count, run.leftOut.paths[0]] },
-    [50, 10, 'uns/r50_provenance'])
-  attempt('and the note says how many were not read', () => said.filter(s => /left out of run/.test(s) && /10 of them were not read/.test(s)).length, 1)
+  const fr = convert(fam, 'family-shapes.zip', ['--label', 'shapes'])
+  const part = fr.o?.parts[0]
+  attempt('the records found are those that hold one of the six, in uns order, each with its identity',
+    () => [fr.r.code, JSON.stringify(part.meta.run.records)],
+    [0, JSON.stringify([
+      { path: 'uns/integrate/provenance', record: { tool: 'scintegrate', version: '0.4.1', commit: 'b'.repeat(40) } },
+      { path: 'uns/scintegrate/provenance', record: { tool: 'scintegrate', version: '0.0.0+fixture', commit: '0'.repeat(40), job: 'fixture' } },
+      { path: 'uns/scqc', record: { tool: 'scQC', version: '0.9.0', commit: 'a'.repeat(40), run_key: 'RK-QC-1' } }])])
+  attempt("each record's note: the integration stage's job is a group; the declaration's other 14 entries, the column record's 8, are counted",
+    () => [notesOf(part, /^uns\/integrate\/provenance: run carries its tool, version and commit; not carried: job \(a group\) and 8 other entries$/).length,
+      notesOf(part, /^uns\/scqc: run carries its tool, version, commit and run_key; not carried: 14 other entries$/).length,
+      notesOf(part, /^uns\/cell_type_provenance holds none of .* so run does not list it; not carried: 8 other entries$/).length,
+      notesOf(part, /^uns\/harness_run is a string/).length, notesOf(part, /scprofile/).length], [1, 1, 1, 1, 0])
 }
 
-console.log('\nAN OBJECT ONE RECORD READ IS NOT TAKEN FROM ANOTHER')
+console.log('\nA RECORD OF ODD SHAPES CONVERTS, AND ONLY ITS IDENTITY IS READ')
 {
-  // A holds a link to the tool's group and is over its budget, so its content
-  // is never written; B is the tool's group itself. Remembered across records,
-  // B became a pointer into A, and the tool's record was lost.
-  const toobig = copyWith(FIX.classic, 'toobig.h5ad', f => {
-    const t = dict(f, 'toolrec')
-    str(t, 'tool', 'B-tool')
-    str(t, 'version', '9.9')
-    str(t, 'commit', 'deadbeef')
-    const a = dict(f.get('uns'), 'a_provenance')
-    str(a, 'tool', 'A-tool')
-    for (const [name, k] of [['big', 1], ['big2', 2]]) {
-      enc(a.create_dataset({ name, data: Float64Array.from({ length: 9_000 }, (_v, i) => Math.sin(i * k + 0.5) * 1e6) }), 'array', '0.2.0')
-    }
-    a.create_hard_link('/toolrec', 'shared')
-    f.get('uns').create_hard_link('/toolrec', 'b_provenance')
-  })
-  const t = convert(toobig, 'toobig.zip', ['--label', 'toobig'])
-  attempt("a record that reaches what an unwritten record reached is still copied: the tool's record is not lost",
-    () => {
-      const run = t.o.parts[0].meta.run
-      return [/^\(not copied: [\d,]+ bytes as written/.test(run.records.find(x => x.path === 'uns/a_provenance').record),
-        run.records.find(x => x.path === 'uns/b_provenance').record]
-    }, [true, { commit: 'deadbeef', tool: 'B-tool', version: '9.9' }])
-
-  // Another file, a copy of the fixture with one more field in its
-  // integration record: the record's group sits at the same address in both
-  // files. Linked from this file, it was taken for this file's own.
-  const other = copyWith(FIX.classic, 'other.h5ad', f => str(f.get('uns/scintegrate/provenance'), 'origin', 'OTHER-FILE'))
-  const ext = copyWith(FIX.classic, 'extcollide.h5ad', f => {
-    const uns = f.get('uns')
-    uns.create_external_link(other, '/uns/scintegrate/provenance', 'extp_provenance')
-    const m = dict(uns, 'mix_provenance')
-    m.create_hard_link('/uns/scintegrate/provenance', 'local')
-    m.create_external_link(other, '/uns/scintegrate/provenance', 'remote')
-  })
-  const e = convert(ext, 'extcollide.zip', ['--label', 'extcollide'])
-  const rec = (p) => e.o.parts[0].meta.run.records.find(x => x.path === p)?.record
-  attempt('a record in another file, at the same address as one here, is copied as its own',
-    () => [rec('uns/extp_provenance')?.origin, rec('uns/scintegrate/provenance')?.origin], ['OTHER-FILE', undefined])
-  attempt('and inside one record, an object here and one in another file at the same address are both copied',
-    () => [rec('uns/mix_provenance')?.local?.tool, rec('uns/mix_provenance')?.remote?.origin], ['scintegrate', 'OTHER-FILE'])
-}
-
-console.log("\nWITHIN A KIND, FIRST FIT IN uns ORDER; WHAT IS LEFT OUT IS NAMED LARGEST FIRST")
-{
-  // The annotator's record (250,000 bytes) comes before four 200,000-byte
-  // *_provenance records in uns. Filled smaller first, the four took the
-  // section and the annotator's record was left out.
-  const smaller = copyWith(FIX.classic, 'smaller.h5ad', f => {
-    const uns = f.get('uns')
-    for (let i = 0; i < 4; i++) str(uns, `z${i}_provenance`, 'x'.repeat(200_000))
-    const a = dict(uns, 'cell_type_provenance')
-    str(a, 'tool', 'annotator')
-    str(a, 'version', '1.0')
-    str(a, 'detail', 'y'.repeat(250_000))
-  })
-  const s = convert(smaller, 'smaller.zip', ['--label', 'smaller'])
-  attempt('a larger record earlier in uns is not left out for smaller ones after it',
-    () => { const run = s.o.parts[0].meta.run; return [run.records.find(x => x.path === 'uns/cell_type_provenance')?.record?.tool, run.leftOut] },
-    ['annotator', { count: 1, paths: ['uns/z3_provenance'] }])
-
-  // A hundred 12,000-byte `provenance` records earlier in uns than the
-  // integration stage's own, made 50,000 bytes here: they fill the section, the
-  // tool's record is left out, and it must be named. Listed in fill order,
-  // the first ten left out were all the small ones.
-  const flood = copyWith(FIX.classic, 'flood.h5ad', f => {
-    const uns = f.get('uns')
-    for (let i = 0; i < 100; i++) str(dict(uns, `g${String(i).padStart(3, '0')}`), 'provenance', 'x'.repeat(12_000))
-    str(f.get('uns/scintegrate/provenance'), 'notes', 'n'.repeat(50_000))
-  })
-  const fl = convert(flood, 'flood.zip', ['--label', 'flood'])
-  attempt("a tool's own record left out is named first among those left out",
-    () => { const lo = fl.o.parts[0].meta.run.leftOut; return [lo.count, lo.paths[0]] }, [15, 'uns/scintegrate/provenance'])
-  attempt('and the note names it first', () => fl.o.parts[0].meta.notes.some(n => /left out of run, largest first: uns\/scintegrate\/provenance,/.test(n)), true)
+  // scripts/fixtures/uns-records.h5ad, written by anndata and h5py: a
+  // structured array with an int64 field (which once crashed the whole
+  // conversion), float16, an HDF5 reference, uint64 past 2**53, NaN and a
+  // dataframe. None is one of the six, so none is read; each is counted.
+  const u = convert(FIX.records, 'uns-records.zip', ['--label', 'records'])
+  check('an object whose provenance holds an int64 rec-array converts', u.r.code, 0)
+  attempt('its odd record carries its tool, and its other entries are counted, none read',
+    () => [JSON.stringify(recOf(u.o?.parts[0], 'uns/odd_provenance')), notesOf(u.o.parts[0], /^uns\/odd_provenance: run carries its tool; not carried: \d+ other entries$/).length],
+    [JSON.stringify({ tool: 'synthetic-tool' }), 1])
 }
 
 console.log('\nAN UNS ENTRY THAT CANNOT BE INSPECTED IS SAID, NOT FATAL')
@@ -711,7 +679,7 @@ console.log('\nAN UNS ENTRY THAT CANNOT BE INSPECTED IS SAID, NOT FATAL')
   check('it converts', u.r.code, 0)
   attempt('a note names the entry and why it could not be inspected',
     () => u.o.parts[0].meta.notes.filter(s => s.includes('uns/plain_group') && /could not be inspected/.test(s) && /Float16/.test(s)).length, 1)
-  attempt('and the record beside it is still copied',
+  attempt('and the record beside it still carries its identity',
     () => u.o.parts[0].meta.run.records.map(x => [x.path, x.record?.tool]), [['uns/x_provenance', 'synthetic-tool']])
 }
 
@@ -822,6 +790,8 @@ console.log('\nNOTHING ELSE IN THE FIXTURE\'S BUNDLE CHANGED (against 51a00fa)')
     return sha256(JSON.stringify(ix))
   }, 'a9985a264cf4021d54153cc03fa2bb5ba1d901804355295cfac697d2f3380cc4')
   const again = convert(FIX.classic, 'guessed-again.zip', ['--label', 'family'])
+  attempt('the bundle is the one predicted before the closed reader was built', () => sha256(G.o.bytes),
+    'a55a9f06dfa38e4553431f76faf53a183ecb8d31049ba1645a86792f4a3fa7b3')
   attempt('two conversions are still byte-identical',
     () => [again.r.code, sha256(readFileSync(again.out)) === sha256(G.o.bytes)], [0, true])
 }

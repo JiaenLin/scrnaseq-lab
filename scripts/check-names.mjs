@@ -10,17 +10,17 @@
 
 import h5wasm from 'h5wasm/node'
 import { unzipSync, strFromU8 } from 'fflate'
-import { scanOpenH5ad } from '../src/lib/h5ad.ts'
+import { openInput, scanOpenH5ad } from '../src/lib/h5ad.ts'
 import { buildBundle } from '../src/lib/build.ts'
 import { geneNameKind, guessCluster, guessEmbedding, guessRole } from '../src/lib/scan.ts'
 
 const files = process.argv.slice(2)
 if (!files.length) files.push('C:/Users/Lin/scrnaseq-studio/testdata/pbmc3k_processed.h5ad')
-await h5wasm.ready
+const { FS } = await h5wasm.ready
 
 for (const path of files) {
   console.log(`\n=== ${path}`)
-  const f = new h5wasm.File(path, 'r')
+  const f = openInput(h5wasm, FS, path)
   const scan = scanOpenH5ad(f, path.split(/[\\/]/).pop())
   console.log(`  ${scan.nCells} cells`)
   console.log(`  embeddings: ${scan.embeddings.map(e => `${e.key}(${e.nDims}D)`).join(', ') || 'none'}`)

@@ -12,7 +12,7 @@
 
 import h5wasm from 'h5wasm/node'
 import { deflateSync, inflateSync } from 'fflate'
-import { scanOpenH5ad } from '../src/lib/h5ad.ts'
+import { openInput, scanOpenH5ad } from '../src/lib/h5ad.ts'
 import { planSplit } from '../src/lib/shard.ts'
 import { column } from '../src/lib/scan.ts'
 import { toGeneMajor } from '../src/lib/matrix.ts'
@@ -21,9 +21,9 @@ import { writeChunked, readGenes, makeChunkCache } from '../src/lib/chunked.ts'
 const TARGET = (Number(process.argv[2]) || 25) * 1e6
 const ms = t => `${((Date.now() - t) / 1000).toFixed(1)} s`
 
-await h5wasm.ready
+const { FS } = await h5wasm.ready
 let t = Date.now()
-const f = new h5wasm.File('E:/developing_mouse_nervous_system.h5ad', 'r')
+const f = openInput(h5wasm, FS, 'E:/developing_mouse_nervous_system.h5ad')
 const scan = scanOpenH5ad(f, 'developing_mouse_nervous_system.h5ad')
 const M = scan.matrices[0]
 const nnzPer = M.nnzPerCell()

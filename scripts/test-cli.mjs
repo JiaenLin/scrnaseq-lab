@@ -34,7 +34,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { unzipSync, strFromU8 } from 'fflate'
 import h5wasm from 'h5wasm/node'
-import { scanOpenH5ad } from '../src/lib/h5ad.ts'
+import { openInput, scanOpenH5ad } from '../src/lib/h5ad.ts'
 import { buildBundle } from '../src/lib/build.ts'
 import { categorical } from '../src/lib/scan.ts'
 import { readCollectionIndex, readEntry } from '../src/lib/collection.ts'
@@ -161,10 +161,10 @@ const EXPLICIT = [
   '--sentinel', 'EXCLUDED', '--sentinel', 'UNRESOLVED', '--label', 'family',
 ]
 
-await h5wasm.ready
+const { FS } = await h5wasm.ready
 /** Scan, run `fn`, close. The scan's matrices read lazily, so `fn` runs while the file is open. */
 function withScan(path, fn) {
-  const f = new h5wasm.File(path, 'r')
+  const f = openInput(h5wasm, FS, path)
   try { return fn(scanOpenH5ad(f, path.split(/[\\/]/).pop())) } finally { f.close() }
 }
 const scanFile = (path) => withScan(path, s => s)
@@ -287,7 +287,8 @@ attempt('every cell carries its own sample\'s factor_b and arm',
     }
     return wrong
   }, 0)
-attempt('nothing is said to be left out', () => p1.meta.notes.filter(s => /not carried/.test(s)), [])
+// A run record's note counts what of it is not carried (uns/...: ...); this is about the cells' groupings.
+attempt('no grouping is said to be left out', () => p1.meta.notes.filter(s => /not carried/.test(s) && !/^uns\//.test(s)), [])
 attempt('the annotator\'s sentinels are marked, in the index and in the part',
   () => [o1.meta.sentinels, p1.meta.sentinels], [['EXCLUDED', 'UNRESOLVED'], ['EXCLUDED', 'UNRESOLVED']])
 attempt('and counted in the notes', () => p1.meta.notes.some(s => /EXCLUDED/.test(s) && /UNRESOLVED/.test(s) && /\d+ cells/.test(s)), true)

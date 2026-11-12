@@ -75,29 +75,39 @@ export interface EmbeddingRef {
   whole?: () => Float32Array
 }
 
+/** The fields a run record is read for: the run's identity, under these names. */
+export type RunField = 'tool' | 'version' | 'commit' | 'stage' | 'run_key' | 'job'
+
 /**
- * One record of the run that made the object, as its uns holds it.
+ * One record of the run that made the object: its identity, not the record.
  *
- * Copied, not interpreted: `record` is the entry converted to JSON, with the
- * tool's own field names. What a record is, is decided in h5ad.ts by name.
+ * `record` holds those of the six fields the record stores as a string of 256
+ * characters or fewer, unchanged, under these names and in this order; a field
+ * it does not hold is not shown. Nothing else of the record is carried: its
+ * other entries stay in the object, and the notes count them. What a record is,
+ * and what was not carried, is decided and said in h5ad.ts.
  */
 export interface RunRecord {
   /** Where the object holds it, e.g. `uns/scintegrate/provenance`. */
   path: string
-  /** The entry as JSON: groups as objects, scalars and lists as themselves. */
-  record: unknown
+  /** The identity fields carried. Every key is one of RunField: none is a name from the object. */
+  record: Partial<Record<RunField, string>>
 }
 
 /** What the object says about the run that made it. */
 export interface RunSection {
   /** Where the reader looked, so that an empty list can be read exactly. */
   searched: string
-  /** The records written, in uns order. Empty: the object carries none. */
+  /**
+   * The records that carry at least one identity field, in uns order. Empty:
+   * the object carries none (a record with none of the six is named in the
+   * notes, not listed).
+   */
   records: RunRecord[]
   /**
-   * The records found but not written, because the section had reached its
-   * budget: how many, and the first few paths. One entry for all of them.
-   * Absent when every record found is in `records`.
+   * The records found and not read: past the first 64, or after a value longer
+   * than 256 characters ended the reading. How many, and the first ten paths.
+   * Absent when every record found was read.
    */
   leftOut?: { count: number; paths: string[] }
 }
@@ -626,11 +636,15 @@ export function replicatesPerCondition(
   sample: Column | undefined, condition: Column | undefined,
 ): Record<string, number> {
   if (!condition) return {}
-  const out: Record<string, Set<number>> = {}
-  for (const l of condition.levels) out[l] = new Set()
+  // A Map, never an object keyed by the levels: a level is the object's own
+  // text, and one named `__proto__` set the object's prototype instead of a
+  // key, so that condition dropped out of the counts.
+  const out = new Map<string, Set<number>>()
+  for (const l of condition.levels) out.set(l, new Set())
   for (let i = 0; i < condition.codes.length; i++) {
     const c = condition.levels[condition.codes[i]]
-    if (c !== undefined) out[c]?.add(sample ? sample.codes[i] : 0)
+    if (c !== undefined) out.get(c)?.add(sample ? sample.codes[i] : 0)
   }
-  return Object.fromEntries(Object.entries(out).map(([k, v]) => [k, v.size]))
+  // fromEntries defines each key as the object's own, `__proto__` included.
+  return Object.fromEntries([...out].map(([k, v]) => [k, v.size]))
 }

@@ -1,13 +1,13 @@
 import h5wasm from 'h5wasm/node'
-import { scanOpenH5ad } from '../src/lib/h5ad.ts'
+import { openInput, scanOpenH5ad } from '../src/lib/h5ad.ts'
 import { splitCandidates, planSplit, shardScan, shardFileName } from '../src/lib/shard.ts'
 import { buildBundle } from '../src/lib/build.ts'
 import { column } from '../src/lib/scan.ts'
 import { parseBundle, bundleDataset } from '../../scrnaseq-studio/src/lib/bundle.ts'
 
-await h5wasm.ready
+const { FS } = await h5wasm.ready
 const t0 = Date.now()
-const f = new h5wasm.File('E:/developing_mouse_nervous_system.h5ad', 'r')
+const f = openInput(h5wasm, FS, 'E:/developing_mouse_nervous_system.h5ad')
 const scan = scanOpenH5ad(f, 'developing_mouse_nervous_system.h5ad')
 console.log(`scanned 9.3 GB in ${Date.now() - t0} ms`)
 console.log(`${scan.nCells.toLocaleString()} cells - ${scan.columns.length} columns - matrices:`,

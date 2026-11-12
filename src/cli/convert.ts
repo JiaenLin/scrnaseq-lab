@@ -26,7 +26,7 @@ import {
   BuildError, buildBundle, oneConditionPerSample, streamableMatrix, type BundleMeta, type BuildResult,
 } from '../lib/build.ts'
 import { COLLECTION_SCHEMA, collectionPieces, type CollectionMeta, type PartInfo } from '../lib/collection.ts'
-import { H5adError, scanOpenH5ad } from '../lib/h5ad.ts'
+import { H5adError, openInput, scanOpenH5ad } from '../lib/h5ad.ts'
 import type { CellMajor } from '../lib/matrix.ts'
 import type { Scan } from '../lib/scan.ts'
 import { chooseSplit, shardScan } from '../lib/shard.ts'
@@ -151,8 +151,11 @@ export async function convert(a: ConvertArgs, say: (line: string) => void): Prom
   const t0 = Date.now()
   const step = (s: string) => say(`  [${((Date.now() - t0) / 1000).toFixed(1).padStart(5)} s] ${s}`)
 
-  await h5wasm.ready
-  const f = new h5wasm.File(a.input, 'r')
+  // The input is the one file HDF5 may open while it is read: an external
+  // link, a virtual dataset's source or external raw storage cannot reach the
+  // host's other files.
+  const { FS } = await h5wasm.ready
+  const f = openInput(h5wasm, FS, a.input)
   if (!(Number(f.file_id) >= 0)) throw new CliError(`${a.input} could not be opened as HDF5`, EXIT.input)
 
   const scratch = mkdtempSync(join(tmpdir(), 'scrnaseq-lab-'))

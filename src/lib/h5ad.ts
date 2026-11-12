@@ -12,7 +12,7 @@
 
 import {
   categorical, fromFactor, internGeneSet, maybeDiscrete, numeric, pickGeneAlias,
-  type Column, type EmbeddingRef, type GeneAlias, type MatrixRef, type RunRecord, type RunSection, type Scan,
+  type Column, type EmbeddingRef, type GeneAlias, type MatrixRef, type RunField, type RunRecord, type RunSection, type Scan,
 } from './scan.ts'
 import { classify, dropZeros, stridedSample, type CellMajor } from './matrix.ts'
 
@@ -45,6 +45,120 @@ const isGroup = (o: H5): boolean =>
   !!o && typeof o.keys === 'function' && typeof o.get === 'function'
 const isDataset = (o: H5): boolean =>
   !!o && !isGroup(o) && (Array.isArray(o.shape) || typeof o.slice === 'function')
+
+// ---- one file: the input ----------------------------------------------------
+//
+// HDF5 opens other files by itself: the file an external link names, a
+// virtual dataset's source file, a dataset's external raw storage. The node
+// build of h5wasm opens them on the host's own filesystem and the browser build
+// among the files the tab holds, and through one such link another file's
+// content entered a bundle as the object's own, named nowhere: the same input
+// gave two bundles when only the file beside it changed. So the converter reads
+// one file, its input. `openInput` seals the filesystem HDF5 opens files
+// through: while an input it opened is open, no other file can be opened.
+// Every lookup of the scan goes through `child`, which names, once, what it
+// does not follow, and one note in the bundle lists them.
+
+/** The seal on one h5wasm module's filesystem: how many inputs are open, and whether the door is. */
+interface Seal { inputs: number; door: boolean }
+const SEALS = new WeakMap<object, Seal>()
+
+/**
+ * This filesystem's seal, put on at its first use: from then on, while an input
+ * opened by `openInput` is open, every open is refused (EACCES) except one made
+ * through the door, which only the converter's own operations use.
+ */
+function sealOf(FS: H5): Seal {
+  let seal = SEALS.get(FS)
+  if (!seal) {
+    const s: Seal = { inputs: 0, door: false }
+    const open = FS.open
+    FS.open = function (this: unknown, ...args: unknown[]) {
+      if (s.inputs > 0 && !s.door) throw new FS.ErrnoError(2)
+      return open.apply(this, args)
+    }
+    SEALS.set(FS, seal = s)
+  }
+  return seal
+}
+
+/** One of the converter's own operations on the filesystem: the door is open only while it runs. */
+function throughDoor<T>(FS: H5, fn: () => T): T {
+  const s = sealOf(FS)
+  const was = s.door
+  s.door = true
+  try { return fn() } finally { s.door = was }
+}
+
+/** What the scan met and did not follow, per open input (by file id): path -> what it is. */
+const UNFOLLOWED = new Map<string, Map<string, string>>()
+
+/**
+ * Open `path` read-only as the converter's input: the one way in the scan
+ * accepts. Until the handle is closed, HDF5 can open no other file.
+ */
+export function openInput(h5wasm: H5Module, FS: H5, path: string): H5 {
+  const s = sealOf(FS)
+  const f = throughDoor(FS, () => new h5wasm.File(path, 'r'))
+  if (!(Number(f?.file_id) >= 0)) return f
+  const id = String(f.file_id)
+  s.inputs++
+  UNFOLLOWED.set(id, new Map())
+  const close = f.close
+  let closed = false
+  f.close = function (this: unknown, ...args: unknown[]) {
+    if (!closed) { closed = true; s.inputs--; UNFOLLOWED.delete(id) }
+    return close.apply(f, args)
+  }
+  return f
+}
+
+/** What a dataset is when its values lie in another file, as its mapping names it; null for any other. */
+function elsewhere(d: H5): string | null {
+  try {
+    const files = [...new Set(((d.metadata?.virtual_sources ?? []) as { file_name: string }[])
+      .map(v => v.file_name).filter(name => name !== '.'))]
+    return files.length ? `a virtual dataset whose values lie in ${files.join(', ')}` : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The object at `name` below `g`, never reached through a link out of the file.
+ *
+ * Looked up one name at a time: for a path that runs through a link it cannot
+ * follow, h5wasm hands back an object shaped like a group whose every read
+ * fails, while one name at a time it hands back the link itself. An external
+ * link (whatever file it names: under the seal none can be opened), a soft link
+ * that reaches nothing in this file, and a virtual dataset whose values lie in
+ * another file are each remembered once, with what the link states, as text,
+ * and are absent to the scan.
+ */
+function child(g: H5, name: string): H5 | null {
+  let at: H5 = g
+  for (const part of name.split('/')) {
+    if (!part) continue
+    if (!isGroup(at)) return null
+    const o = at.get(part)
+    const says = o?.type === 'ExternalLink' ? `an external link to ${o.obj_path} in ${o.filename}`
+      : o?.type === 'BrokenSoftLink' ? `a soft link to ${o.target}, which reaches nothing in this file`
+        : isDataset(o) ? elsewhere(o) : null
+    if (says) {
+      UNFOLLOWED.get(String(at.file_id))?.set(`${at.path}/${part}`.replace(/^\/+/, ''), says)
+      return null
+    }
+    if (!o) return null
+    at = o
+  }
+  return at
+}
+
+/** Why a part the scan needs is missing, when it is something the converter did not follow. */
+function unfollowed(f: H5, path: string): string | null {
+  const says = UNFOLLOWED.get(String(f.file_id))?.get(path)
+  return says ? `/${path} is ${says}, and the converter reads only the file it is given` : null
+}
 
 /** BigInt64Array and friends do not coerce, so every read goes through here. */
 function toF32(v: unknown): Float32Array {
@@ -83,11 +197,11 @@ export class H5adError extends Error {}
  */
 function nullableStrings(o: H5): { values: string[]; mask: Uint8Array } | null {
   if (!isGroup(o) || text(attr(o, 'encoding-type') ?? '') !== 'nullable-string-array') return null
-  const v = o.get('values')
+  const v = child(o, 'values')
   if (!isDataset(v)) return null
   const values = toStrings(v.value)
   const mask = new Uint8Array(values.length)
-  const m = o.get('mask')
+  const m = child(o, 'mask')
   if (isDataset(m)) {
     const raw = m.value as ArrayLike<number | bigint | boolean>
     for (let i = 0; i < mask.length; i++) mask[i] = raw[i] ? 1 : 0
@@ -156,8 +270,8 @@ function readObs(obs: H5, uns: H5, nCells: number, note: (s: string) => void): C
       const name = comp.names[i]
       if (name === 'index' || name === '_index') continue
       const raw = comp.rows.map(r => r[i])
-      const cats = uns && !(uns.get?.(`${name}_categories`) == null)
-        ? toStrings(uns.get(`${name}_categories`).value) : null
+      const catsDs = uns ? child(uns, `${name}_categories`) : null
+      const cats = isDataset(catsDs) ? toStrings(catsDs.value) : null
       if (cats) {
         out.push(fromFactor(name, toI32(raw.map(Number)), cats))
       } else if (typeof raw[0] === 'string') {
@@ -177,7 +291,7 @@ function readObs(obs: H5, uns: H5, nCells: number, note: (s: string) => void): C
 
   for (const key of keys) {
     if (key === indexName) continue
-    const o = obs.get(key)
+    const o = child(obs, key)
     if (!o) continue
     try {
       if (isGroup(o)) {
@@ -191,8 +305,8 @@ function readObs(obs: H5, uns: H5, nCells: number, note: (s: string) => void): C
           continue
         }
         // A modern categorical: categories + codes, with -1 for NA.
-        const cats = o.get('categories')
-        const codes = o.get('codes')
+        const cats = child(o, 'categories')
+        const codes = child(o, 'codes')
         if (cats && codes) {
           out.push(fromFactor(key, toI32(codes.value), toStrings(cats.value)))
           continue
@@ -226,7 +340,7 @@ function readVar(v: H5, label: string): string[] {
   }
   if (isGroup(v)) {
     const name = text(attr(v, '_index') ?? '_index')
-    const ds = v.get(name) ?? v.get('_index') ?? v.get('index')
+    const ds = child(v, name) ?? child(v, '_index') ?? child(v, 'index')
     const strings = nullableStrings(ds)
     if (strings) return unmasked(strings)
     if (isDataset(ds)) return toStrings(ds.value)
@@ -267,7 +381,7 @@ function readVarStringColumns(v: H5, nGenes: number, note: (s: string) => void):
   for (const key of v.keys()) {
     if (key === indexName || key === '_index' || key === 'index') continue
     try {
-      const o = v.get(key)
+      const o = child(v, key)
       if (!o) continue
       const strings = nullableStrings(o)
       if (strings) {
@@ -275,8 +389,8 @@ function readVarStringColumns(v: H5, nGenes: number, note: (s: string) => void):
         continue
       }
       if (isGroup(o)) {
-        const cats = o.get('categories')
-        const codes = o.get('codes')
+        const cats = child(o, 'categories')
+        const codes = child(o, 'codes')
         if (!cats || !codes) continue
         const levels = toStrings(cats.value)
         const c = toI32(codes.value)
@@ -338,9 +452,9 @@ function readMatrix(m: H5, nCells: number, nGenes: number, key: string): CellMaj
   }
 
   const enc = text(attr(m, 'encoding-type') ?? attr(m, 'h5sparse_format') ?? '')
-  const data = toF32(m.get('data').value)
-  const indices = toI32(m.get('indices').value)
-  const indptr = toI32(m.get('indptr').value)
+  const data = toF32(child(m, 'data').value)
+  const indices = toI32(child(m, 'indices').value)
+  const indptr = toI32(child(m, 'indptr').value)
 
   if (enc.includes('csc')) {
     // Stored gene-major already; flip it to cell-major so one path follows.
@@ -382,7 +496,7 @@ function readMatrix(m: H5, nCells: number, nGenes: number, key: string): CellMaj
  * far you read.
  */
 function geneCoverage(m: H5, nGenes: number): number {
-  const idx = m.get('indices')
+  const idx = child(m, 'indices')
   const n = (idx.shape as number[])[0]
   if (!n || !nGenes) return 1
   const blocks = 24
@@ -399,7 +513,7 @@ function geneCoverage(m: H5, nGenes: number): number {
 
 /** Row offsets of a CSR matrix, as counts per cell. */
 function rowLengths(m: H5, nCells: number): Int32Array {
-  const indptr = toI32(m.get('indptr').value)
+  const indptr = toI32(child(m, 'indptr').value)
   const out = new Int32Array(nCells)
   for (let c = 0; c < nCells; c++) out[c] = indptr[c + 1] - indptr[c]
   return out
@@ -420,9 +534,9 @@ function readGroupsCSR(
   m: H5, groups: Int32Array[], nCells: number, nGenes: number,
   onProgress?: (frac: number) => void,
 ): CellMajor[] {
-  const indptr = toI32(m.get('indptr').value)
-  const dataDs = m.get('data')
-  const idxDs = m.get('indices')
+  const indptr = toI32(child(m, 'indptr').value)
+  const dataDs = child(m, 'data')
+  const idxDs = child(m, 'indices')
   const total = indptr[nCells]
 
   // Which group each cell belongs to, and how big each group's arrays must be.
@@ -503,7 +617,7 @@ function sampleMatrix(m: H5, want = 20000): Float64Array {
     }
     return Float64Array.from(vals)
   }
-  const d = m.get('data')
+  const d = child(m, 'data')
   const n = (d.shape as number[])[0]
   // One strided read would mean n round trips into WASM; a few contiguous
   // blocks spread across the vector cost far less and sample just as fairly.
@@ -520,128 +634,86 @@ function sampleMatrix(m: H5, want = 20000): Float64Array {
 }
 
 // ---------------------------------------------------------------------------
-// The run's own record.
+// The run's identity.
 //
 // An object says in uns what made it, and every tool says it in its own place:
 // the integration stage under uns/<tool>/provenance, the annotator as
 // uns/<column>_provenance, the QC stage as a group whose schema names
-// provenance, and the harness's run record (when there is one) as a JSON
-// string in uns/harness_run. The reader cannot know every tool, so it names
-// none: a record is what calls itself provenance, by its key or by its own
-// schema, at the top of uns or one level down. Deeper than that is inside some
-// other record, not a record of the run. What it finds is copied, not
-// summarised — a summary would decide which of a tool's fields matter.
+// provenance, and the harness's run record (when there is one) as
+// uns/harness_run. The reader names no tool: a record is what calls itself
+// provenance, by its key or by its own schema, at the top of uns or one level
+// down.
+//
+// Of each record it carries the run's identity, not the record: six fields
+// read by name, each only as a string of RUN_FIELD_MAX characters or fewer,
+// under the converter's own keys. They are the fields Studio's Run card shows
+// first. Everything else a record holds (a tool's arguments and input path,
+// package versions, settings, label counts) stays in the object, and is counted,
+// never named. An earlier design copied whatever a record held, so its input
+// became all of HDF5 (links, cycles, other files, types JSON cannot hold, names
+// that are code in JavaScript) for a card that shows six strings.
 
-/** Where the reader looks for the run's record. Written into the bundle beside what it found. */
+/** Where the reader looks for the run's records. Written into the bundle beside what it found. */
 export const RUN_SEARCHED = 'uns/harness_run; every entry of uns, and every child of a dict directly under uns, named provenance or *_provenance; every dict directly under uns whose own schema names provenance'
 
-/** Arrays longer than this are named in a record rather than read into it. */
-const RUN_ARRAY_CAP = 10_000
+/** The fields read from each record, by name and in this order: the run's identity. */
+export const RUN_FIELDS: readonly RunField[] = ['tool', 'version', 'commit', 'stage', 'run_key', 'job']
 
-/**
- * The most one record may take in meta.json, in bytes as written; past it the
- * record is named in place with its size, not copied.
- *
- * The run section is written into every part of a split object, so a record
- * is paid for once per part. A tool's provenance is a few hundred bytes to a
- * few tens of thousands (an annotator's per-label counts on an atlas); a
- * quarter of a megabyte holds those with room to spare, and stops a record
- * that is really a result (a log, a table) from being copied forty times.
- *
- * Bytes as written, not compact JSON: meta.json is indented, one space a
- * level, and an array of numbers written one per line takes several times
- * its compact size.
- */
-export const RUN_RECORD_BUDGET = 262_144
+/** The longest value carried, in characters (code points). */
+export const RUN_FIELD_MAX = 256
 
-/**
- * The most all the written records may take together, in bytes as written.
- * Records that do not fit are left out, and one entry, `leftOut`, counts them.
- */
-export const RUN_SECTION_BUDGET = 1_048_576
+/** The most records read. Past it, records are counted in leftOut and the first ten named. */
+export const RUN_MAX_RECORDS = 64
 
-/**
- * Groups deeper than this below their record's own entry are named in place.
- * Reading a chain of groups costs more at every level (800 levels took a
- * minute and a half, 2,000 did not finish), and a run record is not that deep.
- */
-export const RUN_MAX_DEPTH = 16
-
-/**
- * The most groups and datasets read for one record; past it the rest is named
- * in place. Depth alone does not bound a read: hard links make a few groups
- * into exponentially many paths (17 groups of two links each are 2^17 paths in
- * a 265 KB file, which read for minutes and never finished).
- */
-export const RUN_MAX_NODES = 10_000
-
-/**
- * The most groups and datasets read for the whole run section. The per-record
- * budget alone bounds nothing when many records reach the same large group:
- * 400 records linked to one group of 9,990 datasets read it 400 times. Records
- * reached after this is spent are left out, unread.
- */
-export const RUN_SECTION_NODES = 50_000
-
-/**
- * One record's walk: the HDF5 objects this record has read, by identity, and
- * how many groups and datasets this record and the whole section have read.
- * An object the record reaches again — a hard link back to an ancestor, a
- * second hard or soft link — is named in place, never read again.
- *
- * `seen` is the record's own. Shared across records, an object first reached
- * by a record whose content is never written (over its budget, left out of
- * the section, or reached past the depth limit) turned every later record
- * that reached it into a pointer to nothing, and a tool's record was lost.
- * What bounds the cost of many records reaching one large object is the
- * section's own node budget.
- */
-interface Walk {
-  /** The record's own path, for the notes. */
-  record: string
-  /** This record's: identity → the path in the record that first reached it. */
-  seen: Map<string, string>
-  /** Groups and datasets read for this record. */
-  visited: number
-  /** Shared by every record of the section. */
-  section: { visited: number }
-  relinked: Set<string>
-  crowded: Set<string>
+/** `a`; `a and b`; `a, b and c`. */
+function and(items: string[]): string {
+  return items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
 }
 
-/**
- * An HDF5 object's identity: the object reference h5wasm makes for it, which
- * is its address in its file, whatever path reached it — tagged with that
- * file. An external link leads into another file, whose addresses can equal
- * this file's (a copy of an object holds the same layout), so `file` names
- * the file any external link on the way led to, and '' is this one. Null
- * where the reader cannot make a reference, and then the object is not tracked.
- */
-function identity(o: H5, file: string): string | null {
-  try {
-    const bytes = o.create_reference?.()?.ref_data as ArrayLike<number> | undefined
-    return bytes ? `${file}|${Array.from(bytes).join('.')}` : null
-  } catch {
-    return null
+/** Paths for a sentence: the first ten, then a count. */
+function some(paths: string[]): string {
+  const shown = paths.slice(0, 10).join(', ')
+  return paths.length > 10 ? `${shown} and ${(paths.length - 10).toLocaleString('en-US')} more` : shown
+}
+
+/** Is `s` longer than `max` characters, counted as code points? */
+function longer(s: string, max: number): boolean {
+  if (s.length <= max) return false
+  let n = 0
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const d = s.charCodeAt(i + 1)
+      if (d >= 0xdc00 && d <= 0xdfff) i++
+    }
+    if (++n > max) return true
   }
-}
-
-/** The file an external link named `name` in `group` leads to; '' for a link inside the same file. */
-function linkFile(group: H5, name: string): string {
-  try {
-    return String(group.get_external_link?.(`${group.path}/${name}`)?.filename ?? '')
-  } catch {
-    return ''
-  }
+  return false
 }
 
 /**
- * HDF5 type classes JSON has no form for, named in place rather than copied:
- * a reference's bytes mean nothing outside its file, and opaque bytes, a
- * bitfield or a time have no agreed reading.
+ * What an HDF5 object is, from its type and shape alone, said of a field that
+ * is not carried; null for a scalar string, which is read and then measured.
  */
-const UNHELD: Record<number, string> = {
-  2: 'HDF5 time values', 4: 'an HDF5 bitfield', 5: 'opaque HDF5 bytes', 7: 'HDF5 references',
+function kindOf(o: H5): string | null {
+  if (isGroup(o)) return 'a group'
+  if (!isDataset(o)) return 'neither a dataset nor a group'
+  let info: H5
+  try {
+    info = o.metadata ?? {}
+  } catch {
+    return 'a value whose type cannot be read'
+  }
+  const shape = (info.shape as number[] | null) ?? []
+  if (shape.length) {
+    const n = shape.reduce((a, b) => a * b, 1)
+    return `an array of ${n.toLocaleString('en-US')} value${n === 1 ? '' : 's'}`
+  }
+  if (info.type === 3) return null
+  if (info.type === 0 || info.type === 1) return 'a number'
+  const members = info.enum_type?.members as Record<string, number> | undefined
+  if (members && Object.keys(members).length === 2 && 'TRUE' in members && 'FALSE' in members) return 'a boolean'
+  return 'a value that is not a string'
 }
 
 /**
@@ -656,350 +728,159 @@ const isDict = (g: H5): boolean => {
   return isGroup(g) && (encoding === '' || encoding === 'dict')
 }
 
-/**
- * One stored value as JSON can hold it: int64 as a number (its exact digits as
- * a string past 2**53), NaN as "NaN", and a list — a compound row, an array
- * member, a ragged row — value by value. A row of a structured array arrives
- * as a list holding BigInts, and copying it as it came crashed the whole
- * conversion at JSON.stringify.
- */
-function jsonValue(v: unknown): unknown {
-  if (typeof v === 'bigint') {
-    return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v.toString()
-  }
-  if (typeof v === 'number') return Number.isFinite(v) ? v : String(v)
-  if (Array.isArray(v) || ArrayBuffer.isView(v)) return Array.from(v as ArrayLike<unknown>, jsonValue)
-  if (v !== null && typeof v === 'object') return '(not copied: a value JSON has no form for)'
-  return v ?? null
-}
-
-/** A flat list back into the dataset's shape, row-major. */
-function nest(flat: unknown[], shape: number[]): unknown[] {
-  if (shape.length <= 1) return flat
-  const step = shape.slice(1).reduce((a, b) => a * b, 1)
-  const out: unknown[] = []
-  for (let i = 0; i < flat.length; i += step) out.push(nest(flat.slice(i, i + step), shape.slice(1)))
-  return out
-}
-
-/**
- * A dataset as JSON: a scalar as itself, an array as a list (nested by shape),
- * a structured array as one object per row under its field names.
- *
- * What cannot be copied is named in place, so one odd leaf never costs the
- * rest of its record.
- */
-function plainDataset(d: H5, path: string): unknown {
-  const info = d.metadata ?? {}
-  const unheld = UNHELD[info.type as number]
-  if (unheld) return `(not copied: ${path} holds ${unheld})`
-  if (info.type === 1 && info.size === 2) return `(not copied: ${path} is float16, which this reader cannot read)`
-  const shape = (d.shape as number[] | undefined) ?? []
-  const size = shape.reduce((a, b) => a * b, 1)
-  if (size > RUN_ARRAY_CAP) return `(not copied: ${path} holds ${size.toLocaleString('en-US')} values)`
-  let v: unknown
-  try {
-    v = d.value
-  } catch (e) {
-    return `(not copied: ${path} could not be read: ${(e as Error).message})`
-  }
-  if (v == null) return `(not copied: ${path} is of a type this reader cannot read)`
-  // h5py stores a numpy bool as an HDF5 enum of FALSE and TRUE, and h5wasm
-  // hands back the integer. It was a boolean when it was written; any other
-  // enum value is its member's name.
-  const members = info.enum_type?.members as Record<string, number> | undefined
-  const bool = !!members && Object.keys(members).length === 2 && 'TRUE' in members && 'FALSE' in members
-  const fields = info.compound_type?.members as { name: string }[] | undefined
-  const one = (x: unknown): unknown => {
-    if (bool) return Number(x) === members!.TRUE
-    if (members) return Object.keys(members).find(k => members[k] === Number(x)) ?? jsonValue(x)
-    if (fields && Array.isArray(x)) return Object.fromEntries(fields.map((f, i) => [f.name, jsonValue(x[i])]))
-    return jsonValue(x)
-  }
-  if (!shape.length) {
-    // A scalar comes back as itself, or wrapped in a one-element list; a
-    // compound scalar is its row of fields, possibly wrapped the same way.
-    if (fields) return one(Array.isArray(v) && Array.isArray(v[0]) ? v[0] : v)
-    return one(typeof v === 'object' && 'length' in v ? (v as ArrayLike<unknown>)[0] : v)
-  }
-  return nest(Array.from(v as ArrayLike<unknown>, one), shape)
-}
-
-/** Where the walk has run out of reading, as the end of a sentence; null while it has not. */
-function spent(walk: Walk): string | null {
-  if (walk.visited >= RUN_MAX_NODES) return `the ${RUN_MAX_NODES.toLocaleString('en-US')} groups and datasets read for one record`
-  if (walk.section.visited >= RUN_SECTION_NODES) return `the ${RUN_SECTION_NODES.toLocaleString('en-US')} groups and datasets read for the run section`
-  return null
-}
-
-/**
- * An uns entry as JSON: a dict as an object, in the order the file lists it.
- *
- * Four things bound the read, each naming what it stops in place: `depth`
- * counts groups below the record's own entry (past RUN_MAX_DEPTH a group is
- * not read); the walk counts the groups and datasets read, for the record
- * (RUN_MAX_NODES) and for the whole section (RUN_SECTION_NODES); and an object
- * this record has already read is not read again. Only what is read is
- * remembered as read, so "again" always points at content in the same record.
- * `file` is the file an external link on the way led to ('' for this one).
- */
-function plain(o: H5, path: string, walk: Walk, depth = 0, file = ''): unknown {
-  if (!isDataset(o) && !isGroup(o)) return null
-  const stop = spent(walk)
-  if (stop) {
-    walk.crowded.add(walk.record)
-    return `(not copied: ${path} lies past ${stop})`
-  }
-  if (isGroup(o) && depth > RUN_MAX_DEPTH) return `(not copied: ${path} is nested more than ${RUN_MAX_DEPTH} groups below its record)`
-  walk.visited++
-  walk.section.visited++
-  const id = identity(o, file)
-  if (id !== null) {
-    const first = walk.seen.get(id)
-    if (first !== undefined) {
-      walk.relinked.add(walk.record)
-      return `(not copied: ${path} is ${first} again, reached by another link)`
-    }
-    walk.seen.set(id, path)
-  }
-  if (isDataset(o)) return plainDataset(o, path)
-  const strings = nullableStrings(o)
-  if (strings) {
-    return strings.values.length > RUN_ARRAY_CAP
-      ? `(not copied: ${path} holds ${strings.values.length.toLocaleString('en-US')} values)`
-      : strings.values.map((s, i) => (strings.mask[i] ? null : s))
-  }
-  if (!isDict(o)) return `(not copied: ${path} is a ${text(attr(o, 'encoding-type'))})`
-  const out: Record<string, unknown> = {}
-  const keys = o.keys() as string[]
-  for (let i = 0; i < keys.length; i++) {
-    const stop = spent(walk)
-    if (stop) {
-      // One sentence for the rest of this group, not one per entry.
-      walk.crowded.add(walk.record)
-      out['(not copied)'] = `${(keys.length - i).toLocaleString('en-US')} more entries of ${path}, past ${stop}`
-      break
-    }
-    out[keys[i]] = plain(o.get(keys[i]), `${path}/${keys[i]}`, walk, depth + 1, linkFile(o, keys[i]) || file)
-  }
-  return out
-}
-
-/**
- * The bytes a string takes in meta.json: UTF-8, quoted, escaped as
- * JSON.stringify escapes it (a lone surrogate as \uXXXX).
- */
-function stringBytes(s: string): number {
-  let b = 2
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i)
-    if (c === 0x22 || c === 0x5c) b += 2
-    else if (c < 0x20) b += c === 8 || c === 9 || c === 10 || c === 12 || c === 13 ? 2 : 6
-    else if (c < 0x80) b += 1
-    else if (c < 0x800) b += 2
-    else if (c >= 0xd800 && c <= 0xdbff) {
-      const d = s.charCodeAt(i + 1)
-      if (d >= 0xdc00 && d <= 0xdfff) { b += 4; i++ } else b += 6
-    } else if (c >= 0xdc00 && c <= 0xdfff) b += 6
-    else b += 3
-  }
-  return b
-}
-
-/**
- * The bytes a value takes in meta.json, which the builder writes as
- * JSON.stringify(meta, null, 1): at nesting `depth`, each member on its own
- * line indented depth + 1 spaces, the closing bracket on a line indented
- * `depth`. Counted, not written out, so a 50 MB record is measured without a
- * second 50 MB string. A record sits at depth 4 (meta, run, records, entry).
- */
-function writtenSize(v: unknown, depth: number): number {
-  if (Array.isArray(v)) {
-    if (!v.length) return 2
-    let s = v.length * (depth + 3) + depth + 2
-    for (const x of v) s += writtenSize(x, depth + 1)
-    return s
-  }
-  if (v !== null && typeof v === 'object') {
-    const keys = Object.keys(v).filter(k => (v as Record<string, unknown>)[k] !== undefined)
-    if (!keys.length) return 2
-    let s = keys.length * (depth + 5) + depth + 2
-    for (const k of keys) s += stringBytes(k) + writtenSize((v as Record<string, unknown>)[k], depth + 1)
-    return s
-  }
-  if (typeof v === 'string') return stringBytes(v)
-  // Numbers, booleans and null are ASCII; anything else JSON cannot hold
-  // throws here, which fails its record and never the conversion.
-  const json = JSON.stringify(v ?? null)
-  if (json === undefined) throw new Error(`a ${typeof v} has no JSON form`)
-  return json.length
-}
-
-/**
- * What one entry of run.records adds to meta.json, given what its record
- * takes at depth 4: the path, and 40 bytes of indentation and punctuation.
- */
-const entryBytes = (path: string, recordBytes: number) => 40 + stringBytes(path) + recordBytes
-
-/** Paths for a sentence: the first ten, then a count. */
-function some(paths: string[]): string {
-  const shown = paths.slice(0, 10).join(', ')
-  return paths.length > 10 ? `${shown} and ${(paths.length - 10).toLocaleString('en-US')} more` : shown
-}
-
 /** Does this group name provenance in its own `schema` string? */
 function schemaSaysProvenance(o: H5): boolean {
   if (!isDict(o)) return false
   try {
-    const s = o.get('schema')
+    const s = child(o, 'schema')
     return isDataset(s) && /provenance/i.test(text(s.value))
   } catch {
     return false
   }
 }
 
+/** One record, read by the closed rule. */
+interface Identity {
+  /** The fields carried, under the converter's own keys, in RUN_FIELDS order. */
+  record: Partial<Record<RunField, string>>
+  /** Each of the six it holds that is not carried, with what it is. */
+  refused: string[]
+  /** How many of its entries are not one of the six: counted, never named. */
+  others: number
+  /** Where a value longer than RUN_FIELD_MAX was met, which ends the section's reading. */
+  long: string | null
+}
+
 /**
- * Every record of the run the object carries.
- *
- * Found in uns order, then read, measured as meta.json will hold it, and
- * decided one at a time, in the order the section is filled: kind by kind —
- * the harness's run record first, then each `provenance`, then each
- * `*_provenance`, then the records known by their schema — and within a kind
- * in uns order, first fit: one that does not fit in what is left of
- * RUN_SECTION_BUDGET is left out, and the next is still tried. So a record of
- * an earlier kind is never pushed out by a later kind; within one kind,
- * earlier records in uns can still fill the section before a tool's own
- * record, and then that record is left out and named first, because the
- * records left out are named largest first. Written records keep uns order.
- *
- * Each record is read on its own: an object it reaches twice is read once in
- * it, and two records that reach one object both copy it. The section reads at
- * most RUN_SECTION_NODES groups and datasets; records it reaches after that
- * are left out, unread. A record over RUN_RECORD_BUDGET is written as a sentence
- * naming its size. One entry, `leftOut`, and one note cover every record left
- * out.
- *
- * Nothing found here can stop the conversion. An uns entry that cannot even be
- * inspected, a record that cannot be read, and a value JSON cannot hold are
- * each said in one note, never thrown.
+ * The six fields of one record, looked up by name. Nothing else of the record
+ * is read: its entries are counted, never opened. A field that is a link out
+ * of the file is absent here, and named by the scan's note on links.
  */
-export function readRun(uns: H5, note: (s: string) => void): RunSection {
+function readIdentity(rec: H5, path: string): Identity {
+  const record: Partial<Record<RunField, string>> = {}
+  const refused: string[] = []
+  const six: readonly string[] = RUN_FIELDS
+  const others = (rec.keys() as string[]).filter(k => !six.includes(k)).length
+  for (const field of RUN_FIELDS) {
+    const o = child(rec, field)
+    if (!o) continue
+    const kind = kindOf(o)
+    if (kind) {
+      refused.push(`${field} (${kind})`)
+      continue
+    }
+    let v: unknown
+    try {
+      v = o.value
+    } catch {
+      refused.push(`${field} (a string that could not be read)`)
+      continue
+    }
+    const s = typeof v === 'string' ? v : Array.isArray(v) && v.length === 1 && typeof v[0] === 'string' ? v[0] : null
+    if (s === null) {
+      refused.push(`${field} (a value that is not a string)`)
+    } else if (longer(s, RUN_FIELD_MAX)) {
+      refused.push(`${field} (a string longer than ${RUN_FIELD_MAX} characters)`)
+      return { record, refused, others, long: `${path}/${field}` }
+    } else {
+      record[field] = s
+    }
+  }
+  return { record, refused, others, long: null }
+}
+
+/**
+ * The identity of the run that made the object, record by record.
+ *
+ * Records are found in uns order by RUN_SEARCHED's rule, and the first
+ * RUN_MAX_RECORDS of them are read by `readIdentity`. One that carries none of
+ * the six is not written, and its note says so; one that is not a dict (a
+ * string such as the harness's JSON, an array, a group of another encoding) is
+ * named with what it is, and nothing of it is read. The first value longer than
+ * RUN_FIELD_MAX ends the reading, so a long value is read once, however many
+ * records reach it. Records not read, past the cap or after that value, are
+ * counted in `leftOut`, the first ten named. Nothing here can stop the conversion.
+ */
+function readRun(uns: H5, note: (s: string) => void): RunSection {
   const records: RunRecord[] = []
   if (!isGroup(uns)) return { searched: RUN_SEARCHED, records }
   const named = (k: string) => k === 'provenance' || k.endsWith('_provenance')
-  const kindOf = (k: string) => (k === 'provenance' ? 1 : 2)
   const n = (x: number) => x.toLocaleString('en-US')
-  const relinked = new Set<string>()
-  const crowded = new Set<string>()
-  const section = { visited: 0 }
-  const walkOf = (record: string): Walk => ({ record, seen: new Map(), visited: 0, section, relinked, crowded })
 
   // ---- found, in uns order; each entry inspected on its own -------------
-  type Found = { path: string; kind: number; read: (say: (s: string) => void) => unknown }
-  const found: Found[] = []
+  const found: { path: string; o: H5 }[] = []
   const uninspected: string[] = []
   let why = ''
   for (const k of uns.keys() as string[]) {
     const path = `uns/${k}`
     try {
-      const o = uns.get(k)
+      const o = child(uns, k)
       if (!o) continue
-      if (k === 'harness_run') {
-        // The harness's record is one JSON string. Parsed, so that it reads
-        // as the structure it is; kept as its text when it does not parse.
-        found.push({ path, kind: 0, read: say => {
-          const v = plain(o, path, walkOf(path), 0, linkFile(uns, k))
-          if (typeof v !== 'string') return v
-          try {
-            return JSON.parse(v)
-          } catch {
-            say(`${path} is not JSON, so it travels in run as its text`)
-            return v
-          }
-        } })
-      } else if (named(k)) {
-        found.push({ path, kind: kindOf(k), read: () => plain(o, path, walkOf(path), 0, linkFile(uns, k)) })
-      } else if (schemaSaysProvenance(o)) {
-        found.push({ path, kind: 3, read: () => plain(o, path, walkOf(path), 0, linkFile(uns, k)) })
+      if (k === 'harness_run' || named(k) || schemaSaysProvenance(o)) {
+        found.push({ path, o })
       } else if (isDict(o)) {
         for (const c of o.keys() as string[]) {
-          const at = `${path}/${c}`
-          if (named(c)) found.push({ path: at, kind: kindOf(c), read: () => plain(o.get(c), at, walkOf(at), 0, linkFile(o, c) || linkFile(uns, k)) })
+          if (!named(c)) continue
+          const oc = child(o, c)
+          if (oc) found.push({ path: `${path}/${c}`, o: oc })
         }
       }
     } catch (e) {
-      // An attribute h5wasm cannot read (float16), a broken link: this entry
-      // cannot be classified, and the conversion goes on without it.
+      // An attribute h5wasm cannot read (float16): this entry cannot be
+      // classified, and the conversion goes on without it.
       uninspected.push(path)
       why ||= (e as Error).message
     }
   }
 
-  // ---- read, measured and decided, in the order the section fills ------------
-  const order = found.map((f, at) => ({ f, at })).sort((a, b) => a.f.kind - b.f.kind || a.at - b.at)
-  const written = new Map<number, unknown>()
+  // ---- read, in uns order, to the cap -------------------------------------
+  const pastCap: string[] = []
+  const afterLong: string[] = []
   const failed: string[] = []
-  const tooBig: string[] = []
-  // size -1: never read, because the section had read all it may.
-  const leftOut: { at: number; path: string; size: number }[] = []
-  let unread = 0
-  let used = 0
-  for (const { f, at } of order) {
-    if (section.visited >= RUN_SECTION_NODES) {
-      leftOut.push({ at, path: f.path, size: -1 })
-      unread++
-      continue
-    }
-    let record: unknown = null
-    let size = 4
-    let bad = false
+  let long: string | null = null
+  for (let i = 0; i < found.length; i++) {
+    const { path, o } = found[i]
+    if (long !== null) { afterLong.push(path); continue }
+    if (i >= RUN_MAX_RECORDS) { pastCap.push(path); continue }
     try {
-      record = f.read(note) ?? null
-      size = writtenSize(record, 4)
-    } catch {
-      bad = true
-      record = null
-      size = 4
+      if (!isDict(o)) {
+        const what = isGroup(o) ? 'a group of another encoding than dict' : kindOf(o) ?? 'a string'
+        note(`${path} is ${what}, not a dict of named fields, so run reads nothing from it`)
+        continue
+      }
+      const id = readIdentity(o, path)
+      const carried = Object.keys(id.record)
+      const not = [...id.refused, ...(id.others ? [`${n(id.others)} other entr${id.others === 1 ? 'y' : 'ies'}`] : [])]
+      const rest = not.length ? `; not carried: ${and(not)}` : ''
+      if (carried.length) {
+        records.push({ path, record: id.record })
+        note(`${path}: run carries its ${and(carried)}${rest}`)
+      } else {
+        note(`${path} holds none of ${and([...RUN_FIELDS])} as a string of ${RUN_FIELD_MAX} characters or fewer, so run does not list it${rest}`)
+      }
+      long = id.long
+    } catch (e) {
+      failed.push(`${path} (${(e as Error).message})`)
     }
-    const over = !bad && size > RUN_RECORD_BUDGET
-    if (over) record = `(not copied: ${n(size)} bytes as written, over the ${n(RUN_RECORD_BUDGET)}-byte budget for one record)`
-    const cost = entryBytes(f.path, over ? stringBytes(record as string) : size)
-    if (used + cost > RUN_SECTION_BUDGET) {
-      leftOut.push({ at, path: f.path, size })
-      continue
-    }
-    used += cost
-    written.set(at, record)
-    if (bad) failed.push(f.path)
-    else if (over) tooBig.push(f.path)
   }
-  for (const at of [...written.keys()].sort((a, b) => a - b)) records.push({ path: found[at].path, record: written.get(at) })
-  // Largest first, so that a tool's own record, which is rarely the smallest,
-  // is named among the first few whenever it is left out; the unread last.
-  const outPaths = [...leftOut].sort((a, b) => b.size - a.size || a.at - b.at).map(x => x.path)
+  const unread = [...afterLong, ...pastCap]
 
   // ---- said, once each -------------------------------------------------------
   if (uninspected.length) {
     note(`${some(uninspected)} could not be inspected (${why}), so the run section cannot tell whether ${uninspected.length > 1 ? 'they hold records' : 'it holds a record'}`)
   }
-  if (relinked.size) {
-    note(`${some([...relinked])} ${relinked.size > 1 ? 'reach' : 'reaches'} an HDF5 object by more than one link; within the record the object is copied once, and each other link to it is named in place`)
-  }
-  if (crowded.size) {
-    note(`${some([...crowded])} ${crowded.size > 1 ? 'were' : 'was'} read only to the ${n(RUN_MAX_NODES)} groups and datasets one record may take, or the ${n(RUN_SECTION_NODES)} the run section may; past that, the rest is named in place, unread`)
-  }
   if (failed.length) {
-    note(`${some(failed)} could not be read; run lists ${failed.length > 1 ? 'them' : 'it'} with no content`)
+    note(`${some(failed)}: could not be read, so run carries nothing of ${failed.length > 1 ? 'them' : 'it'}`)
   }
-  if (tooBig.length) {
-    note(`${some(tooBig)} ${tooBig.length > 1 ? 'are' : 'is'} over the ${n(RUN_RECORD_BUDGET)}-byte budget for one record as meta.json writes it, so run names ${tooBig.length > 1 ? 'each' : 'it'} with its size instead of copying it into every part`)
+  if (long !== null) {
+    note(`${long} is a string longer than ${RUN_FIELD_MAX} characters, so run read no value after it${afterLong.length ? `: ${n(afterLong.length)} record${afterLong.length > 1 ? 's' : ''} found after it ${afterLong.length > 1 ? 'were' : 'was'} not read: ${some(afterLong)}` : ''}`)
   }
-  if (leftOut.length) {
-    note(`${n(leftOut.length)} record${leftOut.length > 1 ? 's were' : ' was'} left out of run, largest first: ${some(outPaths)}. The section is filled kind by kind (the harness's run record, then each provenance, then *_provenance, then records known by their schema), each kind in uns order, to ${n(RUN_SECTION_BUDGET)} bytes${unread ? `; ${n(unread)} of them ${unread > 1 ? 'were' : 'was'} not read, because the section had read the ${n(RUN_SECTION_NODES)} groups and datasets it may` : ''}`)
+  if (pastCap.length) {
+    note(`${n(found.length)} records were found and run reads the first ${RUN_MAX_RECORDS}: the ${n(pastCap.length)} after them ${pastCap.length > 1 ? 'were' : 'was'} not read: ${some(pastCap)}`)
   }
   return {
     searched: RUN_SEARCHED, records,
-    ...(leftOut.length ? { leftOut: { count: leftOut.length, paths: outPaths.slice(0, 10) } } : {}),
+    ...(unread.length ? { leftOut: { count: unread.length, paths: unread.slice(0, 10) } } : {}),
   }
 }
 
@@ -1017,14 +898,17 @@ export interface H5Module {
  * about how it is read.
  */
 export function scanOpenH5ad(f: H5, filename: string): Scan {
+  if (!UNFOLLOWED.has(String(f?.file_id))) {
+    throw new H5adError('the converter reads only a file it opened itself (openInput), so that no link can lead it to another')
+  }
   const notes: string[] = []
   const note = (s: string) => notes.push(s)
 
-  const obsRaw = f.get('obs')
-  if (!obsRaw) throw new H5adError('this HDF5 file has no /obs — it is not an .h5ad')
+  const obsRaw = child(f, 'obs')
+  if (!obsRaw) throw new H5adError(unfollowed(f, 'obs') ?? 'this HDF5 file has no /obs — it is not an .h5ad')
 
-  const X = f.get('X')
-  if (!X) throw new H5adError('this file has no /X matrix')
+  const X = child(f, 'X')
+  if (!X) throw new H5adError(unfollowed(f, 'X') ?? 'this file has no /X matrix')
   const shape = isDataset(X)
     ? (X.shape as number[])
     : (toI32(attr(X, 'shape') ?? attr(X, 'h5sparse_shape') ?? []) as unknown as number[])
@@ -1037,18 +921,18 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
     ? 'read in the legacy AnnData layout — obs and obsm are compound datasets and categorical levels come from uns'
     : 'read in the modern AnnData layout')
 
-  const uns = f.get('uns')
+  const uns = child(f, 'uns')
   const columns = readObs(obsRaw, uns, nCells, note)
 
   // ---- gene lists -------------------------------------------------------
   const geneSets: Record<string, string[]> = {}
   const geneAliases: Record<string, GeneAlias> = {}
-  const varDs = f.get('var')
+  const varDs = child(f, 'var')
   const varGenes = readVar(varDs, 'var')
   const varSet = internGeneSet(geneSets, varGenes, 'var')
   const varAlias = readVarAlias(varDs, varGenes, note)
   if (varAlias) geneAliases[varSet] = varAlias
-  const rawVarDs = f.get('raw/var') ?? f.get('raw.var')
+  const rawVarDs = child(f, 'raw/var') ?? child(f, 'raw.var')
   let rawSet: string | null = null
   if (rawVarDs) {
     try {
@@ -1068,6 +952,13 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
   const add = (key: string, m: H5, geneSet: string, cells: number, genes: number) => {
     if (!m) return
     try {
+      // Every member a load will read, looked up now: what is not in this file
+      // is named by the scan, never met later by a load.
+      if (isGroup(m)) {
+        for (const part of ['data', 'indices', 'indptr']) {
+          if (!isDataset(child(m, part))) throw new Error(`its ${part} is not a dataset in this file`)
+        }
+      }
       const csr = !isDataset(m) &&
         !text(attr(m, 'encoding-type') ?? attr(m, 'h5sparse_format') ?? '').includes('csc')
       matrices.push({
@@ -1089,18 +980,18 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
   }
 
   add('X', X, varSet, nCells, nGenes)
-  const layers = f.get('layers')
+  const layers = child(f, 'layers')
   if (isGroup(layers)) {
-    for (const k of layers.keys()) add(`layers["${k}"]`, layers.get(k), varSet, nCells, nGenes)
+    for (const k of layers.keys()) add(`layers["${k}"]`, child(layers, k), varSet, nCells, nGenes)
   }
-  const rawX = f.get('raw/X') ?? f.get('raw.X')
+  const rawX = child(f, 'raw/X') ?? child(f, 'raw.X')
   if (rawX && rawSet) {
     add('raw.X', rawX, rawSet, nCells, geneSets[rawSet].length)
   }
 
   // ---- embeddings -------------------------------------------------------
   const embeddings: EmbeddingRef[] = []
-  const obsm = f.get('obsm')
+  const obsm = child(f, 'obsm')
   const comp = obsm ? compound(obsm) : null
   if (comp) {
     comp.members.forEach((m: H5, i: number) => {
@@ -1121,7 +1012,7 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
     })
   } else if (isGroup(obsm)) {
     for (const k of obsm.keys()) {
-      const ds = obsm.get(k)
+      const ds = child(obsm, k)
       const s = ds?.shape as number[] | undefined
       if (!s || s.length < 2 || s[1] < 2 || s[0] !== nCells) continue
       embeddings.push(once({
@@ -1144,6 +1035,12 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
     ambient: unsKeys.find(k => /soupx|cellbender|decontx/i.test(k)) ?? null,
   }
   const run = readRun(uns, note)
+
+  // ---- what was not followed, named once -----------------------------------
+  const outside = [...(UNFOLLOWED.get(String(f.file_id)) ?? [])]
+  if (outside.length) {
+    note(`the converter reads only the file it is given and follows no link out of it: ${some(outside.map(([path, says]) => `${path} (${says})`))} ${outside.length > 1 ? 'are' : 'is'} not read`)
+  }
 
   return {
     format: 'h5ad', source: filename, nCells, columns, matrices, embeddings,
@@ -1177,17 +1074,17 @@ export async function scanH5ad(
   const path = `scan_${filename.replace(/[^\w.-]/g, '_')}`
   try { FS.unlink(path) } catch { /* first run */ }
   try {
-    FS.writeFile(path, bytes)
+    throughDoor(FS, () => FS.writeFile(path, bytes))
   } catch {
     throw new H5adError(
       `this .h5ad (${(bytes.length / 1e9).toFixed(1)} GB) would not fit in the reader's memory.`)
   }
-  return scanOpenH5ad(openOrFail(h5wasm, path), filename)
+  return scanOpenH5ad(openOrFail(h5wasm, FS, path), filename)
 }
 
-function openOrFail(h5wasm: H5Module, path: string): H5 {
+function openOrFail(h5wasm: H5Module, FS: H5, path: string): H5 {
   try {
-    return new h5wasm.File(path, 'r')
+    return openInput(h5wasm, FS, path)
   } catch {
     throw new H5adError('this file is not readable as HDF5. An .h5ad is an HDF5 file — if this came from Seurat, save it as .rds instead.')
   }
@@ -1295,6 +1192,6 @@ export async function scanH5adFile(h5wasm: H5Module, file: File): Promise<{
     throw new H5adError('a file this large can only be read inside a worker, and this is not one.')
   }
   const safe = file.name.replace(/[^\w.-]/g, '_')
-  const handle = openOrFail(h5wasm, mountBlockCached(FS, file, '/lazy', safe))
+  const handle = openOrFail(h5wasm, FS, mountBlockCached(FS, file, '/lazy', safe))
   return { scan: scanOpenH5ad(handle, file.name), handle }
 }

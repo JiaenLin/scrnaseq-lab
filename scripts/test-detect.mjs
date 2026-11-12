@@ -157,6 +157,11 @@ console.log('\nREPLICATES PER GROUP DECIDE WHETHER PSEUDOBULK IS OFFERED')
   check('without a sample column every group has one',
     replicatesPerCondition(undefined, c), { x: 1, y: 1 })
   check('without a condition there is nothing to count', replicatesPerCondition(s, undefined), {})
+  // A level is the object's own text. One named __proto__ set the counting
+  // object's prototype instead of a key, and that group dropped out.
+  const odd = categorical('c', ['__proto__', 'constructor', 'toString', '__proto__', 'constructor', 'toString'])
+  check('groups named __proto__, constructor and toString are each counted',
+    Object.entries(replicatesPerCondition(s, odd)).sort(), [['__proto__', 2], ['constructor', 2], ['toString', 2]])
 }
 
 console.log('\nGENE SETS ARE INTERNED BY CONTENT')
