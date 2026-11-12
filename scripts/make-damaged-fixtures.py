@@ -1,4 +1,4 @@
-"""Write three fixtures whose reads fail inside HDF5, made by h5py (the real writer). Every value is synthetic.
+"""Write four fixtures whose reads fail inside HDF5, made by h5py (the real writer). Every value is synthetic.
 
 - scripts/fixtures/damaged-reads.h5ad: family-2x2.h5ad with obsm/X_umap, X/data and obs/sample/codes rewritten
   gzip-compressed in small chunks, 8 bytes inside one chunk of each overwritten, and three embeddings whose stored
@@ -6,6 +6,7 @@
   two floats) and obsm/X_null (an empty dataspace).
 - scripts/fixtures/damaged-half.h5ad: nullable-mask.h5ad with obsm/X_umap, the embedding a guess takes first, stored
   as 16-bit floats, and obsm/X_tsne holding the same values as 32-bit floats.
+- scripts/fixtures/damaged-opaque.h5ad: the same, with obsm/X_umap stored as opaque 4-byte items instead.
 - scripts/fixtures/damaged-only-matrix.h5ad: nullable-mask.h5ad with X/data, its only matrix, damaged the same way.
 
 h5wasm hands back its buffer when such a read fails, so these are what the converter's one read is tested on.
@@ -73,9 +74,17 @@ with h5py.File(out, 'r+') as f:
     f['obsm'].create_dataset('X_umap', data=umap.astype('f2'))
     f['obsm'].create_dataset('X_tsne', data=umap)
 
+out = at('damaged-opaque.h5ad')
+shutil.copyfile(at('nullable-mask.h5ad'), out)
+with h5py.File(out, 'r+') as f:
+    umap = f['obsm/X_umap'][()]
+    del f['obsm/X_umap']
+    f['obsm'].create_dataset('X_umap', data=np.ascontiguousarray(umap).view('V4'))
+    f['obsm'].create_dataset('X_tsne', data=umap)
+
 out = at('damaged-only-matrix.h5ad')
 shutil.copyfile(at('nullable-mask.h5ad'), out)
 with h5py.File(out, 'r+') as f:
     rewrite(f, 'X/data', (10,))
 damage(out, 'X/data', 1)
-print('wrote damaged-reads.h5ad, damaged-half.h5ad and damaged-only-matrix.h5ad')
+print('wrote damaged-reads.h5ad, damaged-half.h5ad, damaged-opaque.h5ad and damaged-only-matrix.h5ad')

@@ -64,6 +64,7 @@ const FIX = {
   storedBin: here('./fixtures/stored-outside.bin'),
   damaged: here('./fixtures/damaged-reads.h5ad'),
   half: here('./fixtures/damaged-half.h5ad'),
+  opaque: here('./fixtures/damaged-opaque.h5ad'),
   onlyMatrix: here('./fixtures/damaged-only-matrix.h5ad'),
 }
 const BIN = here('../bin/scrnaseq-lab.mjs')
@@ -825,9 +826,14 @@ console.log('\nA READ HDF5 REPORTS AS FAILED IS NEVER USED AS VALUES')
   const h = convert(FIX.half, 'dmg-half.zip', ['--label', 'p'])
   const m = convert(FIX.mask, 'dmg-mask.zip', ['--label', 'p'])
   attempt('an embedding of 16-bit floats, the one a guess takes first, is named and left out; the conversion goes on with the next, the source\'s values',
-    () => [h.r.code, notesOf(h.o?.parts[0], /^obsm\/X_umap is stored as 16-bit floats, which this reader does not read; it is not offered/).length,
-      Object.keys(embOf(h.o?.parts[0])), embOf(h.o?.parts[0]).X_tsne === source(FIX.half, 'X_tsne'), embOf(m.o?.parts[0]).X_umap === source(FIX.half, 'X_tsne')],
+    () => (h.o ? [h.r.code, notesOf(h.o.parts[0], /^obsm\/X_umap is stored as 16-bit floats, which this reader does not read; it is not offered/).length,
+      Object.keys(embOf(h.o.parts[0])), embOf(h.o.parts[0]).X_tsne === source(FIX.half, 'X_tsne'), embOf(m.o?.parts[0]).X_umap === source(FIX.half, 'X_tsne')] : [h.r.code]),
     [0, 1, ['X_tsne'], true, true])
+  const op = convert(FIX.opaque, 'dmg-opaque.zip', ['--label', 'p'])
+  attempt('an embedding of opaque bytes, the one a guess takes first, is named and never offered: its bytes are never read as coordinates',
+    () => (op.o ? [op.r.code, notesOf(op.o.parts[0], /^obsm\/X_umap is stored as opaque bytes, not numbers; it is not offered/).length,
+      Object.keys(embOf(op.o.parts[0])), embOf(op.o.parts[0]).X_tsne === source(FIX.opaque, 'X_tsne')] : [op.r.code]),
+    [0, 1, ['X_tsne'], true])
 
   // The browser's worker reads through h5wasm's other build, with the File mounted as the worker mounts it.
   const esm = await tryImport('../node_modules/h5wasm/dist/esm/hdf5_hl.js')
@@ -838,15 +844,14 @@ console.log('\nA READ HDF5 REPORTS AS FAILED IS NEVER USED AS VALUES')
     const bytes = readFileSync(FIX.damaged)
     const r = await h5ad.scanH5adFile(esm.default ?? esm, { name: 'damaged-reads.h5ad', size: bytes.length, slice: (a, b) => ({ buf: bytes.subarray(a, b) }) })
     w = r.scan
+    // Loaded while the file is open: on 8b4997e an embedding was read only when loaded.
+    w.loaded = Object.fromEntries(w.embeddings.map(e => { const v = e.load(); return [e.key, sha256(new Uint8Array(v.buffer, v.byteOffset, v.byteLength))] }))
     r.handle.close()
   } catch (e) { w = { error: e.message } }
   attempt('in the browser build too: the same parts are named, none is offered, and an embedding carried is the source\'s values',
-    () => {
-      const none = w.embeddings.find(e => e.key === 'X_umap_none').load()
-      return [w.embeddings.map(e => e.key), w.matrices.map(x => x.key), w.unreadableColumns.map(u => u.name),
-        w.notes.filter(n => /^(X|obsm\/X_umap|obs\/sample) could not be read \(HDF5 could not read /.test(n)).length,
-        sha256(new Uint8Array(none.buffer, none.byteOffset, none.byteLength)) === source(FIX.classic, 'X_umap_none')]
-    }, [['X_harmony', 'X_none', 'X_pca', 'X_umap_harmony', 'X_umap_none'], ['layers["counts"]', 'layers["lognorm"]'], ['sample'], 3, true])
+    () => [w.embeddings.map(e => e.key), w.matrices.map(x => x.key), (w.unreadableColumns ?? []).map(u => u.name),
+      w.notes.filter(n => /^(X|obsm\/X_umap|obs\/sample) could not be read \(HDF5 could not read /.test(n)).length,
+      ['X_umap', 'X_umap_harmony', 'X_umap_none'].filter(k => k in w.loaded).every(k => w.loaded[k] === source(FIX.classic, k))], [['X_harmony', 'X_none', 'X_pca', 'X_umap_harmony', 'X_umap_none'], ['layers["counts"]', 'layers["lognorm"]'], ['sample'], 3, true])
 }
 
 console.log('\nA RECORD FOUND AND NOT LISTED IS COUNTED WHERE A READER OF THE BUNDLE LOOKS')
