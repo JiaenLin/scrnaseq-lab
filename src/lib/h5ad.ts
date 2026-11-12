@@ -60,7 +60,7 @@ const isDataset = (o: H5): boolean =>
 // does not follow, and one note in the bundle lists them.
 
 /** The seal on one h5wasm module's filesystem: how many inputs are open, and whether the door is. */
-interface Seal { inputs: number; door: boolean }
+interface Seal { inputs: number; door: boolean; plugins: Set<string> }
 const SEALS = new WeakMap<object, Seal>()
 
 /**
@@ -69,7 +69,10 @@ const SEALS = new WeakMap<object, Seal>()
  * h5wasm as whatever its buffer held, with no error. A refusal during a read is
  * the one sign that the values are not this file's.
  */
-const REFUSED = { opens: 0 }
+const REFUSED = { opens: 0, filters: 0 }
+
+/** What a dataset is, said, when HDF5 looked for its filter as a plugin: not values in another file. */
+const FILTERED = 'a dataset compressed with a filter this reader does not have, LZF for one: write the file again with gzip compression'
 
 /**
  * This filesystem's seal, put on at its first use: from then on, while an input
@@ -79,11 +82,14 @@ const REFUSED = { opens: 0 }
 function sealOf(FS: H5): Seal {
   let seal = SEALS.get(FS)
   if (!seal) {
-    const s: Seal = { inputs: 0, door: false }
+    const s: Seal = { inputs: 0, door: false, plugins: new Set() }
     const open = FS.open
     FS.open = function (this: unknown, ...args: unknown[]) {
       if (s.inputs > 0 && !s.door) {
         REFUSED.opens++
+        // HDF5 looks for a filter it lacks in its own plugin directories, through this open.
+        const at = String(args[0])
+        if ([...s.plugins].some(d => at === d || at.startsWith(`${d}/`))) REFUSED.filters++
         throw new FS.ErrnoError(2)
       }
       return open.apply(this, args)
@@ -112,6 +118,7 @@ export function openInput(h5wasm: H5Module, lib: H5Lib, path: string): H5 {
   guardReads(lib)
   const FS = lib.FS
   const s = sealOf(FS)
+  for (const d of lib.get_plugin_search_paths?.() ?? []) s.plugins.add(String(d))
   const f = throughDoor(FS, () => new h5wasm.File(path, 'r'))
   if (!(Number(f?.file_id) >= 0)) return f
   const id = String(f.file_id)
@@ -139,27 +146,29 @@ function elsewhere(d: H5): string | null {
 
 /**
  * Read one value of an array dataset, and say whether that read tried to open
- * another file: external raw storage, or a virtual source no mapping names.
- * One element is enough, since the first lies where the rest do.
+ * another file: external raw storage, or a virtual source no mapping names
+ * ('file'); or only HDF5's own plugin directories, looking for a filter it
+ * lacks ('filter'). One element is enough, since the first lies where the rest do.
  */
-function storedElsewhere(d: H5): boolean {
+function storedElsewhere(d: H5): 'file' | 'filter' | null {
   const shape = (d.shape as number[] | null) ?? []
-  if (!shape.length || shape.some(x => !(x > 0))) return false
+  if (!shape.length || shape.some(x => !(x > 0))) return null
   // h5wasm's slice of a variable-length type ran out of its memory, and the
   // scan reads those whole anyway. Raw values stored in another file have a
   // fixed size.
   try {
-    if (d.metadata?.vlen || d.metadata?.vlen_type) return false
+    if (d.metadata?.vlen || d.metadata?.vlen_type) return null
   } catch {
-    return false
+    return null
   }
-  const before = REFUSED.opens
+  const before = REFUSED.opens, filters = REFUSED.filters
   try {
     d.slice(shape.map(() => [0, 1]))
   } catch {
     // A read that fails for another reason is the reader's to report, later.
   }
-  return REFUSED.opens !== before
+  const refused = REFUSED.opens - before
+  return !refused ? null : refused === REFUSED.filters - filters ? 'filter' : 'file'
 }
 
 /** A scalar's value, read only from this file. */
@@ -190,7 +199,7 @@ function child(g: H5, name: string): H5 | null {
     const o = at.get(part)
     const says = o?.type === 'ExternalLink' ? 'an external link, which points outside this file'
       : o?.type === 'BrokenSoftLink' ? 'a soft link that reaches nothing in this file'
-        : isDataset(o) ? elsewhere(o) ?? (storedElsewhere(o) ? 'a dataset whose values are stored in another file' : null) : null
+        : isDataset(o) ? elsewhere(o) ?? { file: 'a dataset whose values are stored in another file', filter: FILTERED, none: null }[storedElsewhere(o) ?? 'none'] : null
     if (says) {
       UNFOLLOWED.get(String(at.file_id))?.set(`${at.path}/${part}`.replace(/^\/+/, ''), says)
       return null
@@ -212,7 +221,7 @@ interface Lost { name: string; why: string }
 /** Why a part the scan needs is missing, when it is something the converter did not follow. */
 function unfollowed(f: H5, path: string): string | null {
   const says = UNFOLLOWED.get(String(f.file_id))?.get(path)
-  return says ? `/${path} is ${says}, and the converter reads only the file it is given` : null
+  return says === FILTERED ? `/${path} is ${says}` : says ? `/${path} is ${says}, and the converter reads only the file it is given` : null
 }
 
 /** BigInt64Array and friends do not coerce, so every read goes through here. */
@@ -268,6 +277,7 @@ export interface H5Lib {
   get_dataset_data: (...a: any[]) => number
   get_attribute_data: (...a: any[]) => number
   reclaim_vlen_memory: (...a: any[]) => number
+  get_plugin_search_paths?: () => string[]
 }
 
 const GUARDED = new WeakSet<object>()
@@ -339,10 +349,13 @@ function notNumbers(d: H5, integers = false): string | null {
 
 /** A read the bundle depends on: a failed one stops the conversion, saying what it was for. */
 function needed<T>(what: string, read: () => T): T {
+  const filters = REFUSED.filters
   try {
     return read()
   } catch (e) {
-    if (e instanceof UnreadableError) throw new H5adError(`${what} cannot be read, so the conversion stops: ${e.message}`)
+    // HDF5 looked for a filter it lacks during the read: say which way forward there is.
+    const why = e instanceof UnreadableError && REFUSED.filters !== filters ? `; ${e.what} is ${FILTERED}` : ''
+    if (e instanceof UnreadableError) throw new H5adError(`${what} cannot be read, so the conversion stops: ${e.message}${why}`)
     throw e
   }
 }
@@ -1289,7 +1302,12 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
   const run = readRun(uns, note)
 
   // ---- what was not followed, named once -----------------------------------
-  const outside = [...(UNFOLLOWED.get(String(f.file_id)) ?? [])]
+  const all = [...(UNFOLLOWED.get(String(f.file_id)) ?? [])]
+  const outside = all.filter(([, says]) => says !== FILTERED)
+  const filtered = all.filter(([, says]) => says === FILTERED).map(([path]) => shown(path))
+  if (filtered.length) {
+    note(`${some(filtered)} ${filtered.length > 1 ? 'are datasets' : 'is a dataset'} compressed with a filter this reader does not have, LZF for one, so ${filtered.length > 1 ? 'they are' : 'it is'} not read: write the file again with gzip compression`)
+  }
   if (outside.length) {
     note(`the converter reads only the file it is given and follows no link out of it: ${some(outside.map(([path, says]) => `${shown(path)} (${says})`))} ${outside.length > 1 ? 'are' : 'is'} not read`)
   }

@@ -66,6 +66,9 @@ const FIX = {
   half: here('./fixtures/damaged-half.h5ad'),
   opaque: here('./fixtures/damaged-opaque.h5ad'),
   onlyMatrix: here('./fixtures/damaged-only-matrix.h5ad'),
+  indptr: here('./fixtures/damaged-indptr.h5ad'),
+  lzfCodes: here('./fixtures/lzf-codes.h5ad'),
+  lzfGenes: here('./fixtures/lzf-genes.h5ad'),
 }
 const BIN = here('../bin/scrnaseq-lab.mjs')
 const tmp = mkdtempSync(join(tmpdir(), 'lab-integrity-test-'))
@@ -879,6 +882,11 @@ console.log('\nA READ HDF5 REPORTS AS FAILED IS NEVER USED AS VALUES')
   const only = convert(FIX.onlyMatrix, 'dmg-only.zip', ['--label', 'p'])
   attempt('when the matrix HDF5 cannot read is the only one, the conversion stops and names it',
     () => [only.r.code, /no matrix in this object can be read, so the conversion stops: X \(HDF5 could not read X\/data /.test(only.r.err)], [3, true])
+  // The split reads the first matrix's row lengths whole, after the scan: on
+  // f2ee369 a failed read there was an internal error with a trace (exit 1).
+  const ip = convert(FIX.indptr, 'dmg-indptr.zip', ['--label', 'p'])
+  attempt('a row-pointer array HDF5 cannot read stops the conversion as the input\'s error, naming it: exit 3, no trace',
+    () => [ip.r.code, /^scrnaseq-lab: X cannot be read, so the conversion stops: HDF5 could not read X\/indptr /m.test(ip.r.err), /internal error|\n\s+at /.test(ip.r.err)], [3, true, false])
   const h = convert(FIX.half, 'dmg-half.zip', ['--label', 'p'])
   const m = convert(FIX.mask, 'dmg-mask.zip', ['--label', 'p'])
   attempt('an embedding of 16-bit floats, the one a guess takes first, is named and left out; the conversion goes on with the next, the source\'s values',
@@ -934,6 +942,25 @@ console.log('\nA RECORD FOUND AND NOT LISTED IS COUNTED WHERE A READER OF THE BU
     () => [cut.r.code, runOf(cut)?.records, notesOf(cut.o?.parts[0], /^uns\/a_provenance:/), ['CUT-COMMIT', 'CUT-JOB'].filter(t => bundleText(cut.o).includes(t))],
     [0, [{ path: 'uns/a_provenance', record: { tool: 'CUT-TOOL' } }],
       ['uns/a_provenance: run carries its tool; not carried: version (a string longer than 256 characters), commit (not read: it comes after that string) and job (not read: it comes after that string)'], []])
+}
+
+console.log('\nA DATASET COMPRESSED WITH A FILTER THIS READER LACKS IS SAID AS THAT, WITH THE WAY FORWARD')
+{
+  // scripts/fixtures/lzf-*.h5ad, LZF-compressed by h5py: HDF5 looks for the
+  // filter in its own plugin directory, and the seal refuses that open. On
+  // f2ee369 each was said to be values stored in another file, false, with no
+  // way forward to keep the part.
+  const FWD = 'write the file again with gzip compression'
+  const g = convert(FIX.lzfGenes, 'lzf-genes.zip', ['--label', 'p'])
+  const c = convert(FIX.lzfCodes, 'lzf-codes.zip', ['--label', 'p'])
+  const n = convert(FIX.lzfCodes, 'lzf-codes-none.zip', ['--label', 'p', '--sample', 'none'])
+  attempt('gene names compressed with LZF stop the conversion, said as a filter this reader does not have, with the way forward',
+    () => [g.r.code, g.r.err.includes(`var/_index is a dataset compressed with a filter this reader does not have, LZF for one: ${FWD}`)], [3, true])
+  attempt('sample codes compressed with LZF stop a guessed conversion, said as that, never as stored in another file',
+    () => [c.r.code, c.r.err.includes(`obs/sample/codes is a dataset compressed with a filter this reader does not have, LZF for one: ${FWD}`), /stored in another file/.test(c.r.err)], [3, true, false])
+  attempt("with --sample none it converts, and the bundle's note says the same",
+    () => [n.r.code, notesOf(n.o?.parts[0], new RegExp(`^obs/sample/codes is a dataset compressed with a filter this reader does not have, LZF for one, so it is not read: ${FWD}$`)).length,
+      notesOf(n.o?.parts[0], /stored in another file/).length], [0, 1, 0])
 }
 
 console.log('\nA NAME FROM THE INPUT IS CUT IN A NOTE OR A LIST, SO META.JSON STAYS SMALL')

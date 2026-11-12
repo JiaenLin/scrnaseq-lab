@@ -1,4 +1,4 @@
-"""Write four fixtures whose reads fail inside HDF5, made by h5py (the real writer). Every value is synthetic.
+"""Write seven fixtures whose reads fail inside HDF5, made by h5py (the real writer). Every value is synthetic.
 
 - scripts/fixtures/damaged-reads.h5ad: family-2x2.h5ad with obsm/X_umap, X/data and obs/sample/codes rewritten
   gzip-compressed in small chunks, 8 bytes inside one chunk of each overwritten, and three embeddings whose stored
@@ -8,6 +8,10 @@
   as 16-bit floats, and obsm/X_tsne holding the same values as 32-bit floats.
 - scripts/fixtures/damaged-opaque.h5ad: the same, with obsm/X_umap stored as opaque 4-byte items instead.
 - scripts/fixtures/damaged-only-matrix.h5ad: nullable-mask.h5ad with X/data, its only matrix, damaged the same way.
+- scripts/fixtures/damaged-indptr.h5ad: family-2x2.h5ad with X/indptr, the row pointers the split reads whole,
+  rewritten in chunks of 60 and damaged the same way in its third chunk (the scan's sample reads only the first).
+- scripts/fixtures/lzf-codes.h5ad and lzf-genes.h5ad: family-2x2.h5ad with obs/sample/codes, and with var/_index,
+  written again LZF-compressed (h5py's own filter, which this reader does not have).
 
 h5wasm hands back its buffer when such a read fails, so these are what the converter's one read is tested on.
 Each damaged dataset is checked here to be unreadable by h5py itself.
@@ -27,12 +31,12 @@ def at(name):
     return os.path.join(HERE, name)
 
 
-def rewrite(f, path, chunks):
-    """The dataset at `path`, written again gzip-compressed in chunks of `chunks`, its attributes kept."""
+def rewrite(f, path, chunks, compression='gzip'):
+    """The dataset at `path`, written again compressed (gzip unless said) in chunks of `chunks`, its attributes kept."""
     old = f[path]
     values, attrs = old[()], dict(old.attrs)
     del f[path]
-    d = f.create_dataset(path, data=values, compression='gzip', chunks=chunks)
+    d = f.create_dataset(path, data=values, compression=compression, chunks=chunks)
     for k, v in attrs.items():
         d.attrs[k] = v
 
@@ -87,4 +91,14 @@ shutil.copyfile(at('nullable-mask.h5ad'), out)
 with h5py.File(out, 'r+') as f:
     rewrite(f, 'X/data', (10,))
 damage(out, 'X/data', 1)
-print('wrote damaged-reads.h5ad, damaged-half.h5ad, damaged-opaque.h5ad and damaged-only-matrix.h5ad')
+out = at('damaged-indptr.h5ad')
+shutil.copyfile(at('family-2x2.h5ad'), out)
+with h5py.File(out, 'r+') as f:
+    rewrite(f, 'X/indptr', (60,))
+damage(out, 'X/indptr', 2)
+for name, src, path, chunks in (('lzf-codes.h5ad', 'family-2x2.h5ad', 'obs/sample/codes', (60,)), ('lzf-genes.h5ad', 'family-2x2.h5ad', 'var/_index', (16,))):
+    out = at(name)
+    shutil.copyfile(at(src), out)
+    with h5py.File(out, 'r+') as f:
+        rewrite(f, path, chunks, 'lzf')
+print('wrote damaged-reads.h5ad, damaged-half.h5ad, damaged-opaque.h5ad, damaged-only-matrix.h5ad, damaged-indptr.h5ad, lzf-codes.h5ad and lzf-genes.h5ad')

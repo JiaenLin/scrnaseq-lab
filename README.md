@@ -180,9 +180,10 @@ read as absent and named once, in one note, by its own place in the file and wha
 link points to is never carried, since its target can be a path on the machine that wrote the
 file: an external link, whatever file it names (the input's own name included), a soft link that
 reaches nothing in the file, a virtual dataset whose values lie in another file, and a dataset whose values are
-stored in another file (one value of each array is read first to tell; a dataset compressed with
-a filter this reader lacks, such as LZF, is named this way too, since HDF5 looks for the filter
-as a file). This holds for the
+stored in another file (one value of each array is read first to tell). HDF5 looks for a filter it lacks,
+such as LZF, in its own plugin directory, through the same refused open: a dataset compressed with one
+is named as such, with the way forward (write the file again with gzip compression), never as values
+stored elsewhere. This holds for the
 observations, the variables, the matrix and its layers, the embeddings and `uns` alike, so the
 same input gives the same bundle, whatever sits beside it. An ordinary soft or hard link inside
 the file still reads.

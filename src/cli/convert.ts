@@ -177,7 +177,12 @@ export async function convert(a: ConvertArgs, say: (line: string) => void): Prom
     // the interactions are added, so that it never cuts along a column the
     // object did not have.
     const measurable = scan.matrices.find(m => m.nnzPerCell)
-    const split = chooseSplit(scan.columns, measurable?.nnzPerCell ? measurable.nnzPerCell() : null, scan.nCells)
+    // Its row lengths are read here, whole: one HDF5 cannot read is the input's
+    // error, named like any other, not the command's.
+    const lengths = (() => {
+      try { return measurable?.nnzPerCell ? measurable.nnzPerCell() : null } catch (e) { throw classify(e) }
+    })()
+    const split = chooseSplit(scan.columns, lengths, scan.nCells)
     scan.columns.push(...r.added)
     scan.notes.push(...r.notes)
 
