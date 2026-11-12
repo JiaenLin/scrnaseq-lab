@@ -1,12 +1,11 @@
 import { useMemo } from 'react'
 import {
-  candidates, column, crossCheck, duplicateOf, geneNameKind, replicatesPerCondition,
+  candidates, column, crossCheck, duplicateOf, geneNameKind,
   samePartition, unusable,
   type Choices, type Column, type Role, type ScanInfo,
 } from '../lib/scan.ts'
+import { pageSays, plan } from '../lib/plan.ts'
 import { Card, Field, LevelBar, Mono } from './Ui.tsx'
-
-const MIN_REPS_PB = 4
 
 const counts = (c: Column): number[] => {
   const out = new Array(c.levels.length).fill(0)
@@ -184,12 +183,10 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
   const sampleCol = column(scan, choices.sample)
   const condCol = column(scan, choices.condition)
   const clash = crossCheck(sampleCol, condCol)
-  const reps = replicatesPerCondition(sampleCol, condCol)
-  const repValues = Object.values(reps)
-  const pbOK = condCol != null && repValues.length > 1 &&
-    repValues.every(v => v >= MIN_REPS_PB)
-
-  const hasCounts = scan.matrices.some(m => m.kind === 'counts' || m.kind === 'log-counts')
+  // Every sentence below about what the bundle will hold is the plan's, and the
+  // command and the worker run that plan (lib/plan.ts): what travels, whether
+  // the raw counts do, whether pseudobulk will be possible, the parts.
+  const says = useMemo(() => pageSays(plan(scan, choices)), [scan, choices])
   const usableMatrix = scan.matrices.some(m => m.kind !== 'scaled')
 
   // How the genes are named, and whether the other naming was found. An atlas
@@ -279,7 +276,7 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
             (a PCA, a corrected PCA) and byte copies are not offered beside it,
             and the notes say which; choosing one here draws its first two
             columns. */}
-        <Field label="Embedding" hint="Which one the studio opens on. The other two-column ones travel in the file too, each once.">
+        <Field label="Embedding" hint="Which one the studio opens on.">
           <div className="seg">
             {scan.embeddings.map(e => (
               <button key={e.key} className={e.key === choices.embedding ? 'sel' : ''}
@@ -293,12 +290,10 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
               No 2D embedding in this object. Run a UMAP before converting.
             </div>
           )}
-          {/pca/i.test(choices.embedding) && (
-            <p className="sub mt-2">Principal components only — a coarser picture than a UMAP.</p>
-          )}
-          {scan.embeddings.length > 1 && (
-            <p className="sub mt-2">
-              All {scan.embeddings.length} travel in the file; the studio can switch between them.
+          {choices.embedding && says.wide && <p className="sub mt-2">{says.wide}</p>}
+          {choices.embedding && (
+            <p className="sub mt-2" data-says="travel">
+              {says.travel}{says.notOffered ? ` ${says.notOffered}` : ''}
             </p>
           )}
         </Field>
@@ -354,24 +349,27 @@ export default function Review({ scan, choices, setChoices, onBuild, busy, stage
                 </td>
               </tr>
               <tr>
-                <td className="font-semibold">Pseudobulk DESeq2</td>
+                <td className="font-semibold">Raw counts</td>
                 <td>
-                  <span className={`badge ${pbOK && hasCounts ? 'badge-here' : 'badge-none'}`}>
-                    {pbOK && hasCounts ? 'yes' : 'no'}
+                  <span className={`badge ${says.counts.startsWith('Raw counts travel') ? 'badge-here' : 'badge-none'}`}>
+                    {says.counts.startsWith('Raw counts travel') ? 'yes' : 'no'}
                   </span>
                 </td>
-                <td style={{ color: 'var(--ink-2)' }}>
-                  {!hasCounts
-                    ? 'this object carries no raw counts to sum'
-                    : !condCol ? 'needs a condition to compare'
-                    : repValues.length < 2 ? 'needs at least two groups'
-                    : pbOK ? `${repValues.join(' v ')} samples per group`
-                    : `${repValues.join(' v ')} samples per group — fewer than ${MIN_REPS_PB}, so only the per-cell Wilcoxon is offered`}
+                <td style={{ color: 'var(--ink-2)' }} data-says="counts">{says.counts}</td>
+              </tr>
+              <tr>
+                <td className="font-semibold">Pseudobulk DESeq2</td>
+                <td>
+                  <span className={`badge ${says.pseudobulk.yes ? 'badge-here' : 'badge-none'}`}>
+                    {says.pseudobulk.yes ? 'yes' : 'no'}
+                  </span>
                 </td>
+                <td style={{ color: 'var(--ink-2)' }} data-says="pseudobulk">{says.pseudobulk.because}</td>
               </tr>
             </tbody>
           </table>
         </div>
+        {says.parts && <p className="sub mt-2.5" data-says="parts">{says.parts}</p>}
         <p className="sub mt-2.5">
           Matrices: {scan.matrices.map(m => `${m.key} (${m.kind})`).join(', ')} — the converter
           takes the log-normalized one or builds it from counts, never <Mono>scaled</Mono>.

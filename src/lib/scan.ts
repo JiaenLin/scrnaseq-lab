@@ -3,6 +3,7 @@
 // Both readers produce this and nothing else, so everything downstream — the
 // questions, the warnings, the builder — is written once against one shape.
 
+import type { By, Sources } from './facts.ts'
 import type { CellMajor, MatrixKind } from './matrix.ts'
 
 /** One column of obs / meta.data, already reduced to codes and levels. */
@@ -57,6 +58,13 @@ export interface MatrixRef {
    * and finishes in about a minute. So everything here is sequential.
    */
   loadGroups?: (groups: Int32Array[], onProgress?: (frac: number) => void) => CellMajor[]
+  /**
+   * Whole rows of some cells, run by run (`[first, past-the-last)`): what the
+   * per-cell totals behind the expression are measured on (plan.ts), without
+   * reading the matrix. Only where rows are stored together: a CSR matrix or a
+   * dense one.
+   */
+  readRuns?: (runs: [number, number][]) => CellMajor
 }
 
 export interface EmbeddingRef {
@@ -147,8 +155,10 @@ export interface ScanInfo {
   source: string
   nCells: number
   columns: Column[]
-  matrices: { key: string; geneSet: string; nGenes: number; nCells: number; kind: MatrixKind }[]
-  embeddings: { key: string; nDims: number }[]
+  /** `covered` (the share of genes it reaches) and `streamable`, measured for the plan (plan.ts, planInfo). */
+  matrices: { key: string; geneSet: string; nGenes: number; nCells: number; kind: MatrixKind; covered?: number; streamable?: boolean }[]
+  /** `same`: the first embedding whose two columns are these, bit for bit (plan.ts). */
+  embeddings: { key: string; nDims: number; same?: string }[]
   geneSets: Record<string, string[]>
   /** The other naming of a gene set's rows, keyed the same way as `geneSets`. */
   geneAliases: Record<string, GeneAlias>
@@ -176,6 +186,12 @@ export interface Scan {
    * which always looks; absent from a Seurat scan, which has no uns to look in.
    */
   run?: RunSection
+  /**
+   * The facts read from the object's own records, each at its place or not
+   * recorded (facts.ts). Set by the .h5ad reader; absent from a Seurat scan,
+   * whose records are not read, so no such fact is stated.
+   */
+  recorded?: Sources['recorded']
   /** Everything the reader had to decide, in the order it decided it. */
   notes: string[]
   /**
@@ -214,6 +230,13 @@ export interface Choices {
    * then the bundle has no `sentinels` field at all.
    */
   sentinels?: string[]
+  /**
+   * Who chose the cell type column, the embedding that opens and the cells not
+   * called: a flag, the command's guess, the lab's page. Written into the
+   * bundle's facts with each choice; a choice whose chooser is not given is
+   * stated as no fact.
+   */
+  by?: { cluster?: By; embedding?: By; sentinels?: By }
 }
 
 // ---------------------------------------------------------------------------
@@ -531,6 +554,13 @@ function spread(names: string[], want: number): string[] {
  * references do exist, and calling one of those "symbols" would make every
  * gene-set lookup half-miss with no explanation.
  */
+/** How many of the names are accessions, every name read: the gene_ids fact (plan.ts). */
+export function geneAccessions(names: string[]): number {
+  let n = 0
+  for (const g of names) if (ACCESSION_RE.test(g)) n++
+  return n
+}
+
 export function geneNameKind(names: string[]): GeneIdKind {
   const s = spread(names.filter(n => n.length > 0), 4000)
   if (!s.length) return 'mixed'

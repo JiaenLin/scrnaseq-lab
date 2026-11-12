@@ -22,6 +22,12 @@ export interface ConvertArgs {
   /** Repeatable. `['none']` marks no level as a sentinel. */
   sentinels?: string[]
   help?: boolean
+  /**
+   * The most stored values one part holds. Never parsed from the command line:
+   * set only by a test or a proof script, to split a small object as a large
+   * one is split (lib/plan.ts, lib/shard.ts).
+   */
+  splitAt?: number
 }
 
 const SINGLE = ['cluster', 'sample', 'condition', 'embedding', 'label'] as const

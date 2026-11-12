@@ -14,8 +14,16 @@ import {
 } from './matrix.ts'
 import {
   column, geneNameKind,
-  type Choices, type Column, type EmbeddingRef, type GeneIdKind, type MatrixRef, type RunSection, type Scan,
+  type Choices, type Column, type GeneIdKind, type MatrixRef, type RunSection, type Scan,
 } from './scan.ts'
+import {
+  FactError, factsOf, measured, notRecorded, placeOf, recorded,
+  type Fact, type MetaFacts,
+} from './facts.ts'
+import {
+  COVERAGE_FLOOR, choiceOf, measureExpression, measureObject, pickMatrices, plan, planInfo, rowsOf, sampleRuns,
+  type Measurements, type Plan, type PlanInfo,
+} from './plan.ts'
 
 export const SCHEMA = 'scrnaseq-studio/bundle@1'
 
@@ -148,6 +156,13 @@ export interface BundleMeta {
   chunkGenes: number
   provenance: Record<string, string | null>
   /**
+   * What the bundle states about its object, each with its source: recorded
+   * (with its place), measured (of what, and how) or chosen (by whom). Written
+   * only by walking the table in facts.ts; the ids and shapes are the Studio's
+   * (its tools/BUNDLE.md, "facts"). bundle@1 readers ignore it.
+   */
+  facts?: MetaFacts
+  /**
    * The run's identity, not its record: from each record the object's uns holds
    * (a tool's provenance, the harness's run record), the fields tool, version,
    * commit, stage, run_key and job it stores as strings of 256 characters or
@@ -186,8 +201,6 @@ type Progress = (stage: string) => void
  * velocity model's output — holds values in exactly 2 000 of 31 053 genes, 6%,
  * while `X` reaches most of the list.
  */
-const COVERAGE_FLOOR = 0.25
-
 /**
  * Drop matrices that only ever touch a corner of the gene list.
  *
@@ -228,17 +241,30 @@ export function chooseMatrices(scan: Scan, note: (s: string) => void): {
   counts: CellMajor | null
   geneSet: string
   expression: string
+  /** The matrices by their keys in the object, and what the expression was made from. */
+  displayKey: string
+  countsKey: string | null
+  from: 'lognorm' | 'counts' | 'log-counts' | 'linear'
 } {
   const kinds = usableCoverage(scan.matrices, note)
   for (const m of kinds) note(`${m.key} looks like ${m.kind}`)
 
   const first = (k: MatrixKind): MatrixRef | undefined => kinds.find(m => m.kind === k)
 
+  // The plan's rule (plan.ts, pickMatrices) decides; this loads what it decided.
+  const decided = pickMatrices(kinds)
+  const agree = (key: string, cKey: string | null) => {
+    if (decided.display?.key !== key || (decided.counts?.key ?? null) !== cKey) {
+      throw new BuildError(`the plan and the build chose different matrices (${decided.display?.key} and ${key}): this is a bug in the converter`)
+    }
+  }
+
   // Raw counts, recovered if they are only hiding behind a log.
   let counts: CellMajor | null = null
   let countsSet: string | null = null
   const asCounts = first('counts')
   const asLogCounts = first('log-counts')
+  const countsRef = asCounts ?? asLogCounts
   if (asCounts) {
     counts = asCounts.load()
     countsSet = asCounts.geneSet
@@ -258,18 +284,24 @@ export function chooseMatrices(scan: Scan, note: (s: string) => void): {
       note('the raw counts index a different gene list from the expression matrix; pseudobulk disabled rather than mismatched')
       counts = null
     }
-    return { display, counts, geneSet: asLognorm.geneSet, expression: 'log1p(CP10K)' }
+    agree(asLognorm.key, counts ? countsRef!.key : null)
+    return { display, counts, geneSet: asLognorm.geneSet, expression: 'log1p(CP10K)',
+      displayKey: asLognorm.key, countsKey: counts ? countsRef!.key : null, from: 'lognorm' }
   }
 
   if (counts && countsSet) {
     note('expression computed here as log1p(CP10K) from the counts')
-    return { display: lognormalize(counts), counts, geneSet: countsSet, expression: 'log1p(CP10K)' }
+    agree(countsRef!.key, countsRef!.key)
+    return { display: lognormalize(counts), counts, geneSet: countsSet, expression: 'log1p(CP10K)',
+      displayKey: countsRef!.key, countsKey: countsRef!.key, from: countsRef!.kind as 'counts' | 'log-counts' }
   }
 
   const asLinear = first('linear')
   if (asLinear) {
     note(`${asLinear.key} is normalized but not logged; log1p applied`)
-    return { display: log1p(asLinear.load()), counts: null, geneSet: asLinear.geneSet, expression: 'log1p(CP10K)' }
+    agree(asLinear.key, null)
+    return { display: log1p(asLinear.load()), counts: null, geneSet: asLinear.geneSet, expression: 'log1p(normalized)',
+      displayKey: asLinear.key, countsKey: null, from: 'linear' }
   }
 
   throw new BuildError(
@@ -469,15 +501,6 @@ export function oneConditionPerSample(scan: Scan, choices: Choices): Scan {
   }
 }
 
-/** The same float32 values, bit for bit — what the bundle would store twice. */
-function sameCoordinates(a: Float32Array, b: Float32Array): boolean {
-  if (a.length !== b.length) return false
-  const x = new Uint32Array(a.buffer, a.byteOffset, a.length)
-  const y = new Uint32Array(b.buffer, b.byteOffset, b.length)
-  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false
-  return true
-}
-
 /** An entry name that survives a zip and a file system. */
 const safeEntry = (s: string) =>
   (s || 'x').replace(/[^\w.-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || 'x'
@@ -513,23 +536,42 @@ function alignAlias(genes: string[], alias: { names: string[] }): {
   return { names, missing, duplicated }
 }
 
-/** A numeric obs column by any of several conventional names. */
-function qcColumn(scan: Scan, names: string[]): Float32Array | null {
+/** A numeric obs column at one of several conventional keys: read there, and named. */
+function qcColumn(scan: Scan, names: string[]): { name: string; values: Float32Array } | null {
   for (const n of names) {
     const c = scan.columns.find(x => x.name.toLowerCase() === n.toLowerCase())
-    if (c?.kind === 'numeric' && c.values.length === scan.nCells) return c.values
+    if (c?.kind === 'numeric' && c.values.length === scan.nCells) return { name: c.name, values: c.values }
   }
   return null
 }
 
+/** A fact, or none and a note when the object's own text cannot be carried as one line. */
+function factOr(make: () => Fact, note: (s: string) => void, what: string): Fact | undefined {
+  try {
+    return make()
+  } catch (e) {
+    if (e instanceof FactError) { note(`${what} is not one line of text a reader can show, so the bundle states no fact for it`); return undefined }
+    throw e
+  }
+}
+
+/** The plan and the whole object's measurements, made here when the caller did not (a whole object). */
+export function planOf(scan: Scan, choices: Choices): { plan: Plan; measured: Measurements } {
+  const p = plan({ nCells: scan.nCells, columns: scan.columns, ...planInfo(scan, null) } as PlanInfo, choices)
+  return { plan: p, measured: measureObject(scan, p, choices) }
+}
+
 export function buildBundle(
   given: Scan, choices: Choices, onProgress: Progress = () => {},
+  /** The parent's plan and measurements: given for every part of a split, made here otherwise. */
+  ctx?: { plan: Plan; measured: Measurements },
 ): BuildResult {
   // A no-op on a part whose parent was already resolved; see the function.
   const scan = oneConditionPerSample(given, choices)
   const notes = [...scan.notes]
   const note = (s: string) => notes.push(s)
   const n = scan.nCells
+  const { plan: p, measured: ms } = ctx ?? planOf(scan, choices)
 
   const clusterCol = column(scan, choices.cluster)
   if (!clusterCol || clusterCol.kind !== 'categorical') {
@@ -537,7 +579,12 @@ export function buildBundle(
   }
 
   onProgress('Reading the expression matrix')
-  const { display, counts, geneSet, expression } = chooseMatrices(scan, note)
+  const { display, counts, geneSet, displayKey, countsKey, from } = chooseMatrices(scan, note)
+  if ((counts != null) !== p.carried) {
+    throw new BuildError('the plan and the build disagree on whether the raw counts travel: this is a bug in the converter')
+  }
+  const expr = ms.expression ?? measureExpression(from, displayKey, from === 'lognorm' ? rowsOf(display, sampleRuns(display.nCells)) : null)
+  const expression = expr.label
 
   const genes = scan.geneSets[geneSet]
   if (!genes) throw new BuildError('the chosen matrix has no gene names')
@@ -621,9 +668,8 @@ export function buildBundle(
   if (!emb) throw new BuildError(`no embedding called "${choices.embedding}" in this object`)
   onProgress('Reading the embedding')
   const xy = emb.load()
-  if (/pca/i.test(emb.key)) {
-    note('using the first two principal components, which is a much coarser picture than a UMAP')
-  } else if (emb.nDims > 2) {
+  // Said from its width, never from its name: a key holding "pca" is not a record of a PCA.
+  if (emb.nDims > 2) {
     note(`${emb.key} has ${emb.nDims} columns and only its first two are drawn: the first two dimensions of a latent space, a much coarser picture than a UMAP`)
   }
 
@@ -639,14 +685,11 @@ export function buildBundle(
   // coordinates, so every part of a split decides the same way. The chosen one
   // stays first and stays in `embed.f32`, so a reader that knows nothing about
   // this sees no change at all.
+  // Which travel is the plan's (plan.ts): copies were found there, on the whole
+  // object's coordinates, before any part was cut.
   const embedFiles: EmbeddingEntry[] = [{ key: emb.key, file: 'embed.f32' }]
   const extraXY: { file: string; xy: Float32Array }[] = []
   const usedNames = new Set(['embed.f32'])
-  const offered: { key: string; at: Float32Array }[] = []
-  const wholeOf = (e: EmbeddingRef) => (e.whole ? e.whole() : e.load())
-  try {
-    offered.push({ key: emb.key, at: wholeOf(emb) })
-  } catch { /* then nothing is compared against the default */ }
   const latent: string[] = []
   const copies: string[] = []
   for (const e of scan.embeddings) {
@@ -655,12 +698,15 @@ export function buildBundle(
       latent.push(`${e.key} (${e.nDims} columns)`)
       continue
     }
+    const twin = p.embeddings.copies.find(c => c.key === e.key)
+    if (twin) {
+      copies.push(`${e.key} (the same coordinates as ${twin.of})`)
+      continue
+    }
     onProgress(`Reading the ${e.key} embedding`)
     let coords: Float32Array
-    let at: Float32Array
     try {
       coords = e.load()
-      at = e.whole ? e.whole() : coords
     } catch (err) {
       // One unreadable extra embedding must not lose the conversion: the
       // default one is already in hand and is what the studio opens with.
@@ -671,12 +717,6 @@ export function buildBundle(
       note(`${e.key} has ${coords.length / 2} points for ${n} cells; it is not in the bundle`)
       continue
     }
-    const twin = offered.find(o => sameCoordinates(o.at, at))
-    if (twin) {
-      copies.push(`${e.key} (the same coordinates as ${twin.key})`)
-      continue
-    }
-    offered.push({ key: e.key, at })
     let file = `embed.${safeEntry(e.key)}.f32`
     for (let i = 2; usedNames.has(file); i++) file = `embed.${safeEntry(e.key)}-${i}.f32`
     usedNames.add(file)
@@ -694,6 +734,10 @@ export function buildBundle(
     note(`not offered as embeddings: ${why}.${latent.length ? ' A latent space can still be chosen as the one that opens first, and is then drawn by its first two columns' : ''}`)
   }
 
+  // What was measured on the whole object (plan.ts): the counts left out, the
+  // cells not called and their coordinates. The same in every part.
+  for (const s of ms.notes) note(s)
+
   // The run's identity, read from uns by the reader. Said in the notes too,
   // because the notes are what the studio shows.
   if (scan.run) {
@@ -705,9 +749,29 @@ export function buildBundle(
 
   // ---- QC ---------------------------------------------------------------
   onProgress('Computing QC')
-  let total = qcColumn(scan, ['n_counts', 'total_counts', 'nCount_RNA'])
-  let nGene = qcColumn(scan, ['n_genes', 'n_genes_by_counts', 'nFeature_RNA'])
-  let mito = qcColumn(scan, ['percent_mito', 'pct_counts_mt', 'percent.mt', 'percent_mt'])
+  const MITO = ['percent_mito', 'pct_counts_mt', 'percent.mt', 'percent_mt']
+  const totalCol = qcColumn(scan, ['n_counts', 'total_counts', 'nCount_RNA'])
+  const nGeneCol = qcColumn(scan, ['n_genes', 'n_genes_by_counts', 'nFeature_RNA'])
+  const mitoCol = qcColumn(scan, MITO)
+  let total = totalCol?.values ?? null
+  let nGene = nGeneCol?.values ?? null
+  let mito = mitoCol?.values ?? null
+
+  // A total is of counts only when it is summed from the matrix measured to
+  // hold them; otherwise it names the matrix it was summed from.
+  const summed = placeOf(countsKey ?? displayKey)
+  const after = countsKey && from === 'log-counts' ? ', after expm1 of its stored log1p(counts)' : ''
+  const qcFacts = {
+    total: totalCol
+      ? factOr(() => recorded(totalCol.name, `obs/${totalCol.name}`), note, `the total column's name`)
+      : measured(null, summed, `summed per cell over every gene${after}`),
+    genes_detected: nGeneCol
+      ? factOr(() => recorded(nGeneCol.name, `obs/${nGeneCol.name}`), note, `the detected-gene column's name`)
+      : measured(null, summed, 'values above zero counted per cell'),
+    mito: mitoCol
+      ? factOr(() => recorded(mitoCol.name, `obs/${mitoCol.name}`), note, `the mitochondrial column's name`)
+      : notRecorded(MITO.map(k => `obs/${k}`).join(', ')),
+  }
 
   if (!total || !nGene) {
     const q = cellQC(counts ?? display)
@@ -813,6 +877,21 @@ export function buildBundle(
       condition: condCol?.kind === 'categorical' ? condCol.name : null,
       sample: sampleCol?.kind === 'categorical' ? sampleCol.name : null,
     },
+    // Walked from the table in facts.ts, never written by hand.
+    facts: factsOf({
+      recorded: scan.recorded,
+      measured: {
+        expression: expr.fact, counts: ms.counts, ...qcFacts,
+        ...(ms.gene_ids ? { gene_ids: ms.gene_ids } : {}),
+      },
+      chosen: {
+        cell_type_column: choiceOf(choices.cluster, choices.by?.cluster, note, 'the cell type column'),
+        embedding: choiceOf(choices.embedding, choices.by?.embedding, note, 'the embedding'),
+        ...(choices.sentinels
+          ? { not_called: choiceOf(choices.sentinels.length ? choices.sentinels.join(', ') : null, choices.by?.sentinels, note, 'the labels of the cells not called') }
+          : {}),
+      },
+    }),
     ...(scan.run ? { run: scan.run } : {}),
     notes,
   }

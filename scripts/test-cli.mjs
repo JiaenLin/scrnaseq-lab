@@ -362,7 +362,19 @@ matches('which embedding opens first', r5.err, /^guessed --embedding X_umap\b/m)
 matches('which labels are sentinels', r5.err, /^guessed --sentinel EXCLUDED --sentinel UNRESOLVED\b/m)
 attempt('the summary lists what was guessed', () => r5.summary.guessed,
   ['cluster', 'sample', 'condition', 'extra', 'interaction', 'embedding', 'sentinel'])
-attempt('the guesses are exactly the explicit flags: the same bytes', () => r5.summary.sha256, r1.summary?.sha256)
+// The bundle's facts say who chose each role (W064): "guess" here, "flag" there.
+// Everything else is the same bytes.
+attempt('the guesses are exactly the explicit flags: the same bytes, but for who chose', () => {
+  const part = (p) => {
+    const c = unzipSync(readFileSync(p))
+    return unzipSync(c[JSON.parse(strFromU8(c['collection.json'])).parts[0].file])
+  }
+  const a = part(OUT5), b = part(OUT1)
+  const meta = (f) => strFromU8(f['meta.json']).replaceAll('"by": "guess"', '"by": "flag"')
+  const differ = Object.keys(b).filter(k => k !== 'meta.json' && (!a[k] || Buffer.compare(a[k], b[k]) !== 0))
+  return [meta(a) === meta(b), differ, Object.keys(a).length === Object.keys(b).length,
+    strFromU8(a['meta.json']).split('"by": "guess"').length - 1]
+}, [true, [], true, 3])
 
 const OUT6 = join(tmp, 'named.zip')
 const r6 = cli(['convert', FIX.classic, OUT6, '--condition', 'factor_b', '--label', 'family'])

@@ -29,7 +29,8 @@ import { COLLECTION_SCHEMA, collectionPieces, type CollectionMeta, type PartInfo
 import { H5adError, openInput, scanOpenH5ad } from '../lib/h5ad.ts'
 import type { CellMajor } from '../lib/matrix.ts'
 import type { Scan } from '../lib/scan.ts'
-import { chooseSplit, shardScan } from '../lib/shard.ts'
+import { measureObject, plan, planInfo } from '../lib/plan.ts'
+import { shardScan } from '../lib/shard.ts'
 import type { ConvertArgs } from './args.ts'
 import { CliError, EXIT } from './errors.ts'
 import { resolveRoles } from './roles.ts'
@@ -182,7 +183,11 @@ export async function convert(a: ConvertArgs, say: (line: string) => void): Prom
     const lengths = (() => {
       try { return measurable?.nnzPerCell ? measurable.nnzPerCell() : null } catch (e) { throw classify(e) }
     })()
-    const split = chooseSplit(scan.columns, lengths, scan.nCells)
+    // One plan, the one the page shows (lib/plan.ts): split or not, the matrix
+    // read, what travels. Made on the object's own columns, before the
+    // interactions are added.
+    const p = plan({ nCells: scan.nCells, columns: [...scan.columns], ...planInfo(scan, lengths) }, choices, a.splitAt)
+    const split = p.split
     scan.columns.push(...r.added)
     scan.notes.push(...r.notes)
 
@@ -192,6 +197,13 @@ export async function convert(a: ConvertArgs, say: (line: string) => void): Prom
     const said = scan.notes.length
     scan = oneConditionPerSample(scan, choices)
     for (const line of scan.notes.slice(said)) say(`note: ${line}`)
+
+    // Measured on the whole object before any part is cut, so every part states the same.
+    const ms = (() => {
+      try { return measureObject(scan, p, choices) } catch (e) { throw classify(e) }
+    })()
+    for (const line of ms.notes) say(`note: ${line}`)
+    const ctx = { plan: p, measured: ms }
 
     const parked: { file: string; tmp: string }[] = []
     const partInfo: Index['parts'] = []
@@ -213,11 +225,12 @@ export async function convert(a: ConvertArgs, say: (line: string) => void): Prom
     let first: BundleMeta | undefined
     try {
       if (!split) {
-        first = keep(choices.label, buildBundle(scan, choices, s => step(s)))
+        first = keep(choices.label, buildBundle(scan, choices, s => step(s), ctx))
       } else {
         step(`split along ${split.column.name}: ${split.plan.shards.length} parts in ${split.plan.passes.length} passes`)
         const src = streamableMatrix(scan, s => { scan.notes.push(s); step(s) })
         if (!src?.loadGroups) throw new CliError('no matrix in this object can be read in parts', EXIT.build)
+        if (src.key !== p.stream) throw new CliError('the plan and the build chose different matrices to read in parts: this is a bug in the converter', EXIT.build)
         for (let pi = 0; pi < split.plan.passes.length; pi++) {
           const group = split.plan.passes[pi]
           step(`pass ${pi + 1} of ${split.plan.passes.length}: ${group.length} parts`)
@@ -230,7 +243,7 @@ export async function convert(a: ConvertArgs, say: (line: string) => void): Prom
             const s = group[gi]
             const sub = shardScan(scan, { ...s, cells: Int32Array.from(s.cells) },
               new Map([[src.key, mats[gi]!]]), `${scan.source} · ${choices.label}`)
-            const meta = keep(s.key, buildBundle(sub, { ...choices, label: `${choices.label} ${s.key}` }))
+            const meta = keep(s.key, buildBundle(sub, { ...choices, label: `${choices.label} ${s.key}` }, undefined, ctx))
             first ??= meta
             // A pass can hold a gigabyte across its parts; drop each as it is used.
             mats[gi] = null

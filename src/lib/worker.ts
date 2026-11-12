@@ -18,6 +18,7 @@ import { GzWindow } from './gzwindow.ts'
 import { scanSeurat } from './seurat.ts'
 import { buildBundle, oneConditionPerSample, streamableMatrix } from './build.ts'
 import { shardScan, type Shard } from './shard.ts'
+import { measureObject, plan, planInfo } from './plan.ts'
 import type { Choices, Scan, ScanInfo } from './scan.ts'
 import type { CellMajor } from './matrix.ts'
 
@@ -47,16 +48,18 @@ let scan: Scan | null = null
 
 /** Strip the closures: a Scan cannot be structured-cloned, its shape can. */
 function describe(s: Scan, nnzPerCell: Int32Array | null): ScanInfo {
+  // What the page's plan reads (lib/plan.ts): the same description the command plans from.
+  const info = planInfo(s, nnzPerCell)
   return {
     format: s.format, source: s.source, nCells: s.nCells, columns: s.columns,
-    matrices: s.matrices.map(m => ({
-      key: m.key, geneSet: m.geneSet, nGenes: m.nGenes, nCells: m.nCells, kind: m.kind,
-    })),
-    embeddings: s.embeddings.map(e => ({ key: e.key, nDims: e.nDims })),
+    matrices: info.matrices, embeddings: info.embeddings,
     geneSets: s.geneSets, geneAliases: s.geneAliases,
     provenance: s.provenance, notes: s.notes, nnzPerCell,
   }
 }
+
+/** The row lengths measured when the file was opened: what the plan's split is decided on. */
+let lengths: Int32Array | null = null
 
 type Msg =
   | { id: number; cmd: 'open'; file: File }
@@ -122,6 +125,7 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
       post({ id, event: 'stage', stage: 'Measuring the matrix' })
       const m = scan.matrices.find(x => x.nnzPerCell)
       const nnzPerCell = m?.nnzPerCell ? m.nnzPerCell() : null
+      lengths = nnzPerCell
       post({ id, event: 'done', info: describe(scan, nnzPerCell) })
       return
     }
@@ -133,12 +137,19 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
       // decided here on the whole object, before any part is cut from it, so
       // that every part names it the same way.
       const parent = oneConditionPerSample(scan, choices)
+      // The page's plan, made again from the same description: the split, the
+      // matrix read, what travels. The page showed exactly this.
+      const p = plan({ nCells: scan.nCells, columns: scan.columns, ...planInfo(scan, lengths) }, choices)
+      if ((p.split?.plan.shards.length ?? 0) !== (shards?.length ?? 0)) {
+        throw new Error('the page and the converter planned different splits: this is a bug in the lab')
+      }
+      const ctx = { plan: p, measured: measureObject(parent, p, choices) }
 
       // Whole object, one part. Still a part: the container is written the same
       // way either way, so the studio has one shape to understand.
       if (!shards || !passes) {
         post({ id, event: 'stage', stage: 'Reading the expression matrix' })
-        const res = buildBundle(parent, choices, s => post({ id, event: 'stage', stage: s }))
+        const res = buildBundle(parent, choices, s => post({ id, event: 'stage', stage: s }), ctx)
         post({ id, event: 'bundle', key: choices.label || parent.source,
           zip: res.zip, meta: res.meta, pseudobulkColumns: res.pseudobulkColumns },
           [res.zip.buffer])
@@ -150,6 +161,7 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
       // them: buildBundle copies scan.notes, and the split path never calls
       // chooseMatrices on anything that can still see the rejected matrix.
       const src = streamableMatrix(parent, s => parent.notes.push(s))
+      if ((src?.key ?? null) !== p.stream) throw new Error('the plan and the converter chose different matrices to read in parts: this is a bug in the lab')
       if (!src) {
         throw new Error(
           'this object is too large to convert in one piece, and none of its matrices can be read in parts — every one is either scaled or stored in a layout that cannot be streamed.')
@@ -179,7 +191,7 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
           post({ id, event: 'stage', stage: `Writing ${made + 1} of ${total}` })
           const sub = shardScan(parent, { ...s, cells: Int32Array.from(s.cells) },
             new Map([[src.key, mats[gi][0]]]), `${parent.source} · ${choices.label}`)
-          const res = buildBundle(sub, { ...choices, label: `${choices.label} ${s.key}` })
+          const res = buildBundle(sub, { ...choices, label: `${choices.label} ${s.key}` }, undefined, ctx)
           made++
           post({ id, event: 'bundle', key: s.key,
             zip: res.zip, meta: res.meta, pseudobulkColumns: res.pseudobulkColumns },

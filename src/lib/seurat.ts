@@ -387,16 +387,12 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
     })
   }
 
-  const names = columns.map(c => c.name)
   return {
     format: 'seurat', source: filename, nCells, columns, matrices, embeddings,
     geneSets, geneAliases,
-    provenance: {
-      normalization: null,
-      integration: embeddings.some(e => /harmony|integrated|mnn/i.test(e.key)) ? 'present' : null,
-      doublets: names.find(n => /doublet|scrublet/i.test(n)) ?? null,
-      ambient: names.find(n => /soupx|cellbender|decontx/i.test(n)) ?? null,
-    },
+    // The object's own records (@commands, @misc) are not read, so no fact of
+    // what was run is stated: never from a reduction's or a column's name.
+    provenance: { normalization: null, integration: null, doublets: null, ambient: null },
     notes,
   }
 }

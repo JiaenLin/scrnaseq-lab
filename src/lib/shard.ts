@@ -139,11 +139,13 @@ const M = (n: number) => `${n >= 1e9 ? (n / 1e9).toFixed(1) + ' B' : Math.round(
  */
 export function chooseSplit(
   columns: Column[], nnzPerCell: Int32Array | null, nCells: number,
+  /** The most stored values one piece holds; lowered only by tests, to split a small object. */
+  comfortable = COMFORTABLE_NNZ,
 ): SplitDecision | null {
   if (!nnzPerCell) return null
   let total = 0
   for (const v of nnzPerCell) total += v
-  if (total <= COMFORTABLE_NNZ) return null
+  if (total <= comfortable) return null
 
   const best = splitCandidates(columns, nnzPerCell, nCells)[0]
   if (!best || best.plan.shards.length < 2) return null

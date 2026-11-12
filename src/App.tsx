@@ -8,7 +8,8 @@ import {
 import {
   collectionPieces, writeCollection, type CollectionMeta,
 } from './lib/collection.ts'
-import { chooseSplit, type SplitDecision } from './lib/shard.ts'
+import { type SplitDecision } from './lib/shard.ts'
+import { plan } from './lib/plan.ts'
 import {
   candidates, guessCluster, guessEmbedding, guessRole,
   type Choices, type ScanInfo,
@@ -412,15 +413,19 @@ export default function App() {
       setStage(`Reading ${file.name}`)
       const s = await openFile(file, { onStage: setStage })
       setScan(s)
-      setChoices({
+      const first: Choices = {
         cluster: guessCluster(s) ?? '',
         sample: guessRole(s, 'sample'),
         condition: guessRole(s, 'condition'),
         embedding: guessEmbedding(s) ?? '',
         label: file.name.replace(/\.(h5ad|rds|h5)$/i, ''),
         extras: [],
-      })
-      setSplit(chooseSplit(s.columns, s.nnzPerCell ?? null, s.nCells))
+        // Shown in the page, where the user confirms or changes them.
+        by: { cluster: 'app', embedding: 'app' },
+      }
+      setChoices(first)
+      // The page's plan decides the split (lib/plan.ts); the worker runs the same plan.
+      setSplit(plan(s, first).split)
     } catch (e) {
       setError(explain(e))
     } finally {

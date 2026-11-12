@@ -252,7 +252,7 @@ export function resolveRoles(scan: Scan, a: ConvertArgs): Resolved {
       return [s, k] as const
     })
     const total = counts.reduce((t, [, k]) => t + k, 0)
-    notes.push(`${sentinels.join(' and ')} ${sentinels.length > 1 ? 'are' : 'is'} the annotator's ${sentinels.length > 1 ? 'sentinels' : 'sentinel'}, not cell types: ${total} cells (${counts.map(([s, k]) => `${s} ${k}`).join(', ')}). They stay drawn, and are listed in sentinels so that a reader can leave them out of composition, markers and tests`)
+    notes.push(`${sentinels.join(' and ')} ${sentinels.length > 1 ? 'are' : 'is'} the annotator's ${sentinels.length > 1 ? 'sentinels' : 'sentinel'}, not cell types: ${total} cells (${counts.map(([s, k]) => `${s} ${k}`).join(', ')}). They are listed in sentinels so that a reader can leave them out of composition, markers and tests`)
   }
 
   // ---- the label --------------------------------------------------------------
@@ -268,6 +268,12 @@ export function resolveRoles(scan: Scan, a: ConvertArgs): Resolved {
       cluster, sample, condition, embedding, label,
       extras: [...extras, ...added.map(c => c.name)],
       sentinels,
+      // Who chose, for the bundle's facts: a flag, or the command's guess from a name.
+      by: {
+        cluster: a.cluster !== undefined ? 'flag' : 'guess',
+        embedding: a.embedding !== undefined ? 'flag' : 'guess',
+        sentinels: a.sentinels !== undefined ? 'flag' : 'guess',
+      },
     },
     added, interactions, sentinels, guessed, said, notes, info,
   }

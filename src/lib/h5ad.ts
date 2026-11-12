@@ -15,6 +15,10 @@ import {
   type Column, type EmbeddingRef, type GeneAlias, type MatrixRef, type RunField, type RunRecord, type RunSection, type Scan,
 } from './scan.ts'
 import { classify, dropZeros, stridedSample, type CellMajor } from './matrix.ts'
+import {
+  MAX_PLACE, MAX_VALUE, RECORD_KEYS, SEARCHED, isLine, legacyProvenance, notRecorded, recorded,
+  type RecordedId, type Sources,
+} from './facts.ts'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type H5 = any
@@ -844,6 +848,128 @@ function sampleMatrix(m: H5, want = 20000): Float64Array {
   return vals.length ? Float64Array.from(vals) : stridedSample(n, want, i => Number(d.slice([[i, i + 1]])[0]))
 }
 
+/** Whole rows of a CSR or dense matrix, run by run: what the per-cell totals are measured on. */
+function readRuns(m: H5, nGenes: number, runs: [number, number][]): CellMajor {
+  const rows: CellMajor[] = []
+  for (const [a, b] of runs) {
+    if (b <= a) continue
+    if (isDataset(m)) {
+      const flat = toF32(m.slice([[a, b], [0, nGenes]]))
+      const indptr = new Int32Array(b - a + 1), idx: number[] = [], val: number[] = []
+      for (let r = 0; r < b - a; r++) {
+        indptr[r] = idx.length
+        for (let g = 0; g < nGenes; g++) {
+          const v = flat[r * nGenes + g]
+          if (v !== 0) { idx.push(g); val.push(v) }
+        }
+      }
+      indptr[b - a] = idx.length
+      rows.push({ nCells: b - a, nGenes, indptr, indices: Int32Array.from(idx), data: Float32Array.from(val) })
+      continue
+    }
+    const ptr = toI32(child(m, 'indptr').slice([[a, b + 1]]))
+    const s0 = ptr[0], s1 = ptr[b - a]
+    const data = s1 > s0 ? toF32(child(m, 'data').slice([[s0, s1]])) : new Float32Array(0)
+    const indices = s1 > s0 ? toI32(child(m, 'indices').slice([[s0, s1]])) : new Int32Array(0)
+    rows.push({ nCells: b - a, nGenes, indptr: ptr.map(v => v - s0), indices, data })
+  }
+  const nCells = rows.reduce((n, r) => n + r.nCells, 0)
+  const nnz = rows.reduce((n, r) => n + r.data.length, 0)
+  const out: CellMajor = { nCells, nGenes, indptr: new Int32Array(nCells + 1), indices: new Int32Array(nnz), data: new Float32Array(nnz) }
+  let c = 0, at = 0
+  for (const r of rows) {
+    for (let i = 0; i < r.nCells; i++) out.indptr[c + i] = at + r.indptr[i]
+    out.indices.set(r.indices, at)
+    out.data.set(r.data, at)
+    c += r.nCells
+    at += r.data.length
+  }
+  out.indptr[nCells] = at
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// What the object records of what was run (facts.ts).
+//
+// Read by key at named places, and nothing found by a pattern over names: the
+// integration method and its embedding as `default_method` and
+// `default_embedding` in a dict directly under uns (the reader names no tool);
+// a doublet or an ambient-RNA tool as `doublet_method` or `ambient_method`
+// there; the normalization as scanpy's own record, `uns/log1p`. Each is carried
+// only as one line of MAX_VALUE characters or fewer. Where nothing is at the
+// place the fact is "not recorded", with where the converter looked; two places
+// that both record one are both named in the notes and neither is stated.
+
+const WHAT: Record<RecordedId, string> = {
+  integration: 'an integration method', integration_embedding: "an integration method's embedding",
+  normalization: 'a normalization', doublets: 'a doublet tool', ambient: 'an ambient-RNA tool',
+}
+
+function readRecorded(uns: H5, obsmKeys: string[], note: (s: string) => void): NonNullable<Sources['recorded']> {
+  const out: NonNullable<Sources['recorded']> = {}
+  const ids = Object.keys(RECORD_KEYS) as (keyof typeof RECORD_KEYS)[]
+  const hits = new Map<RecordedId, { value: string; at: string }[]>(ids.map(id => [id, []]))
+  const keys: string[] = isGroup(uns) ? uns.keys() : []
+  for (const k of keys) {
+    let o: H5 | null
+    // An entry whose type cannot be read (a float16 attribute) is not a record
+    // here; the run reader names it.
+    try { o = child(uns, k); if (o && !isDict(o)) o = null } catch { o = null }
+    if (!o) continue
+    for (const id of ids) {
+      const field = RECORD_KEYS[id]
+      let c: H5 | null
+      try { c = child(o, field) } catch { c = null }
+      if (!c) continue
+      const at = `uns/${shown(k)}/${field}`
+      const kind = kindOf(c)
+      let v: unknown = null
+      if (!kind) {
+        try { v = ownValue(c) } catch { v = null }
+      }
+      const str = typeof v === 'string' ? v : Array.isArray(v) && v.length === 1 && typeof v[0] === 'string' ? v[0] : null
+      if (str === null) {
+        note(`${at} is ${kind ?? 'a value that could not be read as a string'}, so it is not read as the object's record of ${WHAT[id]}`)
+      } else if (!isLine(str, MAX_VALUE) || !isLine(at, MAX_PLACE)) {
+        note(`${at} holds more than one line of ${MAX_VALUE} characters without markup, so it is not carried as the object's record of ${WHAT[id]}; it stays in the object`)
+      } else {
+        hits.get(id)!.push({ value: str, at })
+      }
+    }
+  }
+  for (const id of ids) {
+    const h = hits.get(id)!
+    if (h.length === 1) out[id] = recorded(h[0].value, h[0].at)
+    else if (!h.length) out[id] = notRecorded(SEARCHED[id])
+    else note(`${h.length} places record ${WHAT[id]}: ${h.map(x => `${x.at} (${x.value})`).join(', ')}; the bundle states none of them as the object's`)
+  }
+  const e = out.integration_embedding
+  if (e && 'at' in e && !obsmKeys.includes(e.value)) note(`${e.at} names ${e.value}, which is not an embedding of this object`)
+
+  let n: H5 | null = null
+  let dict = false
+  try { n = isGroup(uns) ? child(uns, 'log1p') : null; dict = !!n && isDict(n) } catch { n = null }
+  if (n && dict) {
+    let base: number | null = null
+    try {
+      const b = child(n, 'base')
+      if (b && kindOf(b) === 'a number') {
+        const x = Number(ownValue(b))
+        if (Number.isFinite(x)) base = x
+      }
+    } catch { base = null }
+    out.normalization = recorded(base === null ? 'log1p' : `log1p, base ${base}`, 'uns/log1p')
+  } else {
+    if (n) {
+      let what = 'a string'
+      try { what = kindOf(n) ?? 'a string' } catch { what = 'an entry whose type cannot be read' }
+      note(`uns/log1p is ${what}, not a dict as scanpy records log1p, so no normalization is read from it`)
+    }
+    out.normalization = notRecorded(SEARCHED.normalization)
+  }
+  return out
+}
+
 // ---------------------------------------------------------------------------
 // The run's identity.
 //
@@ -1212,6 +1338,7 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
         key, geneSet, nCells: cells, nGenes: genes,
         kind: classify(sampleMatrix(m)),
         load: chosen(() => readMatrix(m, cells, genes, key)),
+        ...(csr || isDataset(m) ? { readRuns: chosen((runs: [number, number][]) => readRuns(m, genes, runs)) } : {}),
         ...(csr ? {
           nnzPerCell: chosen(() => rowLengths(m, cells)),
           // Only CSR: in a CSC matrix `indices` are cell ids, and counting
@@ -1290,15 +1417,10 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
     }
   }
 
-  // ---- provenance -------------------------------------------------------
-  const unsKeys: string[] = isGroup(uns) ? uns.keys() : []
-  const obsNames = columns.map(c => c.name)
-  const provenance = {
-    normalization: unsKeys.includes('log1p') ? 'log1p(CP10K)' : null,
-    integration: embeddings.some(e => /harmony/i.test(e.key)) ? 'harmony' : null,
-    doublets: obsNames.find(n => /doublet|scrublet/i.test(n)) ?? null,
-    ambient: unsKeys.find(k => /soupx|cellbender|decontx/i.test(k)) ?? null,
-  }
+  // ---- what the object records of what was run -------------------------
+  // Read by key at named places, never from the look of a name (facts.ts).
+  const recorded = readRecorded(uns, embeddings.map(e => e.key), note)
+  const provenance = legacyProvenance(recorded)
   const run = readRun(uns, note)
 
   // ---- what was not followed, named once -----------------------------------
@@ -1314,7 +1436,7 @@ export function scanOpenH5ad(f: H5, filename: string): Scan {
 
   return {
     format: 'h5ad', source: filename, nCells, columns, matrices, embeddings,
-    geneSets, geneAliases, provenance, run, notes,
+    geneSets, geneAliases, provenance, recorded, run, notes,
     ...(lost.length ? { unreadableColumns: lost } : {}),
   }
 }

@@ -794,8 +794,10 @@ console.log('\nONLY TWO-COLUMN EMBEDDINGS ARE OFFERED, AND EACH ONLY ONCE')
 
   const p = convert(FIX.classic, 'emb-pca.zip', ['--label', 'family', '--embedding', 'X_pca'])
   const pm = p.o?.parts[0].meta
-  attempt('choosing X_pca draws its first two components, flagged as before',
-    () => [pm.embedding, pm.notes.some(s => /first two principal components/.test(s))], ['X_pca', true])
+  // Flagged by its width, never by its name (W064): a key holding "pca" is not a record of a PCA.
+  attempt('choosing X_pca draws its first two columns, flagged by its width and not by its name',
+    () => [pm.embedding, pm.notes.some(s => /principal components/.test(s)),
+      pm.notes.some(s => /^X_pca has 10 columns and only its first two are drawn/.test(s))], ['X_pca', false, true])
   attempt('and only the two-column ones travel beside it, each once',
     () => pm.embeddings, [
       { key: 'X_pca', file: 'embed.f32' }, { key: 'X_umap', file: 'embed.X_umap.f32' },
@@ -1003,22 +1005,26 @@ console.log('\nNOTHING ELSE IN THE FIXTURE\'S BUNDLE CHANGED (against 51a00fa)')
   }
   attempt('every other entry of the part is byte-identical (guard)',
     () => Object.keys(BEFORE).filter(k => !g.files[k] || sha256(g.files[k]) !== BEFORE[k]), [])
-  attempt('meta.json is the same in every field but embeddings, notes and run (guard)', () => {
+  attempt('meta.json is the same in every field but embeddings, notes, run and facts (guard)', () => {
     const m = { ...g.meta }
-    delete m.embeddings; delete m.notes; delete m.run
+    delete m.embeddings; delete m.notes; delete m.run; delete m.facts
     return sha256(JSON.stringify(m))
   }, '89f9acf2d69cde69c7e6977dc14e2bf45b30050e0b247e6d63e51306aea779cb')
-  attempt('and the notes not about embeddings or uns are the same 13, in order (guard)',
+  // W064 restated one of the 13, the sentinel note ("They stay drawn" was not
+  // measured); its coordinates are now said in a note of their own, measured.
+  attempt('and the notes not about embeddings or uns are the same 13, in order, the sentinel note restated (guard)',
     () => sha256(JSON.stringify(g.meta.notes.filter(s => !/embedding/i.test(s) && !/\buns\b/.test(s)))),
-    '669678f83b4aefc8cf3835f130fe3e22aee382e190f9d084df9f515d586f892f')
+    'a1070dbd1905511b3d75cfd3322cb8e5a47262a24d8bdd5b89ae03f705be4470')
   attempt('collection.json is the same but for embeddings, notes and the part\'s bytes and sha256 (guard)', () => {
     const ix = { ...G.o.index, parts: G.o.index.parts.map(({ bytes: _b, sha256: _s, ...q }) => q) }
     delete ix.embeddings; delete ix.notes
     return sha256(JSON.stringify(ix))
   }, 'a9985a264cf4021d54153cc03fa2bb5ba1d901804355295cfac697d2f3380cc4')
   const again = convert(FIX.classic, 'guessed-again.zip', ['--label', 'family'])
-  attempt('the bundle is the one predicted before the closed reader was built', () => sha256(G.o.bytes),
-    'a55a9f06dfa38e4553431f76faf53a183ecb8d31049ba1645a86792f4a3fa7b3')
+  // W064: a55a9f06... before; only meta.json (facts added, the sentinel note
+  // restated, one measured note) and collection.json's notes moved.
+  attempt('the bundle is the one predicted: the closed reader, then the facts', () => sha256(G.o.bytes),
+    'd596404e79864ac31351d498001b48b34b620d950684d69f8e8818dd56b44d06')
   attempt('two conversions are still byte-identical',
     () => [again.r.code, sha256(readFileSync(again.out)) === sha256(G.o.bytes)], [0, true])
 }
