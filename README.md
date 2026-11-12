@@ -132,53 +132,50 @@ cell. Two kinds do not, and `meta.notes` names each one left out:
   that opens first, or else the first in the object's order. Copies are compared on the
   whole object, so every part of a split object offers the same ones.
 
-**The run's own record.** What the object's `uns` says about the run that made it travels
-in `meta.run`, copied rather than summarised. The lab names no tool. A record is anything
-that calls itself provenance:
+**The run's identity, not its record.** The lab carries the run's identity, not the run's
+record. From each record it finds it reads six fields by name (`tool`, `version`, `commit`,
+`stage`, `run_key`, `job`) and keeps each one stored as a string of 256 characters or fewer,
+unchanged and under its own name. Nothing else in a record is read: its other fields are
+counted and stay in the object. An absent field is not shown; a longer one, or one that is not
+a string, is said so.
+
+A record is anything that calls itself provenance. The lab names no tool:
 
 - an entry named `provenance` or `*_provenance`, at the top of `uns` or one level down (an
   integration stage's `uns/<tool>/provenance`, an annotator's `uns/<column>_provenance`);
 - a group directly under `uns` whose own `schema` string names provenance;
-- the harness's run record, `uns/harness_run`, read as JSON (kept as its text, with a note,
-  if it is not JSON).
+- the harness's run record, `uns/harness_run`.
 
-Each record keeps the tool's own field names and values. An integration stage's, for
-example, carries its version, commit, job and arguments. A structured array is copied row
-by row, under its field names. When the object carries none, `run.records` is empty and a
-note says so; `run.searched` says where the lab looked. A Seurat object has no `uns`, so its
-bundle has no `run`. Readers that do not know the field ignore it.
+The records go into `meta.run.records` in `uns` order, each as a path and a `record` that holds
+only those of the six it carries. `meta.notes` says, for each record, which fields were carried,
+each of the six that was not and what it is (a number, a boolean, an array, a group, a string
+longer than 256 characters), and how many other entries the record holds: a count, never their
+names. So a tool's arguments, input paths and host names do not travel. A record that holds none
+of the six as such a string is not listed, and its note says so; one that is not a dict at all
+(the harness's record is one JSON string) is named with what it is, and nothing of it is read.
+An integration stage writes its `job` as a dict of scheduler, id and host, so that `job` is
+named as a group and not carried.
 
-Some things are named in place rather than copied (the last three with a note as well):
+At most 64 records are read, in `uns` order. Past that they are counted in `run.leftOut`, and
+the first ten are named. The first string longer than 256 characters ends the reading, so that
+one long value is read once, however many records reach it; the records after it are counted in
+`run.leftOut` too. When the object carries no record, `run.records` is empty and a note says
+so; `run.searched` says where the lab looked. A Seurat object has no `uns`, so its bundle has no
+`run`. Readers that do not know the field ignore it. An `uns` entry that cannot even be
+inspected (an attribute the reader cannot read) is named in a note and never stops the
+conversion. What a record says is recorded, never vouched for: a file can name any tool and
+commit.
 
-- **What JSON has no form for:** float16, an HDF5 reference, opaque bytes, a dataframe or a
-  sparse matrix. The rest of the record is still copied.
-- **Anything nested more than 16 groups below its record.**
-- **An HDF5 object a record reaches a second time** through another link (a hard link back to
-  an ancestor, a second hard or soft link). Within that record it is copied once, and each
-  other link to it is named. Each record is read on its own, so two records that reach one
-  object both copy it. An object reached through an external link is told apart by the file
-  name its link gives as well as its address, so two files linked under one name from
-  different folders are not told apart.
-- **Anything past 10,000 groups and datasets read for one record.** The whole section reads
-  at most 50,000. Records it reaches after that are left out, unread.
-- **A record too large to copy into every part.** The section goes into every part of a split
-  object, and `meta.json` is indented, so sizes are counted as written, in bytes. A record over
-  262,144 bytes is named with its size.
-
-The records together may take 1,048,576 bytes. They are fitted kind by kind:
-
-1. the harness's run record;
-2. each `provenance`;
-3. each `*_provenance`;
-4. the records known by their schema.
-
-Within a kind, records are taken in `uns` order. One that does not fit is left out, and the
-next is still tried. A record is never pushed out by a later kind. Within one kind, records
-earlier in `uns` can still fill the section before a tool's own. The records left out are
-therefore named largest first, so a tool's record, which is rarely the smallest, is among
-those named. One entry, `run.leftOut`, and one note count them all. An `uns` entry that cannot
-even be inspected (an attribute the reader cannot read) is named in a note and never stops
-the conversion.
+**One file: the one it is given.** HDF5 by itself opens other files: the file an external link
+names, a virtual dataset's source, a dataset's external raw storage. From the command those are
+this machine's own files, and in the browser the files the tab holds. While the input is open,
+the converter lets HDF5 open no other file. What the scan meets that leads out of the file is
+read as absent and named once, in one note, with its target as the link states it: an external
+link, whatever file it names (the input's own name included), a soft link that reaches nothing
+in the file, and a virtual dataset whose values lie in another file. This holds for the
+observations, the variables, the matrix and its layers, the embeddings and `uns` alike, so the
+same input gives the same bundle, whatever sits beside it. An ordinary soft or hard link inside
+the file still reads.
 
 **Both namings of the genes.** `genes.txt` is whatever the matrix rows are indexed by —
 `ENSMUSG00000038751` as often as `Sox2` — and `meta.geneIdKind` says which, judged from the
@@ -340,10 +337,11 @@ it is written in anndata's default string encoding. `scripts/make-family-fixture
 made-up names, and Python is needed only to regenerate them:
 `uv run --no-project --with anndata==0.13.2 --with pandas==3.0.5 python scripts/make-family-fixture.py`.
 `scripts/test-integrity.mjs` converts copies of them that it edits itself through h5wasm. It
-checks that every cell keeps its condition, that the run's record travels, and that only
-two-column embeddings are offered. It also checks that nothing else in the fixture's bundle
-moved. `uns-records.h5ad` holds the run records h5wasm cannot write: a structured array with
-an int64 field, float16, and an HDF5 reference. `uns-unreadable.h5ad` holds an `uns` entry
+checks that every cell keeps its condition, that the run's identity travels and nothing else of
+a record does, that no link leads it out of the file, and that only two-column embeddings are
+offered. It also checks that nothing else in the fixture's bundle
+moved. `uns-records.h5ad` holds run records h5wasm cannot write (a structured array with an
+int64 field, float16, an HDF5 reference): they convert, and only their identity is read. `uns-unreadable.h5ad` holds an `uns` entry
 whose `encoding-type` attribute is float16, which anndata itself refuses to read.
 
 ## Known limits

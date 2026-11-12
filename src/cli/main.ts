@@ -36,8 +36,11 @@ carried unless a flag leaves it out, and one left out is named in the notes.
 A sample whose cells hold more than one level of --condition is split into one
 sample per level (sample|level), so every cell keeps its own; with no sample
 column, the cells of each level are one sample. Beside the embedding that opens
-first, only two-column embeddings travel, each set of coordinates once. The
-run's provenance records in uns travel as "run". The notes name all three.
+first, only two-column embeddings travel, each set of coordinates once. Of
+the run's records in uns, only the identity travels, as "run": tool, version,
+commit, stage, run_key and job, each as a string of 256 characters or fewer.
+The notes name all three. Only the input file is read: no link out of it is
+followed, and the notes name each one met.
 
 Output: one .zip holding collection.json and parts/*.zip, each part a complete
 scrnaseq-studio/bundle@1. The same input and flags give the same bytes. The

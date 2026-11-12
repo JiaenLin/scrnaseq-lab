@@ -169,8 +169,8 @@ export interface Scan {
   geneAliases: Record<string, GeneAlias>
   provenance: Record<string, string | null>
   /**
-   * The run's own record, read from uns. Set by the .h5ad reader, which always
-   * looks; absent from a Seurat scan, which has no uns to look in.
+   * The run's identity, read from the records in uns. Set by the .h5ad reader,
+   * which always looks; absent from a Seurat scan, which has no uns to look in.
    */
   run?: RunSection
   /** Everything the reader had to decide, in the order it decided it. */
