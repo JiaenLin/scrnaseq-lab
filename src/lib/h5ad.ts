@@ -909,6 +909,9 @@ function readRecorded(uns: H5, obsmKeys: string[], note: (s: string) => void): N
   const out: NonNullable<Sources['recorded']> = {}
   const ids = Object.keys(RECORD_KEYS) as (keyof typeof RECORD_KEYS)[]
   const hits = new Map<RecordedId, { value: string; at: string }[]>(ids.map(id => [id, []]))
+  // Places that hold something this converter does not carry: then the fact is
+  // not stated (each is named), never "not recorded" of an object that holds one.
+  const refused = new Set<RecordedId>()
   const keys: string[] = isGroup(uns) ? uns.keys() : []
   for (const k of keys) {
     let o: H5 | null
@@ -929,8 +932,10 @@ function readRecorded(uns: H5, obsmKeys: string[], note: (s: string) => void): N
       }
       const str = typeof v === 'string' ? v : Array.isArray(v) && v.length === 1 && typeof v[0] === 'string' ? v[0] : null
       if (str === null) {
+        refused.add(id)
         note(`${at} is ${kind ?? 'a value that could not be read as a string'}, so it is not read as the object's record of ${WHAT[id]}`)
       } else if (!isLine(str, MAX_VALUE) || !isLine(at, MAX_PLACE)) {
+        refused.add(id)
         note(`${at} holds a value that is not one line of ${MAX_VALUE} characters or fewer without markup, so it is not carried as the object's record of ${WHAT[id]}; it stays in the object`)
       } else {
         hits.get(id)!.push({ value: str, at })
@@ -940,7 +945,8 @@ function readRecorded(uns: H5, obsmKeys: string[], note: (s: string) => void): N
   for (const id of ids) {
     const h = hits.get(id)!
     if (h.length === 1) out[id] = recorded(h[0].value, h[0].at)
-    else if (!h.length) out[id] = notRecorded(SEARCHED[id])
+    else if (!h.length && !refused.has(id)) out[id] = notRecorded(SEARCHED[id])
+    else if (!h.length) continue
     else note(`${h.length} places record ${WHAT[id]}: ${h.map(x => `${x.at} (${x.value})`).join(', ')}; the bundle states none of them as the object's`)
   }
   const e = out.integration_embedding

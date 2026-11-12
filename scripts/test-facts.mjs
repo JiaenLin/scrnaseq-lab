@@ -204,10 +204,10 @@ attempt('two dicts recording a method: neither is stated, both are named with th
   B.f?.meta.notes.some(s => s.startsWith('2 places record an integration method: ') && s.includes('uns/scintegrate/default_method (scanvi)')
     && s.includes('uns/other_stage/default_method (harmony)') && s.endsWith("the bundle states none of them as the object's")),
 ], [null, null, true])
-attempt('a group, an array, a number, 10,000 characters, a line break, markup: none read, each named', () => [
+attempt('a group, an array, a number, 10,000 characters, a line break, markup: none read, each named, and no fact stated', () => [
   fact(B.h, 'integration'),
   ['as_group', 'as_array', 'as_number', 'as_long', 'as_lines', 'as_markup'].map(k => B.h?.meta.notes.some(s => s.startsWith(`uns/${k}/default_method `))),
-], [notRec(DICT('default_method')), [true, true, true, true, true, true]])
+], [null, [true, true, true, true, true, true]])
 attempt('a recorded embedding the object does not hold is said so', () => B.a?.meta.notes.some(s => /default_embedding names/.test(s)), false)
 
 console.log('\nTHE PAGE SAYS WHAT THE BUNDLE THEN HOLDS')

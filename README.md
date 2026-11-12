@@ -246,7 +246,7 @@ harmony was run, a column called `predicted_doublet` is not a record of a double
 key holding "pca" is not a PCA. Where the place holds nothing the fact is "not recorded", with
 the place the lab looked; two places that both record one are named in the notes and neither
 is stated. A value at the place is carried only as one line of 64 characters or fewer without
-markup; anything else is named in the notes and stays in the object. The older `provenance`
+markup; anything else is named in the notes, stays in the object, and the fact is then not stated. The older `provenance`
 fields hold the recorded value or null. A Seurat object's records are not read, so a bundle
 from one states none of the recorded facts. The cells the annotator did not call are counted,
 on every embedding carried, for those with no finite coordinates.
