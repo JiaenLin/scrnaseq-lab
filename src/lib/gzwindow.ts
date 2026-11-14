@@ -80,6 +80,15 @@ export class GzWindow {
   /** Decompressed bytes produced so far. Final once the stream has ended. */
   get seen(): number { return this.start + this.queued }
 
+  /**
+   * Whether the stream holds a byte at `p` or after it. It decompresses as far
+   * as it must to know, so after a complete walk this is one small push or none.
+   */
+  more(p: number): boolean {
+    this.pump(p + 1)
+    return this.start + this.queued > p
+  }
+
   private absorb(chunk: Uint8Array) {
     if (!chunk.length) return
     if (this.dropping > 0) {

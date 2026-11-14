@@ -35,7 +35,7 @@ const DEFER_ABOVE = 200_000_000
 
 /** SEXP type codes, from R's Rinternals.h. Only the ones that appear here. */
 const NILSXP = 0, SYMSXP = 1, LISTSXP = 2, CLOSXP = 3, ENVSXP = 4, PROMSXP = 5,
-  LANGSXP = 6, CHARSXP = 9, LGLSXP = 10, INTSXP = 13, REALSXP = 14, CPLXSXP = 15,
+  LANGSXP = 6, SPECIALSXP = 7, BUILTINSXP = 8, CHARSXP = 9, LGLSXP = 10, INTSXP = 13, REALSXP = 14, CPLXSXP = 15,
   STRSXP = 16, DOTSXP = 17, VECSXP = 19, EXPRSXP = 20, BCODESXP = 21,
   EXTPTRSXP = 22, WEAKREFSXP = 23, RAWSXP = 24, S4SXP = 25,
   BCREPREF = 243, BCREPDEF = 244,
@@ -212,8 +212,51 @@ export class RdsReader {
     return s
   }
 
-  /** The entry point: read the whole object graph. */
-  read(): RValue { return this.item() }
+  /**
+   * The entry point: read the whole object graph.
+   *
+   * An .rds holds ONE object and nothing after it, so the walk must end where
+   * the stream ends. A walk that miscounts an item does not always fail: when
+   * the bytes still line up it comes out of a list one item short, takes that
+   * list's attributes for the next slot of the object above, and stops early
+   * with the object's last slots unread. A Seurat object read that way had no
+   * `class`, and the page said "not an S4 object" of a file that held one. So a
+   * walk that stops with bytes left is this reader's failure and is said as one;
+   * the shorter object is never returned.
+   */
+  read(): RValue {
+    const v = this.item()
+    const left = this.stream ? this.stream.more(this.p) : this.p < (this.buf as Bytes).length
+    if (left) {
+      throw new RdsError(
+        'this reader lost its place in this .rds: it reached the end of the object before the end of the file, so what it read cannot be trusted. That is a fault in the reader, not in your file. Please report it with the versions of R and Seurat that wrote the file.')
+    }
+    return v
+  }
+
+  /**
+   * A bare string vector: an integer 0, a count, then that many strings.
+   *
+   * R writes a namespace, a package environment and a persistent name this way
+   * (OutStringVec in serialize.c) and NOT as an item with flags. Read as one
+   * item, the 0 is taken for a NULL and the count for the flags of what follows:
+   * a namespace's count is 2 (its name and version) and 2 is a pairlist node,
+   * whose two fields are then exactly the two strings. The bytes line up, so
+   * nothing fails here; the walk is simply one item short from then on.
+   */
+  private stringVec(): RValue {
+    if (this.int() !== 0) {
+      throw new RdsError('this .rds names a namespace or a package in a form R itself does not read (names on a persistent string)')
+    }
+    const n = this.int()
+    if (n < 0 || n > 1_000_000) throw new RdsError('this .rds is damaged: a namespace or package name has an impossible length')
+    const v: (string | null)[] = new Array(n)
+    for (let i = 0; i < n; i++) {
+      const c = this.item()
+      v[i] = c.t === 'str' ? c.v[0] : null
+    }
+    return { t: 'str', v }
+  }
 
   private item(): RValue {
     const flags = this.int()
@@ -242,10 +285,14 @@ export class RdsReader {
       }
 
       case PACKAGESXP:
-      case NAMESPACESXP: {
-        const v = this.item()
-        this.refs.push(v)
-        return v
+      case NAMESPACESXP:
+      case PERSISTSXP: {
+        // Each is a bare string vector (see stringVec) and one entry in the
+        // reference table, as in R's ReadItem.
+        this.stringVec()
+        const env: RValue = { t: 'env' }
+        this.refs.push(env)
+        return env
       }
 
       case ENVSXP: {
@@ -291,7 +338,21 @@ export class RdsReader {
 
       case CHARSXP: {
         const n = this.int()
-        return { t: 'str', v: [n < 0 ? null : this.str(n)] }
+        const v: RValue = { t: 'str', v: [n < 0 ? null : this.str(n)] }
+        // R reads a string's attributes when their flag is set, and drops them.
+        if (hasAttr) this.item()
+        return v
+      }
+
+      case SPECIALSXP: case BUILTINSXP: {
+        // A primitive function (`c`, `sum`, `[`), kept by name: a length and
+        // that many bytes. A command that was given one as an argument holds it.
+        const n = this.int()
+        if (n < 0 || n > 255) throw new RdsError('this .rds is damaged: a primitive function has an impossible name length')
+        this.p += n
+        const v: RValue = { t: 'other', code: type }
+        if (hasAttr) v.attr = this.attrList()
+        return v
       }
 
       case LGLSXP: case INTSXP: {
@@ -370,11 +431,20 @@ export class RdsReader {
         return this.altrep(info, state, attr)
       }
 
-      case EXTPTRSXP: case WEAKREFSXP: {
+      case EXTPTRSXP: {
         const v: RValue = { t: 'other', code: type }
         this.refs.push(v)
-        this.item()
-        this.item()
+        this.item()         // protected
+        this.item()         // tag
+        if (hasAttr) v.attr = this.attrList()
+        return v
+      }
+
+      case WEAKREFSXP: {
+        // Nothing follows a weak reference's flags but its attributes: R makes
+        // an empty one and reads no key or value.
+        const v: RValue = { t: 'other', code: type }
+        this.refs.push(v)
         if (hasAttr) v.attr = this.attrList()
         return v
       }
@@ -385,7 +455,11 @@ export class RdsReader {
         // have no use for it, but byte-code has its own sub-format, so it must
         // be walked exactly or every offset after it is wrong.
         this.int()          // how many BCREPDEF slots follow; we hold none
-        return this.bc1()
+        const v = this.bc1()
+        // Attributes follow the byte code when their flag is set, as for any
+        // other item. (A byte code INSIDE a constant pool has no flags.)
+        if (hasAttr) this.item()
+        return v
       }
 
       case EMPTYENV_SXP: case BASEENV_SXP: case GLOBALENV_SXP:
@@ -395,11 +469,11 @@ export class RdsReader {
       case UNBOUNDVALUE_SXP: case MISSINGARG_SXP:
         return { t: 'null' }
 
-      case PERSISTSXP: case CLASSREFSXP: case GENERICREFSXP: {
-        const v = this.item()
-        this.refs.push(v)
-        return v
-      }
+      case CLASSREFSXP: case GENERICREFSXP:
+        // R itself refuses these two ("this version of R cannot read class
+        // references"), so no file a current R wrote holds one.
+        throw new RdsError(
+          `this .rds contains a reference R itself no longer reads (code ${type}). Re-save the object with saveRDS() from a current R.`)
 
       default:
         throw new RdsError(

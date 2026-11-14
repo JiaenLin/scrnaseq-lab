@@ -652,5 +652,124 @@ console.log('\nA MATRIX TOO BIG TO HOLD IS READ IN SHARDS')
     parts.map(m => Array.from(m.data).join(',')).join('|'))
 }
 
+console.log('\nITEM LAYOUTS THAT ARE NOT "FLAGS, THEN THE ITEM" (R\'s serialize.c, ReadItem)')
+{
+  // Each is written here as R writes it, inside a list of an S4 object whose
+  // class comes LAST, as a Seurat object's does. A reader that miscounts one of
+  // them by an item does not fail where it happens: it comes out of the list
+  // short, and the object's last slots (`class` among them) are never read.
+  const NAMESPACESXP = 249, PACKAGESXP = 248, PERSISTSXP = 247, CLOSXP = 3,
+    SPECIALSXP = 7, BUILTINSXP = 8, WEAKREFSXP = 23, REFSXP = 255
+  /** A bare string vector: an integer 0, a count, the strings (OutStringVec). */
+  const stringVec = (w, type, strs) => {
+    w.flags(type); w.int(0); w.int(strs.length)
+    for (const s of strs) w.charsxp(s)
+  }
+  const holder = (items, names) => {
+    const w = new W()
+    w.s4([
+      ['commands', x => x.list(items, [['names', y => y.str(names)]])],
+      ['tools', x => x.list([])],
+      ['class', x => x.str(['Seurat'], [['package', y => y.str(['SeuratObject'])]])],
+    ])
+    return w
+  }
+  const whole = (items, names) => {
+    // A refusal while walking is a result to compare, not a crash of the test.
+    let o
+    try { [, o] = read(holder(items, names)) } catch (e) { return `refused: ${e.message}` }
+    return [classOf(o), namesOf(slot(o, 'commands')), Object.keys(o.attr), slot(o, 'commands').v.map(v => v.t)]
+  }
+  const KEYS = ['commands', 'tools', 'class']
+
+  // A closure whose environment is a package namespace: what FindVariableFeatures
+  // logs twice (mean.function, dispersion.function) in every Seurat 5 object.
+  const closure = w => {
+    w.flags(CLOSXP, { tag: true })
+    stringVec(w, NAMESPACESXP, ['Seurat', '5.5.1'])   // the environment
+    w.nil()                                            // formals
+    w.real([1])                                        // body
+  }
+  check('a function from a namespace: the class after it is read',
+    whole([closure, w => w.real([7])], ['fn', 'after']),
+    [['Seurat'], ['fn', 'after'], KEYS, ['lang', 'num']])
+  // The namespace is ONE entry of the reference table: the reference that
+  // follows it must find it, and the symbol written after it must be the next.
+  check('the namespace is one reference, found again by a later function',
+    whole([closure,
+      w => { w.flags(CLOSXP, { tag: true }); w.int((1 << 8) | REFSXP); w.nil(); w.real([2]) }],
+      ['fn', 'again']),
+    [['Seurat'], ['fn', 'again'], KEYS, ['lang', 'lang']])
+  check('a namespace with three strings (a count that is not a pairlist\'s)',
+    whole([w => stringVec(w, NAMESPACESXP, ['a', 'b', 'c']), w => w.real([7])], ['ns', 'after']),
+    [['Seurat'], ['ns', 'after'], KEYS, ['env', 'num']])
+  check('a package environment',
+    whole([w => stringVec(w, PACKAGESXP, ['package:stats']), w => w.real([7])], ['pkg', 'after']),
+    [['Seurat'], ['pkg', 'after'], KEYS, ['env', 'num']])
+  check('a persistent name',
+    whole([w => stringVec(w, PERSISTSXP, ['a-name']), w => w.real([7])], ['p', 'after']),
+    [['Seurat'], ['p', 'after'], KEYS, ['env', 'num']])
+  check('a builtin and a special function, kept by name',
+    whole([w => { w.flags(BUILTINSXP); w.int(3); w.bytes('sum') },
+           w => { w.flags(SPECIALSXP); w.int(5); w.bytes('quote') }, w => w.real([7])], ['b', 's', 'after']),
+    [['Seurat'], ['b', 's', 'after'], KEYS, ['other', 'other', 'num']])
+  check('a weak reference: nothing follows its flags',
+    whole([w => w.flags(WEAKREFSXP), w => w.real([7])], ['w', 'after']),
+    [['Seurat'], ['w', 'after'], KEYS, ['other', 'num']])
+  check('byte code with attributes: they follow it',
+    whole([w => {
+      w.flags(BCODESXP, { attr: true })
+      w.int(0)                 // no shared language nodes
+      w.intv([12, 1])          // the code
+      w.int(0)                 // an empty constant pool
+      w.attrs([['srcref', x => x.intv([1])]])
+    }, w => w.real([7])], ['bc', 'after']),
+    [['Seurat'], ['bc', 'after'], KEYS, ['other', 'num']])
+  check('a single string with attributes: R reads and drops them',
+    whole([w => {
+      w.flags(STRSXP); w.int(1)
+      w.flags(CHARSXP, { attr: true }); w.int(1); w.bytes('x')
+      w.attrs([['a', x => x.intv([1])]])
+    }, w => w.real([7])], ['s', 'after']),
+    [['Seurat'], ['s', 'after'], KEYS, ['str', 'num']])
+  check('a class reference is refused as R refuses it',
+    /R itself no longer reads/.test(String(whole([w => w.flags(246)], ['c']))), true)
+}
+
+console.log('\nTHE WALK ENDS WHERE THE FILE ENDS')
+{
+  // The shape of a miscount that still lands on an item boundary: the object is
+  // complete as far as the reader can tell, and bytes are left. Before, the
+  // shorter object was returned and judged ("not an S4 object").
+  const w = new W()
+  w.s4([['class', x => x.str(['Seurat'])]])
+  const good = w.done()
+  check('an object that ends at the end of the file is read', classOf(new RdsReader(good).read()), ['Seurat'])
+  const extra = new Uint8Array([...good, 0, 0, 0, 254])
+  rejects('bytes left after the object: refused as the reader\'s own fault',
+    () => new RdsReader(extra).read(), 'lost its place')
+  const gz = gzipSync(extra)
+  rejects('the same through the stream the page reads with',
+    () => new RdsReader(new GzWindow(gz.length, (a, b) => gz.subarray(a, b), () => {}, 64)).read(), 'lost its place')
+  const gz2 = gzipSync(good)
+  check('and a complete object through the stream is read',
+    classOf(new RdsReader(new GzWindow(gz2.length, (a, b) => gz2.subarray(a, b), () => {}, 64)).read()), ['Seurat'])
+}
+
+console.log('\nWHAT IS SAID OF A FILE THAT IS NOT A SEURAT OBJECT')
+{
+  const said = build => { try { const [r, o] = read(build()); scanSeurat(r, o, 'x.rds'); return 'accepted' } catch (e) { return String(e.message) } }
+  const list = () => { const w = new W(); w.list([x => x.real([1])]); return w }
+  const s4NoClass = () => { const w = new W(); w.s4([['assays', x => x.list([])]]); return w }
+  const sce = () => { const w = new W(); w.s4([['class', x => x.str(['SingleCellExperiment'])]]); return w }
+  check('a plain list is called a list, with what to save instead',
+    [/holds a plain list/.test(said(list)), /list of Seurat objects/.test(said(list)), /S4 object, but/.test(said(list))],
+    [true, true, false])
+  check('an S4 object with no class is never called "not an S4 object"',
+    [/holds an S4 object, but its class could not be read/.test(said(s4NoClass)), /does not hold an S4/.test(said(s4NoClass))],
+    [true, false])
+  check('another S4 class is named', /holds a SingleCellExperiment object, not a Seurat object/.test(said(sce)), true)
+}
+
 console.log(failed ? `\n${failed} test(s) failed\n` : '\nAll RDS tests passed\n')
 process.exit(failed ? 1 : 0)

@@ -224,11 +224,43 @@ function assayAlias(
   return pickGeneAlias(genes, columns)
 }
 
+/**
+ * The names one layer of a Seurat v5 assay has along one side.
+ *
+ * A v5 assay (Assay5) keeps NO names on a layer's matrix: its Dimnames are
+ * NULL. The names live once per assay, in `@features` and `@cells`, each a
+ * LogMap: a logical matrix with one row per feature (or cell) of the assay and
+ * one column per layer, TRUE where the layer holds that row. A layer is stored
+ * in the map's order (SeuratObject's `LayerData<-` reorders what it is given to
+ * it, and `LayerData` puts the names back from it), so row k of the layer is
+ * the k-th TRUE of its column. Returns null where the map cannot be read as
+ * one, which is not the same as a layer with no rows.
+ */
+function layerNames(r: RdsReader, map: RValue | undefined, layer: string): string[] | null {
+  if (map?.t !== 'num' || map.kind === 'double') return null
+  const dim = attrOf(map, 'dim'), dn = attrOf(map, 'dimnames')
+  if (dim?.t !== 'num' || dn?.t !== 'list' || dn.v.length !== 2) return null
+  const d = r.numbers(dim)
+  const rows = strings(dn.v[0]), cols = strings(dn.v[1])
+  const j = cols.indexOf(layer)
+  if (d.length !== 2 || rows.length !== d[0] || cols.length !== d[1] || j < 0 || map.n !== d[0] * d[1]) return null
+  const held = r.numbers(map)
+  const out: string[] = []
+  for (let k = 0; k < rows.length; k++) if (held[j * rows.length + k] === 1) out.push(rows[k])
+  return out
+}
+
+type Found = {
+  key: string; value: RValue; genes: string[]; assay: RValue
+  /** A v5 layer's own cells, from the assay's map; null where the matrix has no such map (v3/v4). */
+  cells: string[] | null
+}
+
 /** Every assay's matrix slots, v3/v4 and v5 alike. */
 function assayMatrices(
-  assays: RValue | undefined, note: (s: string) => void,
-): { key: string; value: RValue; genes: string[]; assay: RValue }[] {
-  const out: { key: string; value: RValue; genes: string[]; assay: RValue }[] = []
+  r: RdsReader, assays: RValue | undefined, note: (s: string) => void,
+): Found[] {
+  const out: Found[] = []
   const names = namesOf(assays)
   if (assays?.t !== 'list') return out
 
@@ -236,22 +268,29 @@ function assayMatrices(
     const an = names[ai] ?? `assay${ai}`
     const cls = classOf(a)
 
-    // Seurat v5 keeps its matrices in a `layers` list instead of named slots.
+    // Seurat v5 keeps its matrices in a `layers` list instead of named slots,
+    // and their names in the assay's two maps instead of on each matrix.
     const layers = slot(a, 'layers')
     if (layers?.t === 'list') {
       const ln = namesOf(layers)
+      const before = out.length
       layers.v.forEach((m, li) => {
-        const genes = dgcGenes(m)
-        out.push({ key: `${an}@layers$${ln[li] ?? li}`, value: m, genes, assay: a })
+        const layer = ln[li] ?? String(li)
+        const own = dgcGenes(m)
+        const genes = own.length ? own : layerNames(r, slot(a, 'features'), layer) ?? []
+        out.push({
+          key: `${an}@layers$${layer}`, value: m, genes, assay: a,
+          cells: layerNames(r, slot(a, 'cells'), layer),
+        })
       })
-      if (!out.length) note(`assay ${an} is ${cls[0] ?? 'v5'} with no readable layers`)
+      if (out.length === before) note(`assay ${an} is ${cls[0] ?? 'v5'} with no readable layers`)
       return
     }
 
     for (const s of ['counts', 'data', 'scale.data']) {
       const m = slot(a, s)
       if (!m || m.t === 'null') continue
-      out.push({ key: `${an}@${s}`, value: m, genes: dgcGenes(m), assay: a })
+      out.push({ key: `${an}@${s}`, value: m, genes: dgcGenes(m), assay: a, cells: null })
     }
   })
   return out
@@ -267,7 +306,11 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
     throw new RdsError(
       cls.length
         ? `this .rds holds a ${cls.join('/')} object, not a Seurat object. If it is a SingleCellExperiment, convert it first: Seurat::as.Seurat(sce).`
-        : 'this .rds does not hold an S4 object, so it is not a Seurat object.')
+        : obj.t === 's4'
+          // Said only of what was read: an S4 object always has a class, so
+          // this is a file this reader did not read whole, not a judgement of it.
+          ? 'this .rds holds an S4 object, but its class could not be read, so the lab cannot tell whether it is a Seurat object. That is a limit of this reader, not a fault in your file.'
+          : `this .rds holds ${obj.t === 'list' ? 'a plain list' : obj.t === 'null' ? 'NULL' : 'a value that is not an S4 object'}, so it is not a Seurat object.${obj.t === 'list' ? ' If it is a list of Seurat objects, save one of them (or their merge) with saveRDS().' : ''}`)
   }
 
   const version = slot(obj, 'version')
@@ -275,26 +318,53 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
   if (ver) note(`written by Seurat ${ver}`)
 
   // ---- matrices ---------------------------------------------------------
-  const found = assayMatrices(slot(obj, 'assays'), note)
+  const found = assayMatrices(r, slot(obj, 'assays'), note)
   if (!found.length) throw new RdsError('this Seurat object has no assay matrices')
+  // The object's cells, in its own order: the rows of meta.data. A v5 layer may
+  // hold only some of them (a layer per sample, before JoinLayers), and such a
+  // layer is not the object's matrix: its columns are not the object's cells.
+  const objCells = strings(attrOf(slot(obj, 'meta.data'), 'row.names'))
+  const skipped: string[] = []
+  const skip = (s: string) => { skipped.push(s); note(s) }
 
   const geneSets: Record<string, string[]> = {}
   const geneAliases: Record<string, GeneAlias> = {}
   const matrices: MatrixRef[] = []
   let nCells = 0
 
-  for (const { key, value, genes, assay } of found) {
+  for (const { key, value, genes, assay, cells } of found) {
     const d = dgcDim(r, value)
     if (!d) {
       // scale.data is a plain dense matrix, not a dgCMatrix. It is scaled by
       // definition, so it is never the matrix we want — noting it is enough.
-      note(`${key} is dense (scaled data); skipped`)
+      // Anything else without a Dim slot is said as what it is, not as dense.
+      const vc = classOf(value)
+      if (value.t === 'num') note(`${key} is dense (scaled data); skipped`)
+      else skip(`${key} is ${vc.length ? `a ${vc[0]}` : 'not a matrix this reader knows'}, not the sparse dgCMatrix the lab reads; skipped`)
       continue
     }
     const [g, c] = d
+    if (cells && objCells.length) {
+      // A v5 layer says which cells it holds. It is the object's matrix only
+      // when those are the object's cells, all of them and in the same order.
+      if (cells.length !== c) {
+        skip(`${key} has ${c} columns but the assay's map lists ${cells.length} cells for it; skipped`)
+        continue
+      }
+      if (c !== objCells.length) {
+        skip(`${key} holds ${c} of the object's ${objCells.length} cells (the assay's layers are split, one per sample); skipped`)
+        continue
+      }
+      if (cells.some((n, k) => n !== objCells[k])) {
+        skip(`${key} holds the object's cells in another order than meta.data; skipped`)
+        continue
+      }
+    }
     nCells = Math.max(nCells, c)
     if (genes.length !== g) {
-      note(`${key} has no gene names on its Dimnames`)
+      skip(cells
+        ? `${key} has ${g} rows but ${genes.length} gene names (none on the matrix, and the assay's feature map does not give them); skipped`
+        : `${key} has no gene names on its Dimnames`)
       continue
     }
     const setKey = internGeneSet(geneSets, genes, key.replace(/@.*/, '') || 'features')
@@ -326,7 +396,11 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
     })
   }
   if (!matrices.length) {
-    throw new RdsError('no assay in this object holds a sparse matrix with gene names')
+    const split = skipped.some(s => s.includes('layers are split'))
+    throw new RdsError(
+      'no assay in this object holds a sparse matrix the lab can use'
+      + (skipped.length ? `: ${skipped.join('; ')}.` : ' (none has gene names).')
+      + (split ? ' Join the layers in R and save again: obj[["RNA"]] <- JoinLayers(obj[["RNA"]]); saveRDS(obj, "joined.rds").' : ''))
   }
 
   // ---- meta.data --------------------------------------------------------
