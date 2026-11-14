@@ -539,10 +539,48 @@ export class RdsReader {
         return this.inline(out, cls === 'compact_intseq' ? 'int' : 'double', attr)
       }
     }
-    // wrap_* and deferred_string keep the real payload as the head of a list.
-    if (state.t === 'lang') return this.withAttr(state.car, attr)
-    if (state.t === 'list' && state.v.length > 0) return this.withAttr(state.v[0], attr)
-    return this.withAttr(state, attr)
+    // A deferred string is NOT its payload: as.character(1:45) is kept as the
+    // numbers and the promise to print them. Handing back the numbers made a
+    // vector of names read as "no names", which a caller takes for absence.
+    if (cls === 'deferred_string' && state.t === 'lang') {
+      return this.deferredString(state.car, state.cdr, attr)
+    }
+    // wrap_* keeps the real vector as the head of its state.
+    if (cls.startsWith('wrap_')) {
+      if (state.t === 'lang') return this.withAttr(state.car, attr)
+      if (state.t === 'list' && state.v.length > 0) return this.withAttr(state.v[0], attr)
+    }
+    // Any other compact form is one this reader cannot expand. It is handed
+    // back as that, never as its raw state: a wrong vector is worse than none.
+    return this.withAttr({ t: 'other', code: ALTREP_SXP }, attr)
+  }
+
+  /**
+   * as.character() of a numeric vector, which R keeps unevaluated until someone
+   * reads a string from it. The strings are made here exactly as R would make
+   * them (see rRealToString): they are names as often as not.
+   */
+  private deferredString(arg: RValue, info: RValue, attr: RValue): RValue {
+    if (arg.t !== 'num') return this.withAttr({ t: 'other', code: ALTREP_SXP }, attr)
+    const scipen = info.t === 'num' && info.n >= 1 ? this.at(info, 0) : 0
+    const dec = strings(attrOf(info, 'OutDec'))[0] || '.'
+    const held = this.numbers(arg)
+    const out: (string | null)[] = new Array(arg.n)
+    if (arg.kind !== 'double') {
+      for (let i = 0; i < arg.n; i++) out[i] = held[i] === -2147483648 ? null : String(held[i])
+    } else {
+      // NA_real_ is one particular NaN (its low word is 1954); every other NaN
+      // prints as "NaN". Read from the bytes, where the payload is certain.
+      const view = new DataView(held.buffer, held.byteOffset, held.byteLength)
+      const isNA = (i: number) => (arg.off >= 0
+        ? this.dv.getInt32(arg.off + i * 8 + 4)
+        : view.getInt32(i * 8, true)) === 1954
+      for (let i = 0; i < arg.n; i++) {
+        const x = held[i]
+        out[i] = Number.isNaN(x) ? (isNA(i) ? null : 'NaN') : rRealToString(x, scipen, dec)
+      }
+    }
+    return this.withAttr({ t: 'str', v: out }, attr)
   }
 
   private refuseDeferred(v: RNum): never {
@@ -735,6 +773,123 @@ export function slot(v: RValue | undefined, name: string): RValue | undefined {
 
 export const strings = (v: RValue | undefined): string[] =>
   v?.t === 'str' ? v.v.map(s => s ?? '') : []
+
+/**
+ * as.character(x) of one double, as R gives it.
+ *
+ * R's rule (StringFromReal, formatReal, EncodeRealDrop0): round to 15
+ * significant digits; write it in fixed notation unless scientific notation is
+ * narrower by more than `scipen`; drop the zeros that end the fraction. So
+ * 100000 is "1e+05", 123456 is "123456", 0.1 + 0.2 is "0.3", 1/3 is
+ * "0.333333333333333". The digits are the double's exact value rounded to even
+ * on a tie, as the C library R prints with writes them: 2^-22 has sixteen
+ * digits ending in 5, and is "2.38418579101562e-07".
+ *
+ * Measured against R 4.6.1 on arm64: 110,959 doubles of every magnitude (whole
+ * numbers, short decimals, powers of two and ten, random ones) and 32,020 chosen
+ * to be hard (within four steps of a power of ten, or with a sixteenth digit at
+ * a tie). Equal on all but 12, every one of them smaller than 1e-294, where the
+ * count of digits hangs on the last bit of a power of ten near the bottom of
+ * the range. No name or label is such a number. An R built with a wider long
+ * double can differ from this one on a number whose sixteenth digit is a 5.
+ */
+/** R's smallest decimal exponent (floor(log10) of the smallest double, a denormal). */
+const R_DEC_MIN_EXPONENT = -324
+
+export function rRealToString(x: number, scipen = 0, dec = '.'): string {
+  if (Number.isNaN(x)) return 'NaN'
+  if (!Number.isFinite(x)) return x > 0 ? 'Inf' : '-Inf'
+  if (x === 0) return '0'
+  const neg = x < 0 ? 1 : 0
+  const r = Math.abs(x)
+  const p10 = (k: number) => Number('1e' + k)
+
+  // ---- how many digits, and which notation: R's scientific() and formatReal()
+  // R decides this in ordinary double arithmetic (it has no wider type on arm64
+  // and does the same steps in 80 bits on x86), so the same steps are taken
+  // here in the same order: an exact rounding would disagree with R on the few
+  // numbers whose sixteenth digit is a 5.
+  const D = 15
+  let kp = Math.floor(Math.log10(r)) - D + 1
+  let rp = r
+  if (Math.abs(kp) <= 22) rp = kp >= 0 ? rp / p10(kp) : rp * p10(-kp)
+  else if (kp <= R_DEC_MIN_EXPONENT) rp = (rp * 1e303) / p10(kp + 303)
+  else rp = rp / p10(kp)
+  if (rp < 1e14) { rp *= 10; kp-- }
+  const fl = Math.floor(rp), part = rp - fl
+  let alpha = part < 0.5 ? fl : part > 0.5 ? fl + 1 : (fl % 2 === 0 ? fl : fl + 1)
+  let nsig = D
+  for (let j = 1; j <= D; j++) {
+    alpha /= 10
+    if (alpha === Math.floor(alpha)) nsig--
+    else break
+  }
+  if (nsig === 0) { nsig = 1; kp += 1 }
+  const kpower = kp + D - 1
+  const cut = Math.min(22, Math.max(0, D - kpower))
+  const widens = kpower > 0 && kpower <= 22 && r < p10(kpower) - 0.5 / p10(cut)
+  const left = kpower + 1 - (widens ? 1 : 0)
+  const sleft = neg + (left <= 0 ? 1 : left)
+  const rgt = Math.max(0, nsig - left)
+  const wF = sleft + rgt + (rgt !== 0 ? 1 : 0)
+  const e = left > 100 || left <= -99 ? 2 : 1
+  const d = nsig - 1
+  const wE = neg + (d > 0 ? 1 : 0) + d + 4 + e
+  const fixed = wF <= wE + scipen
+
+  // ---- the digits: what C's printf writes, which is the double's EXACT value
+  // rounded (to even on a tie) at the place asked for. r = m * 2^e2.
+  const b = new DataView(new ArrayBuffer(8))
+  b.setFloat64(0, r)
+  const hi = b.getUint32(0), lo = b.getUint32(4)
+  const biased = (hi >>> 20) & 0x7ff
+  let m = (BigInt(hi & 0xfffff) << 32n) | BigInt(lo)
+  let e2 = -1074
+  if (biased !== 0) { m |= 1n << 52n; e2 = biased - 1075 }
+  /** round(r * 10^s), exactly. */
+  const scaled = (s: number): bigint => {
+    let num = m, den = 1n
+    if (e2 >= 0) num <<= BigInt(e2); else den <<= BigInt(-e2)
+    if (s >= 0) num *= 10n ** BigInt(s); else den *= 10n ** BigInt(-s)
+    let q = num / den
+    const twice = (num % den) * 2n
+    if (twice > den || (twice === den && (q & 1n) === 1n)) q += 1n
+    return q
+  }
+  const dropZeros = (frac: string) => frac.replace(/0+$/, '')
+
+  let out: string
+  if (fixed) {
+    // "%.{rgt}f": every digit left of the point as it is, rgt digits right of it.
+    const s = scaled(rgt).toString().padStart(rgt + 1, '0')
+    const frac = dropZeros(s.slice(s.length - rgt))
+    out = s.slice(0, s.length - rgt) + (rgt && frac ? '.' + frac : '')
+  } else {
+    // "%.{d}e": d + 1 significant digits and an exponent of two digits or more.
+    // The exponent is the EXACT value's (10^ex <= r < 10^(ex+1)), found by
+    // comparing whole numbers: log10 of a double a hair under a power of ten is
+    // that power, and starting there printed 9.9999999999999943e-08 as "1e-07".
+    /** Whether r >= 10^k, exactly. */
+    const atLeast = (k: number): boolean => {
+      let lhs = m, rhs = 1n
+      if (e2 >= 0) lhs <<= BigInt(e2); else rhs <<= BigInt(-e2)
+      if (k >= 0) rhs *= 10n ** BigInt(k); else lhs *= 10n ** BigInt(-k)
+      return lhs >= rhs
+    }
+    let ex = Math.floor(Math.log10(r))
+    while (!atLeast(ex)) ex -= 1
+    while (atLeast(ex + 1)) ex += 1
+    let q = scaled(d - ex)
+    // Rounding can carry into one more digit (9.9996 at three digits is 1.000e1).
+    if (q >= 10n ** BigInt(d + 1)) { ex += 1; q /= 10n }
+    const s = q.toString()
+    const frac = dropZeros(s.slice(1))
+    const mag = Math.abs(ex)
+    out = s[0] + (frac ? '.' + frac : '') + 'e' + (ex < 0 ? '-' : '+') + (mag < 10 ? '0' + mag : String(mag))
+  }
+  if (dec !== '.') out = out.replace('.', dec)
+  return (neg ? '-' : '') + out
+}
 
 /**
  * An R factor as plain labels. Factors are int codes (1-based, NA = INT_MIN)

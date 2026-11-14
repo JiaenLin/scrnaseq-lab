@@ -35,4 +35,5 @@ dist-ssr
 # ...and the synthetic Seurat objects scripts/make-seurat-fixtures.R writes (random
 # counts, made-up names; nothing real may ever replace them)
 !scripts/fixtures/seurat-*.rds
+!scripts/fixtures/r-*.rds
 .verify-tmp/

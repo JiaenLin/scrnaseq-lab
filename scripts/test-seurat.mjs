@@ -105,9 +105,75 @@ for (const how of ['whole', 'streamed']) {
   {
     const { obj, error } = scanOf('seurat-v5-split.rds', how)
     check('v5-split: the object\'s class is read', classOf(obj), ['Seurat'])
-    check('v5-split: refused, naming the split', /layers are split, one per sample/.test(error ?? ''), true)
-    check('v5-split: refused with the fix', /JoinLayers\(obj\[\["RNA"\]\]\)/.test(error ?? ''), true)
-    check('v5-split: a layer\'s own count is said', /holds 12 of the object's 24 cells/.test(error ?? ''), true)
+    check('v5-split: refused, naming the split', /the assay's layers are split/.test(error ?? ''), true)
+    check('v5-split: refused with the fix', /obj\[\["RNA"\]\] <- JoinLayers\(obj\[\["RNA"\]\]\)/.test(error ?? ''), true)
+    check('v5-split: a layer\'s own count is said', /holds 12 of its assay's 24 cells/.test(error ?? ''), true)
+  }
+
+  // Cell names made from integers (as.character(1:24)): R saves them as the
+  // numbers and a promise to print them. Read as numbers, the object "had no
+  // cell names", the question of whose cells a layer holds was skipped, and a
+  // split layer of 12 cells was converted as an object of 12: every cell
+  // carried another cell's row of meta.data.
+  {
+    const { scan, error } = scanOf('seurat-v5-intnames-split.rds', how)
+    check('v5-intnames-split: not converted as a part of itself', scan ? `scanned as ${scan.nCells} cells` : 'refused', 'refused')
+    check('v5-intnames-split: refused, naming the split', /holds 12 of its assay's 24 cells \(the assay's layers are split\)/.test(error ?? ''), true)
+  }
+  {
+    const want = EXPECTED['seurat-v5-intnames.rds']
+    const { scan, error } = scanOf('seurat-v5-intnames.rds', how)
+    check('v5-intnames: it scans', error ?? 'ok', 'ok')
+    if (scan) {
+      check('v5-intnames: all the object\'s cells', scan.nCells, want.cells.length)
+      for (const layer of ['counts', 'data']) matchesR('v5-intnames', scan, `RNA@layers$${layer}`, want.layers[layer])
+    }
+  }
+
+  // A second assay on half the cells, with one layer: it is left out, and what
+  // is said of it is that it does not cover the cells, never that it is split.
+  {
+    const want = EXPECTED['seurat-v5-partial-assay.rds']
+    const { scan, error } = scanOf('seurat-v5-partial-assay.rds', how)
+    check('v5-partial-assay: it scans', error ?? 'ok', 'ok')
+    if (scan) {
+      check('v5-partial-assay: all the object\'s cells', scan.nCells, want.cells.length)
+      matchesR('v5-partial-assay', scan, 'RNA@layers$counts', want.layers.counts)
+      check('v5-partial-assay: the other assay is not offered', scan.matrices.some(m => m.key.startsWith('ADT')), false)
+      const said = scan.notes.filter(n => n.startsWith('ADT'))
+      check('v5-partial-assay: and is said not to cover the cells',
+        said.some(n => /ADT@layers\$counts holds 12 of the object's 24 cells: its assay does not cover the others/.test(n)), true)
+      check('v5-partial-assay: nothing is called split', scan.notes.some(n => /split/.test(n)), false)
+    }
+  }
+
+  // The lines of R in a refusal name the assay that is split. Here it is called
+  // Spatial: a line that says RNA is an error in R ("'RNA' not found").
+  {
+    const { error } = scanOf('seurat-v5-spatial-split.rds', how)
+    check('v5-spatial-split: the fix names the assay that is split',
+      /obj\[\["Spatial"\]\] <- JoinLayers\(obj\[\["Spatial"\]\]\); saveRDS\(obj, "joined\.rds"\)/.test(error ?? ''), true)
+    check('v5-spatial-split: and no assay the object does not have', /RNA/.test(error ?? ''), false)
+    // The object after exactly those lines, run in R (make-seurat-fixtures.R).
+    const want = EXPECTED['seurat-v5-spatial-joined.rds']
+    const j = scanOf('seurat-v5-spatial-joined.rds', how)
+    check('v5-spatial-joined: after those lines, it scans', j.error ?? 'ok', 'ok')
+    if (j.scan) matchesR('v5-spatial-joined', j.scan, 'Spatial@layers$counts', want.layers.counts)
+  }
+
+  // Deferred strings by themselves: every number printed as R prints it.
+  {
+    const want = EXPECTED['r-deferred-strings.rds']
+    const r = open[how]('r-deferred-strings.rds')
+    const o = r.read()
+    for (const k of ['int', 'dbl', 'rnd', 'hard']) {
+      const v = slot(o, k)
+      check(`deferred strings: ${k} is read as text`, v?.t, 'str')
+      if (v?.t !== 'str') continue
+      const bad = []
+      v.v.forEach((s, i) => { if (s !== want[k][i]) bad.push(`#${i}: lab ${JSON.stringify(s)}, R ${JSON.stringify(want[k][i])}`) })
+      check(`deferred strings: ${k}, ${want[k].length} values, each as R prints it`, [v.v.length, bad.slice(0, 6)], [want[k].length, []])
+    }
   }
 
   // meta.data in another order than the layers' cells: a layer is then not the

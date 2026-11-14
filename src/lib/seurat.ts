@@ -250,10 +250,24 @@ function layerNames(r: RdsReader, map: RValue | undefined, layer: string): strin
   return out
 }
 
+/** How many rows (features or cells) one of a v5 assay's maps has; null where it is not a map. */
+function mapRows(r: RdsReader, map: RValue | undefined): number | null {
+  const dim = attrOf(map, 'dim')
+  if (map?.t !== 'num' || dim?.t !== 'num') return null
+  const d = r.numbers(dim)
+  return d.length === 2 ? d[0] : null
+}
+
 type Found = {
   key: string; value: RValue; genes: string[]; assay: RValue
-  /** A v5 layer's own cells, from the assay's map; null where the matrix has no such map (v3/v4). */
-  cells: string[] | null
+  /** The assay's own name, as the object lists it: what a line of R must say. */
+  assayName: string
+  /**
+   * Set for a layer of a v5 assay, whose cells are said by the assay's map and
+   * not by the matrix: the layer's cells (null where the map could not be
+   * read) and how many cells the assay has in all.
+   */
+  v5?: { cells: string[] | null; assayCells: number | null }
 }
 
 /** Every assay's matrix slots, v3/v4 and v5 alike. */
@@ -279,8 +293,11 @@ function assayMatrices(
         const own = dgcGenes(m)
         const genes = own.length ? own : layerNames(r, slot(a, 'features'), layer) ?? []
         out.push({
-          key: `${an}@layers$${layer}`, value: m, genes, assay: a,
-          cells: layerNames(r, slot(a, 'cells'), layer),
+          key: `${an}@layers$${layer}`, value: m, genes, assay: a, assayName: an,
+          v5: {
+            cells: layerNames(r, slot(a, 'cells'), layer),
+            assayCells: mapRows(r, slot(a, 'cells')),
+          },
         })
       })
       if (out.length === before) note(`assay ${an} is ${cls[0] ?? 'v5'} with no readable layers`)
@@ -290,7 +307,7 @@ function assayMatrices(
     for (const s of ['counts', 'data', 'scale.data']) {
       const m = slot(a, s)
       if (!m || m.t === 'null') continue
-      out.push({ key: `${an}@${s}`, value: m, genes: dgcGenes(m), assay: a, cells: null })
+      out.push({ key: `${an}@${s}`, value: m, genes: dgcGenes(m), assay: a, assayName: an })
     }
   })
   return out
@@ -326,13 +343,15 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
   const objCells = strings(attrOf(slot(obj, 'meta.data'), 'row.names'))
   const skipped: string[] = []
   const skip = (s: string) => { skipped.push(s); note(s) }
+  /** The assays whose layers are split, by the name a line of R must use. */
+  const splitAssays: string[] = []
 
   const geneSets: Record<string, string[]> = {}
   const geneAliases: Record<string, GeneAlias> = {}
   const matrices: MatrixRef[] = []
   let nCells = 0
 
-  for (const { key, value, genes, assay, cells } of found) {
+  for (const { key, value, genes, assay, assayName, v5 } of found) {
     const d = dgcDim(r, value)
     if (!d) {
       // scale.data is a plain dense matrix, not a dgCMatrix. It is scaled by
@@ -344,15 +363,34 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
       continue
     }
     const [g, c] = d
-    if (cells && objCells.length) {
-      // A v5 layer says which cells it holds. It is the object's matrix only
-      // when those are the object's cells, all of them and in the same order.
+    if (v5) {
+      // A v5 layer's cells are said by the assay's map. It is the object's
+      // matrix only when those are PROVEN to be the object's cells, all of them
+      // and in the same order. Whatever cannot be read is a reason to leave the
+      // layer out, never a reason to skip the question: a layer of 30 cells
+      // taken for an object of 45 gives every cell another cell's values.
+      const { cells, assayCells } = v5
+      if (!cells) {
+        skip(`${key}: the assay's map of cells could not be read, so the lab cannot tell which cells this layer holds; skipped`)
+        continue
+      }
       if (cells.length !== c) {
         skip(`${key} has ${c} columns but the assay's map lists ${cells.length} cells for it; skipped`)
         continue
       }
+      if (!objCells.length) {
+        skip(`${key}: the object's own cell names (the row names of meta.data) could not be read as text, so the lab cannot tell that this layer's cells are the object's; skipped`)
+        continue
+      }
+      if (assayCells !== null && c < assayCells) {
+        // Fewer cells than its own assay has: the assay's layers are split.
+        skip(`${key} holds ${c} of its assay's ${assayCells} cells (the assay's layers are split); skipped`)
+        if (!splitAssays.includes(assayName)) splitAssays.push(assayName)
+        continue
+      }
       if (c !== objCells.length) {
-        skip(`${key} holds ${c} of the object's ${objCells.length} cells (the assay's layers are split, one per sample); skipped`)
+        // All of its assay's cells, and the assay has fewer than the object.
+        skip(`${key} holds ${c} of the object's ${objCells.length} cells: its assay does not cover the others; skipped`)
         continue
       }
       if (cells.some((n, k) => n !== objCells[k])) {
@@ -362,7 +400,7 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
     }
     nCells = Math.max(nCells, c)
     if (genes.length !== g) {
-      skip(cells
+      skip(v5
         ? `${key} has ${g} rows but ${genes.length} gene names (none on the matrix, and the assay's feature map does not give them); skipped`
         : `${key} has no gene names on its Dimnames`)
       continue
@@ -396,11 +434,13 @@ export function scanSeurat(r: RdsReader, obj: RValue, filename: string): Scan {
     })
   }
   if (!matrices.length) {
-    const split = skipped.some(s => s.includes('layers are split'))
+    // The lines of R name the assays that ARE split, by their own names: a line
+    // that says RNA to an object with no RNA is an error in R, not a fix.
+    const join = splitAssays.map(a => `obj[[${JSON.stringify(a)}]] <- JoinLayers(obj[[${JSON.stringify(a)}]]); `).join('')
     throw new RdsError(
       'no assay in this object holds a sparse matrix the lab can use'
       + (skipped.length ? `: ${skipped.join('; ')}.` : ' (none has gene names).')
-      + (split ? ' Join the layers in R and save again: obj[["RNA"]] <- JoinLayers(obj[["RNA"]]); saveRDS(obj, "joined.rds").' : ''))
+      + (join ? ` Join the layers in R and save again: ${join}saveRDS(obj, "joined.rds").` : ''))
   }
 
   // ---- meta.data --------------------------------------------------------
